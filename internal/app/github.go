@@ -22,6 +22,20 @@ type pullRequest struct {
 	Request    string
 }
 
+type pullRequestDetail struct {
+	pullRequest
+	Body             string
+	CreatedAt        time.Time
+	BaseRefName      string
+	HeadRefName      string
+	ReviewDecision   string
+	MergeStateStatus string
+	Additions        int
+	Deletions        int
+	ChangedFiles     int
+	Labels           []string
+}
+
 type team struct {
 	Organization string
 	Slug         string
@@ -38,6 +52,28 @@ type issueSearchResponse struct {
 			Login string `json:"login"`
 		} `json:"user"`
 	} `json:"items"`
+}
+
+type prViewResponse struct {
+	Number           int       `json:"number"`
+	Title            string    `json:"title"`
+	URL              string    `json:"url"`
+	Body             string    `json:"body"`
+	CreatedAt        time.Time `json:"createdAt"`
+	UpdatedAt        time.Time `json:"updatedAt"`
+	BaseRefName      string    `json:"baseRefName"`
+	HeadRefName      string    `json:"headRefName"`
+	ReviewDecision   string    `json:"reviewDecision"`
+	MergeStateStatus string    `json:"mergeStateStatus"`
+	Additions        int       `json:"additions"`
+	Deletions        int       `json:"deletions"`
+	ChangedFiles     int       `json:"changedFiles"`
+	Author           struct {
+		Login string `json:"login"`
+	} `json:"author"`
+	Labels []struct {
+		Name string `json:"name"`
+	} `json:"labels"`
 }
 
 func loadReviewRequests(ctx context.Context) ([]pullRequest, error) {
@@ -152,8 +188,54 @@ func searchPRs(ctx context.Context, query, label string) ([]pullRequest, error) 
 	return prs, nil
 }
 
+func loadPRDetail(ctx context.Context, pr pullRequest) (pullRequestDetail, error) {
+	out, err := runGH(ctx, "pr", "view", pr.URL, "--json", "number,title,url,body,createdAt,updatedAt,baseRefName,headRefName,reviewDecision,mergeStateStatus,additions,deletions,changedFiles,author,labels")
+	if err != nil {
+		return pullRequestDetail{}, err
+	}
+
+	var res prViewResponse
+	if err := json.Unmarshal(out, &res); err != nil {
+		return pullRequestDetail{}, err
+	}
+
+	detail := pullRequestDetail{
+		pullRequest:      pr,
+		Body:             res.Body,
+		CreatedAt:        res.CreatedAt,
+		BaseRefName:      res.BaseRefName,
+		HeadRefName:      res.HeadRefName,
+		ReviewDecision:   res.ReviewDecision,
+		MergeStateStatus: res.MergeStateStatus,
+		Additions:        res.Additions,
+		Deletions:        res.Deletions,
+		ChangedFiles:     res.ChangedFiles,
+	}
+	if res.Number != 0 {
+		detail.Number = res.Number
+	}
+	if res.Title != "" {
+		detail.Title = res.Title
+	}
+	if res.URL != "" {
+		detail.URL = res.URL
+	}
+	if res.Author.Login != "" {
+		detail.Author = res.Author.Login
+	}
+	if !res.UpdatedAt.IsZero() {
+		detail.UpdatedAt = res.UpdatedAt
+	}
+	for _, label := range res.Labels {
+		if label.Name != "" {
+			detail.Labels = append(detail.Labels, label.Name)
+		}
+	}
+	return detail, nil
+}
+
 func loadDiff(ctx context.Context, pr pullRequest) (string, error) {
-	out, err := runGH(ctx, "pr", "diff", pr.URL, "--color=never")
+	out, err := runGH(ctx, "pr", "diff", pr.URL, "--color=always")
 	if err != nil {
 		return "", err
 	}

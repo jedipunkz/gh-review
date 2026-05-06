@@ -15,9 +15,13 @@ derives the command name from the extension repository name.
 During development:
 
 ```bash
-make build
-./gh-review
+make install-dev
+gh review
 ```
+
+`make install-dev` symlinks the current checkout to GitHub CLI's extension
+directory as `gh-review`, so it works from git worktrees whose directory names
+are not `gh-review`.
 
 ## Keys
 
