@@ -24,9 +24,10 @@ type prListMsg struct {
 }
 
 type diffMsg struct {
-	pr   pullRequest
-	diff string
-	err  error
+	pr     pullRequest
+	detail pullRequestDetail
+	diff   string
+	err    error
 }
 
 type approveMsg struct {
@@ -103,8 +104,8 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		m.err = ""
 		m.screen = screenDiff
-		m.diffPR = &msg.pr
-		m.diff.SetContent(msg.diff)
+		m.diffPR = &msg.detail.pullRequest
+		m.diff.SetContent(renderDiffContent(msg.detail, msg.diff))
 		m.diff.GotoTop()
 		m.status = "press a to approve, esc to go back"
 		return m, nil
@@ -133,7 +134,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 func (m model) handleKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 	key := msg.String()
 	switch key {
-	case "ctrl+c", "q":
+	case "ctrl+c":
 		return m, tea.Quit
 	case "r":
 		if m.loading {
@@ -160,6 +161,8 @@ func (m model) handleListKey(key string) (tea.Model, tea.Cmd) {
 		return m, nil
 	}
 	switch key {
+	case "q":
+		return m, tea.Quit
 	case "down", "j":
 		if m.cursor < len(m.prs)-1 {
 			m.cursor++
@@ -182,7 +185,7 @@ func (m model) handleListKey(key string) (tea.Model, tea.Cmd) {
 
 func (m model) handleDiffKey(key string, msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 	switch key {
-	case "esc", "b":
+	case "esc", "b", "q", "enter":
 		m.screen = screenList
 		m.diffPR = nil
 		m.status = fmt.Sprintf("%d review request(s)", len(m.prs))
@@ -265,8 +268,7 @@ func (m model) renderDiff() string {
 	if m.diffPR == nil {
 		return mutedStyle.Render("No PR selected.")
 	}
-	header := fmt.Sprintf("%s  #%d  %s", m.diffPR.Repository, m.diffPR.Number, m.diffPR.Title)
-	return titleStyle.Render(header) + "\n" + m.diff.View()
+	return m.diff.View()
 }
 
 func (m model) renderFooter() string {
@@ -298,8 +300,12 @@ func loadDiffCmd(pr pullRequest) tea.Cmd {
 	return func() tea.Msg {
 		ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 		defer cancel()
+		detail, err := loadPRDetail(ctx, pr)
+		if err != nil {
+			return diffMsg{pr: pr, err: err}
+		}
 		diff, err := loadDiff(ctx, pr)
-		return diffMsg{pr: pr, diff: diff, err: err}
+		return diffMsg{pr: pr, detail: detail, diff: diff, err: err}
 	}
 }
 
@@ -314,6 +320,81 @@ func approveCmd(pr pullRequest) tea.Cmd {
 
 func prLabel(pr pullRequest) string {
 	return fmt.Sprintf("%s#%d", pr.Repository, pr.Number)
+}
+
+func renderDiffContent(detail pullRequestDetail, diff string) string {
+	var b strings.Builder
+	b.WriteString(titleStyle.Render(fmt.Sprintf("%s  #%d  %s", detail.Repository, detail.Number, detail.Title)))
+	b.WriteByte('\n')
+	b.WriteString(formatMeta("Author", "@"+detail.Author))
+	b.WriteString("  ")
+	b.WriteString(formatMeta("Review request", detail.Request))
+	if branch := branchLabel(detail); branch != "" {
+		b.WriteString("  ")
+		b.WriteString(formatMeta("Branch", branch))
+	}
+	b.WriteByte('\n')
+	b.WriteString(formatMeta("State", nonEmpty(detail.MergeStateStatus, "unknown")))
+	b.WriteString("  ")
+	b.WriteString(formatMeta("Review", nonEmpty(detail.ReviewDecision, "none")))
+	b.WriteString("  ")
+	b.WriteString(formatMeta("Files", fmt.Sprintf("%d", detail.ChangedFiles)))
+	b.WriteString("  ")
+	b.WriteString(okStyle.Render(fmt.Sprintf("+%d", detail.Additions)))
+	b.WriteString(" ")
+	b.WriteString(errorStyle.Render(fmt.Sprintf("-%d", detail.Deletions)))
+	if !detail.CreatedAt.IsZero() || !detail.UpdatedAt.IsZero() {
+		b.WriteByte('\n')
+		if !detail.CreatedAt.IsZero() {
+			b.WriteString(formatMeta("Created", detail.CreatedAt.Format("2006-01-02 15:04")))
+		}
+		if !detail.UpdatedAt.IsZero() {
+			if !detail.CreatedAt.IsZero() {
+				b.WriteString("  ")
+			}
+			b.WriteString(formatMeta("Updated", detail.UpdatedAt.Format("2006-01-02 15:04")))
+		}
+	}
+	if len(detail.Labels) > 0 {
+		b.WriteByte('\n')
+		b.WriteString(formatMeta("Labels", strings.Join(detail.Labels, ", ")))
+	}
+	b.WriteString("\n\n")
+	body := strings.TrimSpace(detail.Body)
+	if body == "" {
+		b.WriteString(mutedStyle.Render("No description."))
+	} else {
+		b.WriteString(body)
+	}
+	b.WriteString("\n\n")
+	b.WriteString(mutedStyle.Render(strings.Repeat("-", 80)))
+	b.WriteString("\n\n")
+	b.WriteString(diff)
+	return b.String()
+}
+
+func formatMeta(label, value string) string {
+	return mutedStyle.Render(label+":") + " " + value
+}
+
+func nonEmpty(s, fallback string) string {
+	if s == "" {
+		return fallback
+	}
+	return s
+}
+
+func branchLabel(detail pullRequestDetail) string {
+	if detail.HeadRefName == "" && detail.BaseRefName == "" {
+		return ""
+	}
+	if detail.HeadRefName == "" {
+		return detail.BaseRefName
+	}
+	if detail.BaseRefName == "" {
+		return detail.HeadRefName
+	}
+	return detail.HeadRefName + " -> " + detail.BaseRefName
 }
 
 func truncate(s string, maxWidth int) string {
