@@ -4,7 +4,7 @@ import (
 	"fmt"
 	"os"
 
-	"github.com/thirai/gh-review-cli/internal/app"
+	"github.com/thirai/gh-review/internal/app"
 )
 
 func main() {

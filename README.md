@@ -1,6 +1,6 @@
-# gh-review-cli
+# gh-review
 
-`gh review-cli` lists open pull requests that request review from you or your teams, shows the PR diff in a TUI, and approves from the keyboard.
+`gh review` lists open pull requests that request review from you or your teams, shows the PR diff in a TUI, and approves from the keyboard.
 
 ## Install
 
@@ -9,11 +9,14 @@ make build
 gh extension install .
 ```
 
+The repository or checkout directory must be named `gh-review` because `gh`
+derives the command name from the extension repository name.
+
 During development:
 
 ```bash
 make build
-./gh-review-cli
+./gh-review
 ```
 
 ## Keys

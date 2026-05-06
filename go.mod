@@ -1,4 +1,4 @@
-module github.com/thirai/gh-review-cli
+module github.com/thirai/gh-review
 
 go 1.26.2
 

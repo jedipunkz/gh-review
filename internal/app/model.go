@@ -215,7 +215,7 @@ func (m model) View() tea.View {
 }
 
 func (m model) renderHeader() string {
-	parts := []string{titleStyle.Render("gh review-cli")}
+	parts := []string{titleStyle.Render("gh review")}
 	if m.status != "" {
 		parts = append(parts, mutedStyle.Render(m.status))
 	}
