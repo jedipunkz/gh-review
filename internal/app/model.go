@@ -46,14 +46,14 @@ type model struct {
 }
 
 var (
-	titleStyle      = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("39"))
-	selectedStyle   = lipgloss.NewStyle().Foreground(lipgloss.Color("230")).Background(lipgloss.Color("62"))
-	mutedStyle      = lipgloss.NewStyle().Foreground(lipgloss.Color("245"))
-	errorStyle      = lipgloss.NewStyle().Foreground(lipgloss.Color("196"))
-	okStyle         = lipgloss.NewStyle().Foreground(lipgloss.Color("42"))
-	meFrameStyle    = lipgloss.NewStyle().Border(lipgloss.RoundedBorder()).BorderForeground(lipgloss.Color("39"))
-	teamFrameStyle  = lipgloss.NewStyle().Border(lipgloss.RoundedBorder()).BorderForeground(lipgloss.Color("214"))
-	detailFrameStyle = lipgloss.NewStyle().Border(lipgloss.RoundedBorder()).BorderForeground(lipgloss.Color("245"))
+	titleStyle       = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("39"))
+	selectedStyle    = lipgloss.NewStyle().Foreground(lipgloss.Color("230")).Background(lipgloss.Color("62"))
+	mutedStyle       = lipgloss.NewStyle().Foreground(lipgloss.Color("245"))
+	errorStyle       = lipgloss.NewStyle().Foreground(lipgloss.Color("196"))
+	okStyle          = lipgloss.NewStyle().Foreground(lipgloss.Color("42"))
+	meFrameStyle     = lipgloss.NewStyle().Border(lipgloss.RoundedBorder()).BorderForeground(lipgloss.Color("39"))
+	teamFrameStyle   = lipgloss.NewStyle().Border(lipgloss.RoundedBorder()).BorderForeground(lipgloss.Color("214"))
+	detailFrameStyle = lipgloss.NewStyle().Border(lipgloss.RoundedBorder()).BorderForeground(lipgloss.Color("245")).PaddingLeft(1)
 )
 
 func newModel() model {
@@ -190,9 +190,7 @@ func (m *model) triggerDetailLoad() tea.Cmd {
 func (m model) View() tea.View {
 	parts := []string{
 		m.renderHeader(),
-		"",
 		m.renderGroupedList(),
-		"",
 		m.renderDetailSection(),
 		m.renderFooter(),
 	}
@@ -229,17 +227,18 @@ func (m model) renderGroupedList() string {
 		return mutedStyle.Render("No open PRs are requesting your review.")
 	}
 
-	boxW := max(40, m.width-4)
+	boxW := m.frameWidth()
 	me, team := m.groupPRsByIndex()
 
 	var sections []string
 
 	if len(me) > 0 {
+		contentW := frameContentWidth(meFrameStyle, boxW)
 		var lines []string
 		lines = append(lines, titleStyle.Render("Me"))
-		lines = append(lines, m.renderListHeader(boxW))
+		lines = append(lines, m.renderListHeader(contentW))
 		for _, item := range me {
-			lines = append(lines, m.renderPRLine(item.idx, item.pr, boxW))
+			lines = append(lines, m.renderPRLine(item.idx, item.pr, contentW))
 		}
 		inner := 2 + len(me)
 		frameH := inner + 2
@@ -247,11 +246,12 @@ func (m model) renderGroupedList() string {
 	}
 
 	if len(team) > 0 {
+		contentW := frameContentWidth(teamFrameStyle, boxW)
 		var lines []string
 		lines = append(lines, titleStyle.Render("Team"))
-		lines = append(lines, m.renderListHeader(boxW))
+		lines = append(lines, m.renderListHeader(contentW))
 		for _, item := range team {
-			lines = append(lines, m.renderPRLine(item.idx, item.pr, boxW))
+			lines = append(lines, m.renderPRLine(item.idx, item.pr, contentW))
 		}
 		inner := 2 + len(team)
 		frameH := inner + 2
@@ -324,7 +324,7 @@ func (m model) renderPRLine(idx int, pr pullRequest, boxW int) string {
 }
 
 func (m model) renderDetailSection() string {
-	boxW := max(40, m.width-4)
+	boxW := m.frameWidth()
 	vpH := m.detailVP.Height()
 	var content string
 	switch {
@@ -340,6 +340,14 @@ func (m model) renderDetailSection() string {
 	return detailFrameStyle.Width(boxW).Height(vpH).MaxHeight(vpH + 2).Render(content)
 }
 
+func (m model) frameWidth() int {
+	return max(40, m.width-4)
+}
+
+func frameContentWidth(style lipgloss.Style, width int) int {
+	return max(1, width-style.GetHorizontalFrameSize())
+}
+
 func (m model) renderFooter() string {
 	return mutedStyle.Render("ctrl+n/p list  j/k scroll  pgup/pgdn page  a approve  r refresh  q quit")
 }
@@ -349,11 +357,9 @@ func (m *model) resizeViewport() {
 		return
 	}
 	listH := m.computeListSectionHeight()
-	// layout: header(1) + blank(1) + list(listH) + blank(1) + detailBorder(2) + vpH + footer(1) = 6 + listH + vpH
-	vpH := max(3, m.height-6-listH)
-	// boxW = m.width-4. lipgloss wraps at boxW - horizontalBorderSize(2) = m.width-6.
-	// keep viewport narrower than wrap threshold to ensure no re-wrap by lipgloss.
-	vpW := max(20, m.width-8)
+	// layout: header(1) + list(listH) + detailBorder(2) + vpH + footer(1) = 4 + listH + vpH
+	vpH := max(3, m.height-4-listH)
+	vpW := max(20, frameContentWidth(detailFrameStyle, m.frameWidth()))
 	m.detailVP.SetHeight(vpH)
 	m.detailVP.SetWidth(vpW)
 }
