@@ -11,13 +11,6 @@ import (
 	"charm.land/lipgloss/v2"
 )
 
-type screen int
-
-const (
-	screenList screen = iota
-	screenDiff
-)
-
 type prListMsg struct {
 	prs []pullRequest
 	err error
@@ -36,25 +29,30 @@ type approveMsg struct {
 }
 
 type model struct {
-	screen   screen
-	loading  bool
-	status   string
-	err      string
-	prs      []pullRequest
-	cursor   int
-	diffPR   *pullRequest
-	diff     viewport.Model
-	width    int
-	height   int
-	approved map[string]bool
+	loading       bool
+	status        string
+	err           string
+	prs           []pullRequest
+	cursor        int
+	currentDetail *pullRequestDetail
+	detailLoading bool
+	detailErr     string
+	loadingForURL string
+	detailVP      viewport.Model
+	width         int
+	height        int
+	approved      map[string]bool
 }
 
 var (
-	titleStyle    = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("39"))
-	selectedStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("230")).Background(lipgloss.Color("62"))
-	mutedStyle    = lipgloss.NewStyle().Foreground(lipgloss.Color("245"))
-	errorStyle    = lipgloss.NewStyle().Foreground(lipgloss.Color("196"))
-	okStyle       = lipgloss.NewStyle().Foreground(lipgloss.Color("42"))
+	titleStyle      = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("39"))
+	selectedStyle   = lipgloss.NewStyle().Foreground(lipgloss.Color("230")).Background(lipgloss.Color("62"))
+	mutedStyle      = lipgloss.NewStyle().Foreground(lipgloss.Color("245"))
+	errorStyle      = lipgloss.NewStyle().Foreground(lipgloss.Color("196"))
+	okStyle         = lipgloss.NewStyle().Foreground(lipgloss.Color("42"))
+	meFrameStyle    = lipgloss.NewStyle().Border(lipgloss.RoundedBorder()).BorderForeground(lipgloss.Color("39"))
+	teamFrameStyle  = lipgloss.NewStyle().Border(lipgloss.RoundedBorder()).BorderForeground(lipgloss.Color("214"))
+	detailFrameStyle = lipgloss.NewStyle().Border(lipgloss.RoundedBorder()).BorderForeground(lipgloss.Color("245"))
 )
 
 func newModel() model {
@@ -63,7 +61,7 @@ func newModel() model {
 	return model{
 		loading:  true,
 		status:   "loading review requests...",
-		diff:     vp,
+		detailVP: vp,
 		approved: make(map[string]bool),
 	}
 }
@@ -94,20 +92,26 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.cursor = max(0, len(m.prs)-1)
 		}
 		m.status = fmt.Sprintf("%d review request(s)", len(m.prs))
+		m.resizeViewport()
+		if len(m.prs) > 0 {
+			cmd := m.triggerDetailLoad()
+			return m, cmd
+		}
 		return m, nil
 	case diffMsg:
-		m.loading = false
-		if msg.err != nil {
-			m.err = msg.err.Error()
-			m.status = "failed to load diff"
+		if msg.pr.URL != m.loadingForURL {
 			return m, nil
 		}
-		m.err = ""
-		m.screen = screenDiff
-		m.diffPR = &msg.detail.pullRequest
-		m.diff.SetContent(renderDiffContent(msg.detail, msg.diff))
-		m.diff.GotoTop()
-		m.status = "press a to approve, esc to go back"
+		m.detailLoading = false
+		if msg.err != nil {
+			m.detailErr = msg.err.Error()
+			return m, nil
+		}
+		m.detailErr = ""
+		d := msg.detail
+		m.currentDetail = &d
+		m.detailVP.SetContent(renderDiffContent(msg.detail, msg.diff))
+		m.detailVP.GotoTop()
 		return m, nil
 	case approveMsg:
 		m.loading = false
@@ -119,14 +123,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.err = ""
 		m.approved[msg.pr.URL] = true
 		m.status = "approved " + prLabel(msg.pr)
-		m.screen = screenList
 		return m, loadPRsCmd()
-	}
-
-	if m.screen == screenDiff {
-		var cmd tea.Cmd
-		m.diff, cmd = m.diff.Update(msg)
-		return m, cmd
 	}
 	return m, nil
 }
@@ -134,7 +131,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 func (m model) handleKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 	key := msg.String()
 	switch key {
-	case "ctrl+c":
+	case "ctrl+c", "q":
 		return m, tea.Quit
 	case "r":
 		if m.loading {
@@ -144,77 +141,61 @@ func (m model) handleKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 		m.status = "refreshing..."
 		m.err = ""
 		return m, loadPRsCmd()
-	}
-
-	switch m.screen {
-	case screenList:
-		return m.handleListKey(key)
-	case screenDiff:
-		return m.handleDiffKey(key, msg)
-	default:
-		return m, nil
-	}
-}
-
-func (m model) handleListKey(key string) (tea.Model, tea.Cmd) {
-	if m.loading {
-		return m, nil
-	}
-	switch key {
-	case "q":
-		return m, tea.Quit
-	case "down", "j":
-		if m.cursor < len(m.prs)-1 {
+	case "ctrl+n":
+		if !m.loading && m.cursor < len(m.prs)-1 {
 			m.cursor++
+			cmd := m.triggerDetailLoad()
+			return m, cmd
 		}
-	case "up", "k":
-		if m.cursor > 0 {
+	case "ctrl+p":
+		if !m.loading && m.cursor > 0 {
 			m.cursor--
+			cmd := m.triggerDetailLoad()
+			return m, cmd
 		}
-	case "enter", "d", "a":
-		if len(m.prs) == 0 {
-			return m, nil
+	case "j":
+		m.detailVP.ScrollDown(1)
+	case "k":
+		m.detailVP.ScrollUp(1)
+	case "pgdown":
+		m.detailVP.PageDown()
+	case "pgup":
+		m.detailVP.PageUp()
+	case "a":
+		if m.currentDetail != nil && !m.loading && !m.detailLoading {
+			pr := m.currentDetail.pullRequest
+			m.loading = true
+			m.status = "approving..."
+			m.err = ""
+			return m, approveCmd(pr)
 		}
-		m.loading = true
-		m.status = "loading diff..."
-		m.err = ""
-		return m, loadDiffCmd(m.prs[m.cursor])
 	}
 	return m, nil
 }
 
-func (m model) handleDiffKey(key string, msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
-	switch key {
-	case "esc", "b", "q", "enter":
-		m.screen = screenList
-		m.diffPR = nil
-		m.status = fmt.Sprintf("%d review request(s)", len(m.prs))
-		return m, nil
-	case "a":
-		if m.diffPR == nil || m.loading {
-			return m, nil
-		}
-		pr := *m.diffPR
-		m.loading = true
-		m.status = "approving..."
-		m.err = ""
-		return m, approveCmd(pr)
+func (m *model) triggerDetailLoad() tea.Cmd {
+	if len(m.prs) == 0 {
+		return nil
 	}
-
-	var cmd tea.Cmd
-	m.diff, cmd = m.diff.Update(msg)
-	return m, cmd
+	pr := m.prs[m.cursor]
+	m.loadingForURL = pr.URL
+	m.currentDetail = nil
+	m.detailLoading = true
+	m.detailErr = ""
+	m.detailVP.GotoTop()
+	return loadDiffCmd(pr)
 }
 
 func (m model) View() tea.View {
-	content := m.renderHeader() + "\n\n"
-	if m.screen == screenDiff {
-		content += m.renderDiff()
-	} else {
-		content += m.renderList()
+	parts := []string{
+		m.renderHeader(),
+		"",
+		m.renderGroupedList(),
+		"",
+		m.renderDetailSection(),
+		m.renderFooter(),
 	}
-	content += "\n" + m.renderFooter()
-	return tea.NewView(content)
+	return tea.NewView(strings.Join(parts, "\n"))
 }
 
 func (m model) renderHeader() string {
@@ -222,69 +203,153 @@ func (m model) renderHeader() string {
 	if m.status != "" {
 		parts = append(parts, mutedStyle.Render(m.status))
 	}
-	if m.loading {
-		parts = append(parts, mutedStyle.Render("working"))
+	if m.loading || m.detailLoading {
+		parts = append(parts, mutedStyle.Render("working..."))
 	}
 	return strings.Join(parts, "  ")
 }
 
-func (m model) renderList() string {
-	if m.err != "" {
+func (m model) groupPRs() (me, team []pullRequest) {
+	for _, pr := range m.prs {
+		if strings.Contains(pr.Request, "@me") {
+			me = append(me, pr)
+		} else {
+			team = append(team, pr)
+		}
+	}
+	return
+}
+
+func (m model) renderGroupedList() string {
+	if m.err != "" && len(m.prs) == 0 {
 		return errorStyle.Render(m.err)
 	}
 	if len(m.prs) == 0 {
 		return mutedStyle.Render("No open PRs are requesting your review.")
 	}
 
-	var b strings.Builder
-	for i, pr := range m.prs {
-		line := fmt.Sprintf("%s  #%d  %s  %s  %s",
-			truncate(pr.Repository, 28),
-			pr.Number,
-			truncate(pr.Title, max(20, m.width-70)),
-			mutedStyle.Render("@"+pr.Author),
-			mutedStyle.Render(pr.Request),
-		)
-		if m.approved[pr.URL] {
-			line += " " + okStyle.Render("approved")
+	boxW := max(40, m.width-4)
+	me, team := m.groupPRsByIndex()
+
+	var sections []string
+
+	if len(me) > 0 {
+		var lines []string
+		lines = append(lines, titleStyle.Render("Me"))
+		for _, item := range me {
+			lines = append(lines, m.renderPRLine(item.idx, item.pr, boxW))
 		}
-		if i == m.cursor {
-			line = selectedStyle.Render(" " + line + " ")
-		} else {
-			line = " " + line
-		}
-		b.WriteString(line)
-		if i < len(m.prs)-1 {
-			b.WriteByte('\n')
-		}
+		frameH := 1 + len(me) + 2
+		sections = append(sections, meFrameStyle.Width(boxW).Height(1+len(me)).MaxHeight(frameH).Render(strings.Join(lines, "\n")))
 	}
-	return b.String()
+
+	if len(team) > 0 {
+		var lines []string
+		lines = append(lines, titleStyle.Render("Team"))
+		for _, item := range team {
+			lines = append(lines, m.renderPRLine(item.idx, item.pr, boxW))
+		}
+		frameH := 1 + len(team) + 2
+		sections = append(sections, teamFrameStyle.Width(boxW).Height(1+len(team)).MaxHeight(frameH).Render(strings.Join(lines, "\n")))
+	}
+
+	return strings.Join(sections, "\n")
 }
 
-func (m model) renderDiff() string {
-	if m.err != "" {
-		return errorStyle.Render(m.err)
+type indexedPR struct {
+	idx int
+	pr  pullRequest
+}
+
+func (m model) groupPRsByIndex() (me, team []indexedPR) {
+	for i, pr := range m.prs {
+		if strings.Contains(pr.Request, "@me") {
+			me = append(me, indexedPR{i, pr})
+		} else {
+			team = append(team, indexedPR{i, pr})
+		}
 	}
-	if m.diffPR == nil {
-		return mutedStyle.Render("No PR selected.")
+	return
+}
+
+func (m model) renderPRLine(idx int, pr pullRequest, boxW int) string {
+	repoW := 28
+	authorW := 15
+	approvedW := 0
+	approved := m.approved[pr.URL]
+	if approved {
+		approvedW = 10 // " approved"
 	}
-	return m.diff.View()
+	// budget: leading/trailing space (2) + repo + "  #" (3) + num (5) + "  " (2) + title + "  @" (3) + author + approved
+	fixed := 2 + repoW + 3 + 5 + 2 + 3 + authorW + approvedW
+	titleW := max(10, boxW-fixed)
+
+	line := fmt.Sprintf("%s  #%d  %s  %s",
+		truncate(pr.Repository, repoW),
+		pr.Number,
+		truncate(pr.Title, titleW),
+		mutedStyle.Render("@"+truncate(pr.Author, authorW)),
+	)
+	if approved {
+		line += " " + okStyle.Render("approved")
+	}
+	if idx == m.cursor {
+		return selectedStyle.Render(" " + line + " ")
+	}
+	return " " + line
+}
+
+func (m model) renderDetailSection() string {
+	boxW := max(40, m.width-4)
+	vpH := m.detailVP.Height()
+	var content string
+	switch {
+	case m.detailLoading:
+		content = mutedStyle.Render("loading detail...")
+	case m.detailErr != "":
+		content = errorStyle.Render(m.detailErr)
+	case m.currentDetail == nil:
+		content = mutedStyle.Render("No detail loaded.")
+	default:
+		content = m.detailVP.View()
+	}
+	return detailFrameStyle.Width(boxW).Height(vpH).MaxHeight(vpH + 2).Render(content)
 }
 
 func (m model) renderFooter() string {
-	if m.screen == screenDiff {
-		return mutedStyle.Render("j/k scroll  pgup/pgdn page  a approve  esc back  r refresh  q quit")
-	}
-	return mutedStyle.Render("j/k move  enter/d diff  a diff+approve  r refresh  q quit")
+	return mutedStyle.Render("ctrl+n/p list  j/k scroll  pgup/pgdn page  a approve  r refresh  q quit")
 }
 
 func (m *model) resizeViewport() {
-	if m.width > 0 {
-		m.diff.SetWidth(m.width)
+	if m.width == 0 || m.height == 0 {
+		return
 	}
-	if m.height > 6 {
-		m.diff.SetHeight(m.height - 6)
+	listH := m.computeListSectionHeight()
+	// layout: header(1) + blank(1) + list(listH) + blank(1) + detailBorder(2) + vpH + footer(1) = 6 + listH + vpH
+	vpH := max(3, m.height-6-listH)
+	// boxW = m.width-4. lipgloss wraps at boxW - horizontalBorderSize(2) = m.width-6.
+	// keep viewport narrower than wrap threshold to ensure no re-wrap by lipgloss.
+	vpW := max(20, m.width-8)
+	m.detailVP.SetHeight(vpH)
+	m.detailVP.SetWidth(vpW)
+}
+
+func (m model) computeListSectionHeight() int {
+	me, team := m.groupPRs()
+	h := 0
+	if len(me) > 0 {
+		h += 2 + 1 + len(me) // top border + bottom border + title line + items
 	}
+	if len(team) > 0 {
+		if h > 0 {
+			h++ // gap between frames
+		}
+		h += 2 + 1 + len(team)
+	}
+	if h == 0 {
+		h = 1
+	}
+	return h
 }
 
 func loadPRsCmd() tea.Cmd {
