@@ -9,6 +9,7 @@ import (
 	"charm.land/bubbles/v2/viewport"
 	tea "charm.land/bubbletea/v2"
 	"charm.land/lipgloss/v2"
+	"github.com/mattn/go-runewidth"
 )
 
 type prListMsg struct {
@@ -236,21 +237,25 @@ func (m model) renderGroupedList() string {
 	if len(me) > 0 {
 		var lines []string
 		lines = append(lines, titleStyle.Render("Me"))
+		lines = append(lines, m.renderListHeader(boxW))
 		for _, item := range me {
 			lines = append(lines, m.renderPRLine(item.idx, item.pr, boxW))
 		}
-		frameH := 1 + len(me) + 2
-		sections = append(sections, meFrameStyle.Width(boxW).Height(1+len(me)).MaxHeight(frameH).Render(strings.Join(lines, "\n")))
+		inner := 2 + len(me)
+		frameH := inner + 2
+		sections = append(sections, meFrameStyle.Width(boxW).Height(inner).MaxHeight(frameH).Render(strings.Join(lines, "\n")))
 	}
 
 	if len(team) > 0 {
 		var lines []string
 		lines = append(lines, titleStyle.Render("Team"))
+		lines = append(lines, m.renderListHeader(boxW))
 		for _, item := range team {
 			lines = append(lines, m.renderPRLine(item.idx, item.pr, boxW))
 		}
-		frameH := 1 + len(team) + 2
-		sections = append(sections, teamFrameStyle.Width(boxW).Height(1+len(team)).MaxHeight(frameH).Render(strings.Join(lines, "\n")))
+		inner := 2 + len(team)
+		frameH := inner + 2
+		sections = append(sections, teamFrameStyle.Width(boxW).Height(inner).MaxHeight(frameH).Render(strings.Join(lines, "\n")))
 	}
 
 	return strings.Join(sections, "\n")
@@ -272,23 +277,42 @@ func (m model) groupPRsByIndex() (me, team []indexedPR) {
 	return
 }
 
+const (
+	colRepoW   = 28
+	colNumW    = 6
+	colAuthorW = 15
+)
+
+func listTitleWidth(boxW, approvedW int) int {
+	// budget: leading/trailing space (2) + repo + "  " (2) + num + "  " (2) + title + "  " (2) + "@" or " " (1) + author + approved
+	fixed := 2 + colRepoW + 2 + colNumW + 2 + 2 + 1 + colAuthorW + approvedW
+	return max(10, boxW-fixed)
+}
+
+func (m model) renderListHeader(boxW int) string {
+	titleW := listTitleWidth(boxW, 0)
+	line := fmt.Sprintf("%s  %s  %s   %s",
+		padRight("Repository", colRepoW),
+		padRight("#", colNumW),
+		padRight("Title", titleW),
+		padRight("Author", colAuthorW),
+	)
+	return " " + mutedStyle.Render(line)
+}
+
 func (m model) renderPRLine(idx int, pr pullRequest, boxW int) string {
-	repoW := 28
-	authorW := 15
 	approvedW := 0
 	approved := m.approved[pr.URL]
 	if approved {
-		approvedW = 10 // " approved"
+		approvedW = 9 // " approved"
 	}
-	// budget: leading/trailing space (2) + repo + "  #" (3) + num (5) + "  " (2) + title + "  @" (3) + author + approved
-	fixed := 2 + repoW + 3 + 5 + 2 + 3 + authorW + approvedW
-	titleW := max(10, boxW-fixed)
+	titleW := listTitleWidth(boxW, approvedW)
 
-	line := fmt.Sprintf("%s  #%d  %s  %s",
-		truncate(pr.Repository, repoW),
-		pr.Number,
-		truncate(pr.Title, titleW),
-		mutedStyle.Render("@"+truncate(pr.Author, authorW)),
+	line := fmt.Sprintf("%s  %s  %s  %s",
+		padRight(pr.Repository, colRepoW),
+		padRight(fmt.Sprintf("#%d", pr.Number), colNumW),
+		padRight(pr.Title, titleW),
+		mutedStyle.Render("@"+padRight(pr.Author, colAuthorW)),
 	)
 	if approved {
 		line += " " + okStyle.Render("approved")
@@ -338,13 +362,13 @@ func (m model) computeListSectionHeight() int {
 	me, team := m.groupPRs()
 	h := 0
 	if len(me) > 0 {
-		h += 2 + 1 + len(me) // top border + bottom border + title line + items
+		h += 2 + 2 + len(me) // top border + bottom border + title line + header line + items
 	}
 	if len(team) > 0 {
 		if h > 0 {
 			h++ // gap between frames
 		}
-		h += 2 + 1 + len(team)
+		h += 2 + 2 + len(team)
 	}
 	if h == 0 {
 		h = 1
@@ -468,4 +492,16 @@ func truncate(s string, maxWidth int) string {
 		return s
 	}
 	return string(runes[:maxWidth-3]) + "..."
+}
+
+func padRight(s string, width int) string {
+	if width <= 0 {
+		return ""
+	}
+	truncated := runewidth.Truncate(s, width, "...")
+	w := runewidth.StringWidth(truncated)
+	if w < width {
+		return truncated + strings.Repeat(" ", width-w)
+	}
+	return truncated
 }
