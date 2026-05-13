@@ -3,6 +3,7 @@ package app
 import (
 	"context"
 	"fmt"
+	"os/exec"
 	"strings"
 	"time"
 
@@ -25,6 +26,11 @@ type diffMsg struct {
 }
 
 type approveMsg struct {
+	pr  pullRequest
+	err error
+}
+
+type copyURLMsg struct {
 	pr  pullRequest
 	err error
 }
@@ -125,6 +131,15 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.approved[msg.pr.URL] = true
 		m.status = "approved " + prLabel(msg.pr)
 		return m, loadPRsCmd()
+	case copyURLMsg:
+		if msg.err != nil {
+			m.err = msg.err.Error()
+			m.status = "failed to copy URL"
+			return m, nil
+		}
+		m.err = ""
+		m.status = "copied " + prLabel(msg.pr) + " URL"
+		return m, nil
 	}
 	return m, nil
 }
@@ -162,6 +177,13 @@ func (m model) handleKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 		m.detailVP.PageDown()
 	case "pgup":
 		m.detailVP.PageUp()
+	case "y":
+		if !m.loading && len(m.prs) > 0 {
+			pr := m.prs[m.cursor]
+			m.status = "copying URL..."
+			m.err = ""
+			return m, copyURLCmd(pr)
+		}
 	case "a":
 		if m.currentDetail != nil && !m.loading && !m.detailLoading {
 			pr := m.currentDetail.pullRequest
@@ -410,6 +432,21 @@ func approveCmd(pr pullRequest) tea.Cmd {
 		defer cancel()
 		err := approvePR(ctx, pr)
 		return approveMsg{pr: pr, err: err}
+	}
+}
+
+func copyURLCmd(pr pullRequest) tea.Cmd {
+	return func() tea.Msg {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+
+		cmd := exec.CommandContext(ctx, "pbcopy")
+		cmd.Stdin = strings.NewReader(pr.URL)
+		err := cmd.Run()
+		if ctx.Err() != nil {
+			err = ctx.Err()
+		}
+		return copyURLMsg{pr: pr, err: err}
 	}
 }
 
