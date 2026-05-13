@@ -53,14 +53,41 @@ type model struct {
 }
 
 var (
-	titleStyle       = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("39"))
-	selectedStyle    = lipgloss.NewStyle().Foreground(lipgloss.Color("230")).Background(lipgloss.Color("62"))
-	mutedStyle       = lipgloss.NewStyle().Foreground(lipgloss.Color("245"))
-	errorStyle       = lipgloss.NewStyle().Foreground(lipgloss.Color("196"))
-	okStyle          = lipgloss.NewStyle().Foreground(lipgloss.Color("42"))
-	meFrameStyle     = lipgloss.NewStyle().Border(lipgloss.RoundedBorder()).BorderForeground(lipgloss.Color("39"))
-	teamFrameStyle   = lipgloss.NewStyle().Border(lipgloss.RoundedBorder()).BorderForeground(lipgloss.Color("214"))
-	detailFrameStyle = lipgloss.NewStyle().Border(lipgloss.RoundedBorder()).BorderForeground(lipgloss.Color("245")).PaddingLeft(1)
+	tokyoNightFG         = lipgloss.Color("#c0caf5")
+	tokyoNightMuted      = lipgloss.Color("#565f89")
+	tokyoNightBlue       = lipgloss.Color("#7aa2f7")
+	tokyoNightCyan       = lipgloss.Color("#7dcfff")
+	tokyoNightGreen      = lipgloss.Color("#9ece6a")
+	tokyoNightMagenta    = lipgloss.Color("#bb9af7")
+	tokyoNightOrange     = lipgloss.Color("#ff9e64")
+	tokyoNightRed        = lipgloss.Color("#f7768e")
+	tokyoNightYellow     = lipgloss.Color("#e0af68")
+	tokyoNightSelected   = lipgloss.Color("#283457")
+	tokyoNightSelectedFg = lipgloss.Color("#ffffff")
+
+	titleStyle          = lipgloss.NewStyle().Bold(true).Foreground(tokyoNightBlue)
+	selectedStyle       = lipgloss.NewStyle().Foreground(tokyoNightFG).Background(tokyoNightSelected)
+	selectedTextStyle   = lipgloss.NewStyle().Foreground(tokyoNightSelectedFg).Background(tokyoNightSelected)
+	selectedMutedStyle  = lipgloss.NewStyle().Foreground(tokyoNightYellow).Background(tokyoNightSelected)
+	selectedOKStyle     = lipgloss.NewStyle().Foreground(tokyoNightGreen).Background(tokyoNightSelected)
+	selectedErrorStyle  = lipgloss.NewStyle().Foreground(tokyoNightRed).Background(tokyoNightSelected)
+	mutedStyle          = lipgloss.NewStyle().Foreground(tokyoNightMuted)
+	errorStyle          = lipgloss.NewStyle().Foreground(tokyoNightRed)
+	okStyle             = lipgloss.NewStyle().Foreground(tokyoNightGreen)
+	listMeTitleStyle    = lipgloss.NewStyle().Bold(true).Foreground(tokyoNightCyan)
+	listTeamTitleStyle  = lipgloss.NewStyle().Bold(true).Foreground(tokyoNightOrange)
+	listHeaderStyle     = lipgloss.NewStyle().Foreground(tokyoNightMuted)
+	listRepoStyle       = lipgloss.NewStyle().Foreground(tokyoNightCyan)
+	listNumStyle        = lipgloss.NewStyle().Foreground(tokyoNightBlue)
+	listTitleStyle      = lipgloss.NewStyle().Foreground(tokyoNightFG)
+	listAuthorStyle     = lipgloss.NewStyle().Foreground(tokyoNightMagenta)
+	detailTitleStyle    = lipgloss.NewStyle().Bold(true).Foreground(tokyoNightMagenta)
+	detailMetaKeyStyle  = lipgloss.NewStyle().Foreground(tokyoNightYellow)
+	detailMetaTextStyle = lipgloss.NewStyle().Foreground(tokyoNightFG)
+	detailRuleStyle     = lipgloss.NewStyle().Foreground(tokyoNightMuted)
+	meFrameStyle        = lipgloss.NewStyle().Border(lipgloss.RoundedBorder()).BorderForeground(tokyoNightCyan)
+	teamFrameStyle      = lipgloss.NewStyle().Border(lipgloss.RoundedBorder()).BorderForeground(tokyoNightOrange)
+	detailFrameStyle    = lipgloss.NewStyle().Border(lipgloss.RoundedBorder()).BorderForeground(tokyoNightMagenta).PaddingLeft(1)
 )
 
 func newModel() model {
@@ -284,7 +311,7 @@ func (m model) renderGroupedList() string {
 	if len(me) > 0 {
 		contentW := frameContentWidth(meFrameStyle, boxW)
 		var lines []string
-		lines = append(lines, titleStyle.Render("Me"))
+		lines = append(lines, listMeTitleStyle.Render("Me"))
 		lines = append(lines, m.renderListHeader(contentW))
 		for _, item := range me {
 			lines = append(lines, m.renderPRLine(item.idx, item.pr, contentW))
@@ -297,7 +324,7 @@ func (m model) renderGroupedList() string {
 	if len(team) > 0 {
 		contentW := frameContentWidth(teamFrameStyle, boxW)
 		var lines []string
-		lines = append(lines, titleStyle.Render("Team"))
+		lines = append(lines, listTeamTitleStyle.Render("Team"))
 		lines = append(lines, m.renderListHeader(contentW))
 		for _, item := range team {
 			lines = append(lines, m.renderPRLine(item.idx, item.pr, contentW))
@@ -327,49 +354,109 @@ func (m model) groupPRsByIndex() (me, team []indexedPR) {
 }
 
 const (
-	colRepoW   = 28
-	colNumW    = 6
-	colAuthorW = 15
+	colRepoW    = 28
+	colNumW     = 6
+	colAuthorW  = 15
+	colApproveW = 11
 )
 
-func listTitleWidth(boxW, approvedW int) int {
-	// budget: leading/trailing space (2) + repo + "  " (2) + num + "  " (2) + title + "  " (2) + "@" or " " (1) + author + approved
-	fixed := 2 + colRepoW + 2 + colNumW + 2 + 2 + 1 + colAuthorW + approvedW
+func listTitleWidth(boxW int) int {
+	// budget: leading/trailing space (2) + repo + num + title + author + approve columns and separators.
+	fixed := 2 + colRepoW + 2 + colNumW + 2 + 2 + 1 + colAuthorW + 2 + colApproveW
 	return max(10, boxW-fixed)
 }
 
 func (m model) renderListHeader(boxW int) string {
-	titleW := listTitleWidth(boxW, 0)
-	line := fmt.Sprintf("%s  %s  %s   %s",
+	titleW := listTitleWidth(boxW)
+	line := fmt.Sprintf("%s  %s  %s   %s  %s",
 		padRight("Repository", colRepoW),
 		padRight("#", colNumW),
 		padRight("Title", titleW),
 		padRight("Author", colAuthorW),
+		padRight("Approve", colApproveW),
 	)
-	return " " + mutedStyle.Render(line)
+	return " " + listHeaderStyle.Render(line)
 }
 
 func (m model) renderPRLine(idx int, pr pullRequest, boxW int) string {
-	approvedW := 0
-	approved := m.approved[pr.URL]
-	if approved {
-		approvedW = 9 // " approved"
-	}
-	titleW := listTitleWidth(boxW, approvedW)
+	titleW := listTitleWidth(boxW)
+	approve := m.approveLabel(pr)
+	selected := idx == m.cursor
 
-	line := fmt.Sprintf("%s  %s  %s  %s",
-		padRight(pr.Repository, colRepoW),
-		padRight(fmt.Sprintf("#%d", pr.Number), colNumW),
-		padRight(pr.Title, titleW),
-		mutedStyle.Render("@"+padRight(pr.Author, colAuthorW)),
+	line := fmt.Sprintf("%s  %s  %s  %s  %s",
+		m.listRepoStyle(selected).Render(padRight(pr.Repository, colRepoW)),
+		m.listNumStyle(selected).Render(padRight(fmt.Sprintf("#%d", pr.Number), colNumW)),
+		m.listTitleStyle(selected).Render(padRight(pr.Title, titleW)),
+		m.listAuthorStyle(selected).Render("@"+padRight(pr.Author, colAuthorW)),
+		m.approveStyle(approve, selected).Render(padRight(approve, colApproveW)),
 	)
-	if approved {
-		line += " " + okStyle.Render("approved")
-	}
-	if idx == m.cursor {
+	if selected {
 		return selectedStyle.Render(" " + line + " ")
 	}
 	return " " + line
+}
+
+func (m model) approveLabel(pr pullRequest) string {
+	if m.approved[pr.URL] || pr.ReviewDecision == "APPROVED" {
+		return "approved"
+	}
+	switch pr.ReviewDecision {
+	case "CHANGES_REQUESTED":
+		return "changes"
+	case "REVIEW_REQUIRED":
+		return "required"
+	default:
+		return "-"
+	}
+}
+
+func (m model) listRepoStyle(selected bool) lipgloss.Style {
+	if selected {
+		return selectedTextStyle
+	}
+	return listRepoStyle
+}
+
+func (m model) listNumStyle(selected bool) lipgloss.Style {
+	if selected {
+		return selectedMutedStyle
+	}
+	return listNumStyle
+}
+
+func (m model) listTitleStyle(selected bool) lipgloss.Style {
+	if selected {
+		return selectedTextStyle.Bold(true)
+	}
+	return listTitleStyle
+}
+
+func (m model) listAuthorStyle(selected bool) lipgloss.Style {
+	if selected {
+		return selectedTextStyle
+	}
+	return listAuthorStyle
+}
+
+func (m model) approveStyle(label string, selected bool) lipgloss.Style {
+	if selected {
+		switch label {
+		case "approved":
+			return selectedOKStyle
+		case "changes":
+			return selectedErrorStyle
+		default:
+			return selectedMutedStyle
+		}
+	}
+	switch label {
+	case "approved":
+		return okStyle
+	case "changes":
+		return errorStyle
+	default:
+		return mutedStyle
+	}
 }
 
 func (m model) renderDetailSection() string {
@@ -493,7 +580,7 @@ func prLabel(pr pullRequest) string {
 
 func renderDiffContent(detail pullRequestDetail, diff string) string {
 	var b strings.Builder
-	b.WriteString(titleStyle.Render(fmt.Sprintf("%s  #%d  %s", detail.Repository, detail.Number, detail.Title)))
+	b.WriteString(detailTitleStyle.Render(fmt.Sprintf("%s  #%d  %s", detail.Repository, detail.Number, detail.Title)))
 	b.WriteByte('\n')
 	b.WriteString(formatMeta("Author", "@"+detail.Author))
 	b.WriteString("  ")
@@ -505,7 +592,7 @@ func renderDiffContent(detail pullRequestDetail, diff string) string {
 	b.WriteByte('\n')
 	b.WriteString(formatMeta("State", nonEmpty(detail.MergeStateStatus, "unknown")))
 	b.WriteString("  ")
-	b.WriteString(formatMeta("Review", nonEmpty(detail.ReviewDecision, "none")))
+	b.WriteString(formatReviewMeta(detail.ReviewDecision))
 	b.WriteString("  ")
 	b.WriteString(formatMeta("Files", fmt.Sprintf("%d", detail.ChangedFiles)))
 	b.WriteString("  ")
@@ -536,14 +623,32 @@ func renderDiffContent(detail pullRequestDetail, diff string) string {
 		b.WriteString(body)
 	}
 	b.WriteString("\n\n")
-	b.WriteString(mutedStyle.Render(strings.Repeat("-", 80)))
+	b.WriteString(detailRuleStyle.Render(strings.Repeat("-", 80)))
 	b.WriteString("\n\n")
 	b.WriteString(diff)
 	return b.String()
 }
 
 func formatMeta(label, value string) string {
-	return mutedStyle.Render(label+":") + " " + value
+	return detailMetaKeyStyle.Render(label+":") + " " + detailMetaTextStyle.Render(value)
+}
+
+func formatReviewMeta(decision string) string {
+	value := nonEmpty(decision, "none")
+	return detailMetaKeyStyle.Render("Review:") + " " + reviewDecisionStyle(decision).Render(value)
+}
+
+func reviewDecisionStyle(decision string) lipgloss.Style {
+	switch decision {
+	case "APPROVED":
+		return okStyle
+	case "CHANGES_REQUESTED":
+		return errorStyle
+	case "REVIEW_REQUIRED":
+		return lipgloss.NewStyle().Foreground(tokyoNightYellow)
+	default:
+		return detailMetaTextStyle
+	}
 }
 
 func nonEmpty(s, fallback string) string {

@@ -3,6 +3,7 @@ package app
 import (
 	"errors"
 	"testing"
+	"time"
 )
 
 func TestIsPRDiffTooLargeError(t *testing.T) {
@@ -39,5 +40,59 @@ func TestIsPRDiffTooLargeError(t *testing.T) {
 				t.Fatalf("isPRDiffTooLargeError() = %v, want %v", got, tt.want)
 			}
 		})
+	}
+}
+
+func TestParseSearchPRsResponseIncludesReviewDecision(t *testing.T) {
+	out := []byte(`{
+		"data": {
+			"search": {
+				"pageInfo": {
+					"hasNextPage": true,
+					"endCursor": "cursor-1"
+				},
+				"nodes": [
+					{
+						"number": 42,
+						"title": "Add review list status",
+						"url": "https://github.com/owner/repo/pull/42",
+						"updatedAt": "2026-05-13T01:02:03Z",
+						"reviewDecision": "APPROVED",
+						"repository": {
+							"nameWithOwner": "owner/repo"
+						},
+						"author": {
+							"login": "octocat"
+						}
+					}
+				]
+			}
+		}
+	}`)
+
+	page, err := parseSearchPRsResponse(out, "@me")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !page.hasNextPage {
+		t.Fatal("hasNextPage = false, want true")
+	}
+	if page.endCursor != "cursor-1" {
+		t.Fatalf("endCursor = %q, want cursor-1", page.endCursor)
+	}
+	if len(page.prs) != 1 {
+		t.Fatalf("len(prs) = %d, want 1", len(page.prs))
+	}
+
+	pr := page.prs[0]
+	if pr.Repository != "owner/repo" {
+		t.Fatalf("Repository = %q, want owner/repo", pr.Repository)
+	}
+	if pr.ReviewDecision != "APPROVED" {
+		t.Fatalf("ReviewDecision = %q, want APPROVED", pr.ReviewDecision)
+	}
+	wantUpdatedAt := time.Date(2026, 5, 13, 1, 2, 3, 0, time.UTC)
+	if !pr.UpdatedAt.Equal(wantUpdatedAt) {
+		t.Fatalf("UpdatedAt = %s, want %s", pr.UpdatedAt, wantUpdatedAt)
 	}
 }
