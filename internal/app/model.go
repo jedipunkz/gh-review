@@ -36,19 +36,20 @@ type copyURLMsg struct {
 }
 
 type model struct {
-	loading       bool
-	status        string
-	err           string
-	prs           []pullRequest
-	cursor        int
-	currentDetail *pullRequestDetail
-	detailLoading bool
-	detailErr     string
-	loadingForURL string
-	detailVP      viewport.Model
-	width         int
-	height        int
-	approved      map[string]bool
+	loading        bool
+	status         string
+	err            string
+	prs            []pullRequest
+	cursor         int
+	currentDetail  *pullRequestDetail
+	detailLoading  bool
+	detailErr      string
+	loadingForURL  string
+	detailVP       viewport.Model
+	width          int
+	height         int
+	approved       map[string]bool
+	pendingApprove *pullRequest
 }
 
 var (
@@ -146,6 +147,10 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 func (m model) handleKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 	key := msg.String()
+	if m.pendingApprove != nil {
+		return m.handleApproveConfirmation(key)
+	}
+
 	switch key {
 	case "ctrl+c", "q":
 		return m, tea.Quit
@@ -187,13 +192,35 @@ func (m model) handleKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 	case "a":
 		if m.currentDetail != nil && !m.loading && !m.detailLoading {
 			pr := m.currentDetail.pullRequest
-			m.loading = true
-			m.status = "approving..."
 			m.err = ""
-			return m, approveCmd(pr)
+			m.pendingApprove = &pr
+			m.status = fmt.Sprintf("Approve %s? yes/no", prLabel(pr))
+			return m, nil
 		}
 	}
 	return m, nil
+}
+
+func (m model) handleApproveConfirmation(key string) (tea.Model, tea.Cmd) {
+	pr := *m.pendingApprove
+	switch strings.ToLower(key) {
+	case "ctrl+c":
+		return m, tea.Quit
+	case "y", "yes":
+		m.pendingApprove = nil
+		m.loading = true
+		m.status = "approving..."
+		m.err = ""
+		return m, approveCmd(pr)
+	case "n", "no", "esc":
+		m.pendingApprove = nil
+		m.status = "approval canceled"
+		m.err = ""
+		return m, nil
+	default:
+		m.status = fmt.Sprintf("Approve %s? yes/no", prLabel(pr))
+		return m, nil
+	}
 }
 
 func (m *model) triggerDetailLoad() tea.Cmd {
@@ -371,6 +398,9 @@ func frameContentWidth(style lipgloss.Style, width int) int {
 }
 
 func (m model) renderFooter() string {
+	if m.pendingApprove != nil {
+		return mutedStyle.Render("confirm approve: y/yes approve  n/no cancel")
+	}
 	return mutedStyle.Render("ctrl+n/p list  j/k scroll  pgup/pgdn page  a approve  r refresh  q quit")
 }
 
