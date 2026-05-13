@@ -422,6 +422,10 @@ func loadDiffCmd(pr pullRequest) tea.Cmd {
 			return diffMsg{pr: pr, err: err}
 		}
 		diff, err := loadDiff(ctx, pr)
+		if isPRDiffTooLargeError(err) {
+			diff = mutedStyle.Render("Diff omitted because GitHub reports this PR diff is too large to display.")
+			err = nil
+		}
 		return diffMsg{pr: pr, detail: detail, diff: diff, err: err}
 	}
 }

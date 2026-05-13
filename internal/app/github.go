@@ -242,6 +242,15 @@ func loadDiff(ctx context.Context, pr pullRequest) (string, error) {
 	return string(out), nil
 }
 
+func isPRDiffTooLargeError(err error) bool {
+	if err == nil {
+		return false
+	}
+	message := err.Error()
+	return strings.Contains(message, "PullRequest.diff too_large") ||
+		strings.Contains(message, "diff exceeded the maximum number of files")
+}
+
 func approvePR(ctx context.Context, pr pullRequest) error {
 	_, err := runGH(ctx, "pr", "review", pr.URL, "--approve")
 	return err
