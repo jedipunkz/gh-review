@@ -13,13 +13,14 @@ import (
 )
 
 type pullRequest struct {
-	Repository string
-	Number     int
-	Title      string
-	URL        string
-	Author     string
-	UpdatedAt  time.Time
-	Request    string
+	Repository     string
+	Number         int
+	Title          string
+	URL            string
+	Author         string
+	UpdatedAt      time.Time
+	Request        string
+	ReviewDecision string
 }
 
 type pullRequestDetail struct {
@@ -41,17 +42,28 @@ type team struct {
 	Slug         string
 }
 
-type issueSearchResponse struct {
-	Items []struct {
-		Number        int       `json:"number"`
-		Title         string    `json:"title"`
-		URL           string    `json:"html_url"`
-		RepositoryURL string    `json:"repository_url"`
-		UpdatedAt     time.Time `json:"updated_at"`
-		User          struct {
-			Login string `json:"login"`
-		} `json:"user"`
-	} `json:"items"`
+type searchPRsResponse struct {
+	Data struct {
+		Search struct {
+			PageInfo struct {
+				HasNextPage bool   `json:"hasNextPage"`
+				EndCursor   string `json:"endCursor"`
+			} `json:"pageInfo"`
+			Nodes []struct {
+				Number         int       `json:"number"`
+				Title          string    `json:"title"`
+				URL            string    `json:"url"`
+				UpdatedAt      time.Time `json:"updatedAt"`
+				ReviewDecision string    `json:"reviewDecision"`
+				Repository     struct {
+					NameWithOwner string `json:"nameWithOwner"`
+				} `json:"repository"`
+				Author struct {
+					Login string `json:"login"`
+				} `json:"author"`
+			} `json:"nodes"`
+		} `json:"search"`
+	} `json:"data"`
 }
 
 type prViewResponse struct {
@@ -75,6 +87,32 @@ type prViewResponse struct {
 		Name string `json:"name"`
 	} `json:"labels"`
 }
+
+const searchPRsGraphQLQuery = `
+query($q: String!, $after: String) {
+  search(type: ISSUE, query: $q, first: 100, after: $after) {
+    pageInfo {
+      hasNextPage
+      endCursor
+    }
+    nodes {
+      ... on PullRequest {
+        number
+        title
+        url
+        updatedAt
+        reviewDecision
+        repository {
+          nameWithOwner
+        }
+        author {
+          login
+        }
+      }
+    }
+  }
+}
+`
 
 func loadReviewRequests(ctx context.Context) ([]pullRequest, error) {
 	queries := []struct {
@@ -163,29 +201,64 @@ func loadTeams(ctx context.Context) ([]team, error) {
 }
 
 func searchPRs(ctx context.Context, query, label string) ([]pullRequest, error) {
-	out, err := runGH(ctx, "api", "--method", "GET", "/search/issues", "-f", "q="+query, "-f", "per_page=100")
-	if err != nil {
-		return nil, err
-	}
+	var prs []pullRequest
+	var after string
+	for {
+		args := []string{"api", "graphql", "-f", "query=" + searchPRsGraphQLQuery, "-F", "q=" + query}
+		if after != "" {
+			args = append(args, "-F", "after="+after)
+		}
+		out, err := runGH(ctx, args...)
+		if err != nil {
+			return nil, err
+		}
 
-	var res issueSearchResponse
-	if err := json.Unmarshal(out, &res); err != nil {
-		return nil, err
-	}
-
-	prs := make([]pullRequest, 0, len(res.Items))
-	for _, item := range res.Items {
-		prs = append(prs, pullRequest{
-			Repository: repositoryName(item.RepositoryURL),
-			Number:     item.Number,
-			Title:      item.Title,
-			URL:        item.URL,
-			Author:     item.User.Login,
-			UpdatedAt:  item.UpdatedAt,
-			Request:    label,
-		})
+		page, err := parseSearchPRsResponse(out, label)
+		if err != nil {
+			return nil, err
+		}
+		prs = append(prs, page.prs...)
+		if !page.hasNextPage || page.endCursor == "" {
+			break
+		}
+		after = page.endCursor
 	}
 	return prs, nil
+}
+
+type searchPRsPage struct {
+	prs         []pullRequest
+	hasNextPage bool
+	endCursor   string
+}
+
+func parseSearchPRsResponse(out []byte, label string) (searchPRsPage, error) {
+	var res searchPRsResponse
+	if err := json.Unmarshal(out, &res); err != nil {
+		return searchPRsPage{}, err
+	}
+
+	nodes := res.Data.Search.Nodes
+	prs := make([]pullRequest, 0, len(nodes))
+	for _, item := range nodes {
+		prs = append(prs, pullRequest{
+			Repository:     item.Repository.NameWithOwner,
+			Number:         item.Number,
+			Title:          item.Title,
+			URL:            item.URL,
+			Author:         item.Author.Login,
+			UpdatedAt:      item.UpdatedAt,
+			Request:        label,
+			ReviewDecision: item.ReviewDecision,
+		})
+	}
+
+	pageInfo := res.Data.Search.PageInfo
+	return searchPRsPage{
+		prs:         prs,
+		hasNextPage: pageInfo.HasNextPage,
+		endCursor:   pageInfo.EndCursor,
+	}, nil
 }
 
 func loadPRDetail(ctx context.Context, pr pullRequest) (pullRequestDetail, error) {
@@ -269,13 +342,4 @@ func runGH(ctx context.Context, args ...string) ([]byte, error) {
 		return nil, fmt.Errorf("gh %s: %s", strings.Join(args, " "), message)
 	}
 	return out, nil
-}
-
-func repositoryName(apiURL string) string {
-	const marker = "/repos/"
-	i := strings.Index(apiURL, marker)
-	if i == -1 {
-		return apiURL
-	}
-	return apiURL[i+len(marker):]
 }

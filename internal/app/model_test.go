@@ -102,6 +102,54 @@ func TestApproveConfirmationNoCancelsApprove(t *testing.T) {
 	}
 }
 
+func TestApproveLabelUsesReviewDecision(t *testing.T) {
+	m := newModel()
+	tests := []struct {
+		name string
+		pr   pullRequest
+		want string
+	}{
+		{
+			name: "approved",
+			pr:   pullRequest{ReviewDecision: "APPROVED"},
+			want: "approved",
+		},
+		{
+			name: "changes requested",
+			pr:   pullRequest{ReviewDecision: "CHANGES_REQUESTED"},
+			want: "changes",
+		},
+		{
+			name: "review required",
+			pr:   pullRequest{ReviewDecision: "REVIEW_REQUIRED"},
+			want: "required",
+		},
+		{
+			name: "unknown",
+			pr:   pullRequest{},
+			want: "-",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := m.approveLabel(tt.pr); got != tt.want {
+				t.Fatalf("approveLabel() = %q, want %q", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestApproveLabelUsesLocalApprovedState(t *testing.T) {
+	m := newModel()
+	pr := pullRequest{URL: "https://example.test/pr/1"}
+	m.approved[pr.URL] = true
+
+	if got := m.approveLabel(pr); got != "approved" {
+		t.Fatalf("approveLabel() = %q, want approved", got)
+	}
+}
+
 func modelWithLoadedDetail() model {
 	m := newModel()
 	m.loading = false
