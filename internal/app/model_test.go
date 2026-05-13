@@ -35,7 +35,10 @@ func TestFrameSectionsUseSameRenderedWidth(t *testing.T) {
 	m.resizeViewport()
 	m.detailVP.SetContent("detail")
 
-	want := m.frameWidth()
+	want := m.width
+	if got := m.frameWidth(); got != want {
+		t.Fatalf("frame width = %d, want %d", got, want)
+	}
 	if got := lipgloss.Width(m.renderGroupedList()); got != want {
 		t.Fatalf("list width = %d, want %d", got, want)
 	}
