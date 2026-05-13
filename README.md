@@ -27,7 +27,7 @@ are not `gh-review`.
 
 - `j` / `k`: move selection or scroll diff
 - `enter` / `d`: show diff
-- `a`: from the list, show the diff first; from the diff view, approve
+- `a`: approve after confirming with `y`/`yes` or cancel with `n`/`no`
 - `y`: copy the selected PR URL to the clipboard
 - `esc` / `b`: return to the list
 - `r`: refresh
