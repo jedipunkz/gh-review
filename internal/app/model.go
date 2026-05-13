@@ -390,7 +390,10 @@ func (m model) renderDetailSection() string {
 }
 
 func (m model) frameWidth() int {
-	return max(40, m.width-4)
+	if m.width > 0 {
+		return m.width
+	}
+	return 40
 }
 
 func frameContentWidth(style lipgloss.Style, width int) int {
