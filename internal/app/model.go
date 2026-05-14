@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"os/exec"
+	"runtime"
 	"sort"
 	"strings"
 	"time"
@@ -147,7 +148,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		m.updateNotice = &updateNotice{count: msg.count}
 		m.status = "review requests changed"
-		return m, nil
+		return m, playNotifySoundCmd()
 	case prListMsg:
 		m.loading = false
 		if msg.err != nil {
@@ -642,6 +643,22 @@ func approveCmd(pr pullRequest) tea.Cmd {
 		defer cancel()
 		err := approvePR(ctx, pr)
 		return approveMsg{pr: pr, err: err}
+	}
+}
+
+var notifySoundFile = "/System/Library/Sounds/Glass.aiff"
+
+func playNotifySoundCmd() tea.Cmd {
+	if runtime.GOOS != "darwin" {
+		return nil
+	}
+	return func() tea.Msg {
+		cmd := exec.Command("afplay", notifySoundFile)
+		if err := cmd.Start(); err != nil {
+			return nil
+		}
+		go func() { _ = cmd.Wait() }()
+		return nil
 	}
 }
 
