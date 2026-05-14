@@ -50,7 +50,14 @@ type updateCheckMsg struct {
 
 type updateNotice struct {
 	count int
+	id    int
 }
+
+type popupDismissMsg struct {
+	id int
+}
+
+const popupDismissDelay = 6 * time.Second
 
 type model struct {
 	loading        bool
@@ -70,6 +77,8 @@ type model struct {
 	approved       map[string]bool
 	pendingApprove *pullRequest
 	updateNotice   *updateNotice
+	markedPRs      map[string]bool
+	popupSeq       int
 }
 
 var (
@@ -111,7 +120,8 @@ var (
 	meFrameStyle        = lipgloss.NewStyle().Border(lipgloss.RoundedBorder()).BorderForeground(framePink)
 	teamFrameStyle      = lipgloss.NewStyle().Border(lipgloss.RoundedBorder()).BorderForeground(framePink)
 	detailFrameStyle    = lipgloss.NewStyle().Border(lipgloss.RoundedBorder()).BorderForeground(frameGray).PaddingLeft(1)
-	updateNoticeStyle   = lipgloss.NewStyle().Border(lipgloss.RoundedBorder()).BorderForeground(tokyoNightYellow).Padding(1, 2)
+	updateNoticeStyle   = lipgloss.NewStyle().Border(lipgloss.RoundedBorder()).BorderForeground(tokyoNightYellow).Padding(0, 1)
+	markStyle           = lipgloss.NewStyle().Bold(true).Foreground(tokyoNightYellow)
 )
 
 const updateCheckInterval = time.Minute
@@ -120,10 +130,11 @@ func newModel() model {
 	vp := viewport.New()
 	vp.SoftWrap = false
 	return model{
-		loading:  true,
-		status:   "loading review requests...",
-		detailVP: vp,
-		approved: make(map[string]bool),
+		loading:   true,
+		status:    "loading review requests...",
+		detailVP:  vp,
+		approved:  make(map[string]bool),
+		markedPRs: make(map[string]bool),
 	}
 }
 
@@ -156,9 +167,31 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				return prListMsg{prs: prs}
 			}
 		}
-		m.updateNotice = &updateNotice{count: msg.count}
-		m.status = "review requests changed"
-		return m, playNotifySoundCmd()
+		newURLs := newPRURLs(m.prs, msg.prs)
+		for _, url := range newURLs {
+			m.markedPRs[url] = true
+		}
+		m.prs = msg.prs
+		m.prSignature = msg.currentSignature
+		if m.cursor >= len(m.prs) {
+			m.cursor = max(0, len(m.prs)-1)
+		}
+		m.resizeViewport()
+		m.popupSeq++
+		m.updateNotice = &updateNotice{count: msg.count, id: m.popupSeq}
+		m.status = fmt.Sprintf("%d review request(s)", len(m.prs))
+		var cmds []tea.Cmd
+		cmds = append(cmds, playNotifySoundCmd(), dismissPopupCmd(m.popupSeq))
+		if detailCmd := m.refreshDetailIfNeeded(); detailCmd != nil {
+			cmds = append(cmds, detailCmd)
+		}
+		return m, tea.Batch(cmds...)
+	case popupDismissMsg:
+		if m.updateNotice != nil && m.updateNotice.id == msg.id {
+			m.updateNotice = nil
+			m.status = fmt.Sprintf("%d review request(s)", len(m.prs))
+		}
+		return m, nil
 	case prListMsg:
 		m.loading = false
 		if msg.err != nil {
@@ -171,6 +204,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.prSignature = prListSignature(msg.prs)
 		m.prListLoaded = true
 		m.updateNotice = nil
+		m.pruneMarkedPRs()
 		if m.cursor >= len(m.prs) {
 			m.cursor = max(0, len(m.prs)-1)
 		}
@@ -222,12 +256,10 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 func (m model) handleKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 	key := msg.String()
-	if m.updateNotice != nil {
-		return m.handleUpdateNotice(key)
-	}
 	if m.pendingApprove != nil {
 		return m.handleApproveConfirmation(key)
 	}
+	m.clearMarkOnSelected()
 
 	switch key {
 	case "ctrl+c", "q":
@@ -279,25 +311,6 @@ func (m model) handleKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 	return m, nil
 }
 
-func (m model) handleUpdateNotice(key string) (tea.Model, tea.Cmd) {
-	switch key {
-	case "ctrl+c", "q":
-		return m, tea.Quit
-	case "enter":
-		m.updateNotice = nil
-		m.loading = true
-		m.status = "refreshing..."
-		m.err = ""
-		return m, loadPRsCmd()
-	case "esc":
-		m.updateNotice = nil
-		m.status = fmt.Sprintf("%d review request(s)", len(m.prs))
-		return m, nil
-	default:
-		return m, nil
-	}
-}
-
 func (m model) handleApproveConfirmation(key string) (tea.Model, tea.Cmd) {
 	pr := *m.pendingApprove
 	switch strings.ToLower(key) {
@@ -318,6 +331,71 @@ func (m model) handleApproveConfirmation(key string) (tea.Model, tea.Cmd) {
 		m.status = fmt.Sprintf("Approve %s? yes/no", prLabel(pr))
 		return m, nil
 	}
+}
+
+func (m *model) refreshDetailIfNeeded() tea.Cmd {
+	if len(m.prs) == 0 {
+		m.currentDetail = nil
+		m.detailLoading = false
+		m.loadingForURL = ""
+		m.detailVP.SetContent("")
+		return nil
+	}
+	if m.cursor >= len(m.prs) {
+		m.cursor = len(m.prs) - 1
+	}
+	if m.prs[m.cursor].URL == m.loadingForURL {
+		return nil
+	}
+	return m.triggerDetailLoad()
+}
+
+func (m *model) clearMarkOnSelected() {
+	if len(m.markedPRs) == 0 || len(m.prs) == 0 {
+		return
+	}
+	if m.cursor < 0 || m.cursor >= len(m.prs) {
+		return
+	}
+	url := m.prs[m.cursor].URL
+	if m.markedPRs[url] {
+		delete(m.markedPRs, url)
+	}
+}
+
+func (m *model) pruneMarkedPRs() {
+	if len(m.markedPRs) == 0 {
+		return
+	}
+	alive := make(map[string]bool, len(m.prs))
+	for _, pr := range m.prs {
+		alive[pr.URL] = true
+	}
+	for url := range m.markedPRs {
+		if !alive[url] {
+			delete(m.markedPRs, url)
+		}
+	}
+}
+
+func newPRURLs(prev, curr []pullRequest) []string {
+	existing := make(map[string]bool, len(prev))
+	for _, pr := range prev {
+		existing[pr.URL] = true
+	}
+	var added []string
+	for _, pr := range curr {
+		if !existing[pr.URL] {
+			added = append(added, pr.URL)
+		}
+	}
+	return added
+}
+
+func dismissPopupCmd(id int) tea.Cmd {
+	return tea.Tick(popupDismissDelay, func(time.Time) tea.Msg {
+		return popupDismissMsg{id: id}
+	})
 }
 
 func (m *model) triggerDetailLoad() tea.Cmd {
@@ -342,7 +420,7 @@ func (m model) View() tea.View {
 	}
 	view := strings.Join(parts, "\n")
 	if m.updateNotice != nil {
-		view = m.renderUpdateNotice(view)
+		view = m.overlayUpdateNotice(view)
 	}
 	return tea.NewView(view)
 }
@@ -428,6 +506,7 @@ func (m model) groupPRsByIndex() (me, team []indexedPR) {
 }
 
 const (
+	colMarkW    = 3
 	colRepoW    = 28
 	colNumW     = 6
 	colAuthorW  = 15
@@ -435,14 +514,15 @@ const (
 )
 
 func listTitleWidth(boxW int) int {
-	// budget: leading/trailing space (2) + repo + num + title + author + approve columns and separators.
-	fixed := 2 + colRepoW + 2 + colNumW + 2 + 2 + 1 + colAuthorW + 2 + colApproveW
+	// budget: leading/trailing space (2) + mark + repo + num + title + author + approve columns and separators.
+	fixed := 2 + colMarkW + 1 + colRepoW + 2 + colNumW + 2 + 2 + 1 + colAuthorW + 2 + colApproveW
 	return max(10, boxW-fixed)
 }
 
 func (m model) renderListHeader(boxW int) string {
 	titleW := listTitleWidth(boxW)
-	line := fmt.Sprintf("%s  %s  %s   %s  %s",
+	line := fmt.Sprintf("%s %s  %s  %s   %s  %s",
+		padRight("", colMarkW),
 		padRight("Repository", colRepoW),
 		padRight("#", colNumW),
 		padRight("Title", titleW),
@@ -457,7 +537,8 @@ func (m model) renderPRLine(idx int, pr pullRequest, boxW int) string {
 	approve := m.approveLabel(pr)
 	selected := idx == m.cursor
 
-	line := fmt.Sprintf("%s  %s  %s  %s  %s",
+	line := fmt.Sprintf("%s %s  %s  %s  %s  %s",
+		m.markCell(pr, selected),
 		m.listRepoStyle(selected).Render(padRight(pr.Repository, colRepoW)),
 		m.listNumStyle(selected).Render(padRight(fmt.Sprintf("#%d", pr.Number), colNumW)),
 		m.listTitleStyle(selected).Render(padRight(pr.Title, titleW)),
@@ -468,6 +549,17 @@ func (m model) renderPRLine(idx int, pr pullRequest, boxW int) string {
 		return selectedStyle.Render(" " + line + " ")
 	}
 	return " " + line
+}
+
+func (m model) markCell(pr pullRequest, selected bool) string {
+	if m.markedPRs[pr.URL] {
+		style := markStyle
+		if selected {
+			style = style.Background(tokyoNightSelected)
+		}
+		return style.Render(padRight("[!]", colMarkW))
+	}
+	return strings.Repeat(" ", colMarkW)
 }
 
 func (m model) approveLabel(pr pullRequest) string {
@@ -562,9 +654,6 @@ func frameContentWidth(style lipgloss.Style, width int) int {
 }
 
 func (m model) renderFooter() string {
-	if m.updateNotice != nil {
-		return footerStyle.Render("enter reload  esc dismiss  q quit")
-	}
 	if m.pendingApprove != nil {
 		return footerStyle.Render("confirm approve: y/yes approve  n/no cancel")
 	}
@@ -707,25 +796,36 @@ func prLabel(pr pullRequest) string {
 	return fmt.Sprintf("%s#%d", pr.Repository, pr.Number)
 }
 
-func (m model) renderUpdateNotice(base string) string {
-	width := max(40, m.frameWidth())
-	height := m.height
-	if height == 0 {
-		height = lipgloss.Height(base)
+func (m model) overlayUpdateNotice(base string) string {
+	popup := m.renderUpdateNoticePopup()
+	if popup == "" {
+		return base
 	}
-	count := "review requests"
-	if m.updateNotice.count >= 0 {
+	width := lipgloss.Width(base)
+	height := lipgloss.Height(base)
+	if width <= 0 || height <= 0 {
+		return base
+	}
+	pw := lipgloss.Width(popup)
+	ph := lipgloss.Height(popup)
+	x := max(0, width-pw-1)
+	y := max(0, height-ph-1)
+	canvas := lipgloss.NewCanvas(width, height)
+	canvas.Compose(lipgloss.NewLayer(base))
+	canvas.Compose(lipgloss.NewLayer(popup).X(x).Y(y).Z(1))
+	return canvas.Render()
+}
+
+func (m model) renderUpdateNoticePopup() string {
+	count := "review requests changed"
+	if m.updateNotice != nil && m.updateNotice.count >= 0 {
 		count = fmt.Sprintf("%d review request(s)", m.updateNotice.count)
 	}
 	body := strings.Join([]string{
-		titleStyle.Render("Review requests updated"),
-		mutedStyle.Render(count + " are available."),
-		"",
-		okStyle.Render("Press Enter to reload."),
-		mutedStyle.Render("Esc dismisses this notice."),
+		titleStyle.Render("Review updated"),
+		mutedStyle.Render(count),
 	}, "\n")
-	dialog := updateNoticeStyle.Width(min(52, max(32, width-8))).Render(body)
-	return lipgloss.Place(width, height, lipgloss.Center, lipgloss.Center, dialog)
+	return updateNoticeStyle.Render(body)
 }
 
 func renderDiffContent(detail pullRequestDetail, diff string) string {
