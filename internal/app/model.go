@@ -42,7 +42,9 @@ type updateCheckTickMsg time.Time
 type updateCheckMsg struct {
 	previousSignature string
 	currentSignature  string
+	previousCount     int
 	count             int
+	prs               []pullRequest
 	err               error
 }
 
@@ -104,9 +106,11 @@ var (
 	detailMetaKeyStyle  = lipgloss.NewStyle().Foreground(tokyoNightYellow)
 	detailMetaTextStyle = lipgloss.NewStyle().Foreground(tokyoNightFG)
 	detailRuleStyle     = lipgloss.NewStyle().Foreground(tokyoNightMuted)
-	meFrameStyle        = lipgloss.NewStyle().Border(lipgloss.RoundedBorder()).BorderForeground(tokyoNightCyan)
-	teamFrameStyle      = lipgloss.NewStyle().Border(lipgloss.RoundedBorder()).BorderForeground(tokyoNightOrange)
-	detailFrameStyle    = lipgloss.NewStyle().Border(lipgloss.RoundedBorder()).BorderForeground(tokyoNightMagenta).PaddingLeft(1)
+	framePink           = lipgloss.Color("#f7768e")
+	frameGray           = lipgloss.Color("#a9b1d6")
+	meFrameStyle        = lipgloss.NewStyle().Border(lipgloss.RoundedBorder()).BorderForeground(framePink)
+	teamFrameStyle      = lipgloss.NewStyle().Border(lipgloss.RoundedBorder()).BorderForeground(framePink)
+	detailFrameStyle    = lipgloss.NewStyle().Border(lipgloss.RoundedBorder()).BorderForeground(frameGray).PaddingLeft(1)
 	updateNoticeStyle   = lipgloss.NewStyle().Border(lipgloss.RoundedBorder()).BorderForeground(tokyoNightYellow).Padding(1, 2)
 )
 
@@ -139,12 +143,18 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case updateCheckTickMsg:
 		cmds := []tea.Cmd{updateCheckTickCmd()}
 		if !m.loading && m.updateNotice == nil && m.prListLoaded {
-			cmds = append(cmds, checkForUpdatesCmd(m.prSignature))
+			cmds = append(cmds, checkForUpdatesCmd(m.prSignature, len(m.prs)))
 		}
 		return m, tea.Batch(cmds...)
 	case updateCheckMsg:
 		if msg.err != nil || msg.previousSignature != m.prSignature || msg.currentSignature == m.prSignature {
 			return m, nil
+		}
+		if msg.count < msg.previousCount {
+			prs := msg.prs
+			return m, func() tea.Msg {
+				return prListMsg{prs: prs}
+			}
 		}
 		m.updateNotice = &updateNotice{count: msg.count}
 		m.status = "review requests changed"
@@ -606,7 +616,7 @@ func updateCheckTickCmd() tea.Cmd {
 	})
 }
 
-func checkForUpdatesCmd(previousSignature string) tea.Cmd {
+func checkForUpdatesCmd(previousSignature string, previousCount int) tea.Cmd {
 	return func() tea.Msg {
 		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 		defer cancel()
@@ -614,7 +624,9 @@ func checkForUpdatesCmd(previousSignature string) tea.Cmd {
 		return updateCheckMsg{
 			previousSignature: previousSignature,
 			currentSignature:  prListSignature(prs),
+			previousCount:     previousCount,
 			count:             len(prs),
+			prs:               prs,
 			err:               err,
 		}
 	}
