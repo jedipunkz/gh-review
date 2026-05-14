@@ -256,6 +256,9 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 func (m model) handleKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 	key := msg.String()
+	if m.updateNotice != nil {
+		m.updateNotice = nil
+	}
 	if m.pendingApprove != nil {
 		return m.handleApproveConfirmation(key)
 	}
@@ -810,10 +813,10 @@ func (m model) overlayUpdateNotice(base string) string {
 	ph := lipgloss.Height(popup)
 	x := max(0, width-pw-1)
 	y := max(0, height-ph-1)
-	canvas := lipgloss.NewCanvas(width, height)
-	canvas.Compose(lipgloss.NewLayer(base))
-	canvas.Compose(lipgloss.NewLayer(popup).X(x).Y(y).Z(1))
-	return canvas.Render()
+	return lipgloss.NewCompositor(
+		lipgloss.NewLayer(base),
+		lipgloss.NewLayer(popup).X(x).Y(y).Z(1),
+	).Render()
 }
 
 func (m model) renderUpdateNoticePopup() string {
