@@ -646,7 +646,7 @@ func approveCmd(pr pullRequest) tea.Cmd {
 	}
 }
 
-var notifySoundFile = "/System/Library/Sounds/Glass.aiff"
+var notifySoundFile = "/System/Library/Sounds/Pop.aiff"
 
 func playNotifySoundCmd() tea.Cmd {
 	if runtime.GOOS != "darwin" {
