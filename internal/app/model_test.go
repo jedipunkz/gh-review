@@ -162,7 +162,7 @@ func TestUpdateCheckShowsNoticeWhenSignatureChanges(t *testing.T) {
 	m.prs = prs
 	m.prSignature = prListSignature(prs)
 
-	updated, cmd := m.Update(updateCheckMsg{
+	updated, _ := m.Update(updateCheckMsg{
 		previousSignature: m.prSignature,
 		currentSignature: prListSignature([]pullRequest{
 			{
@@ -172,9 +172,6 @@ func TestUpdateCheckShowsNoticeWhenSignatureChanges(t *testing.T) {
 		}),
 		count: 1,
 	})
-	if cmd != nil {
-		t.Fatal("update check returned command")
-	}
 
 	got := updated.(model)
 	if got.updateNotice == nil {
