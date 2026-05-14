@@ -334,6 +334,56 @@ func TestPopupDismissMsgClearsCurrentNoticeOnly(t *testing.T) {
 	}
 }
 
+func TestKeyPressDismissesUpdateNotice(t *testing.T) {
+	m := newModel()
+	m.loading = false
+	m.prs = []pullRequest{{URL: "https://example.test/pr/1"}}
+	m.popupSeq = 7
+	m.updateNotice = &updateNotice{count: 1, id: 7}
+
+	updated, _ := m.handleKey(keyMsg("j"))
+	if updated.(model).updateNotice != nil {
+		t.Fatal("key press should dismiss update notice")
+	}
+}
+
+func TestOverlayUpdateNoticePreservesBaseAndPlacesPopupBottomRight(t *testing.T) {
+	m := newModel()
+	m.width = 60
+	m.height = 12
+	m.updateNotice = &updateNotice{count: 3, id: 1}
+
+	base := strings.Repeat("ABCDEFGHIJ", 6)
+	lines := make([]string, m.height)
+	for i := range lines {
+		lines[i] = base
+	}
+	joined := strings.Join(lines, "\n")
+
+	rendered := m.overlayUpdateNotice(joined)
+	renderedLines := strings.Split(rendered, "\n")
+	if len(renderedLines) != m.height {
+		t.Fatalf("rendered height = %d, want %d", len(renderedLines), m.height)
+	}
+
+	if !strings.HasPrefix(renderedLines[0], "ABCDEFGHIJ") {
+		t.Fatalf("top-left line should keep base content, got %q", renderedLines[0])
+	}
+	if !strings.HasPrefix(renderedLines[m.height/2], "ABCDEFGHIJ") {
+		t.Fatalf("middle line should keep base content, got %q", renderedLines[m.height/2])
+	}
+
+	popupRow := renderedLines[m.height-3]
+	if !strings.Contains(popupRow, "Review updated") && !strings.Contains(popupRow, "review request") {
+		// the popup spans multiple rows; ensure at least one of the popup rows
+		// near the bottom contains popup content.
+		joinedTail := strings.Join(renderedLines[m.height-5:], "\n")
+		if !strings.Contains(joinedTail, "Review updated") {
+			t.Fatalf("popup not present in bottom rows: %q", joinedTail)
+		}
+	}
+}
+
 func TestRenderListShowsMarkForNewPR(t *testing.T) {
 	m := newModel()
 	m.width = 120
