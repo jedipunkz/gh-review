@@ -1,6 +1,7 @@
 package app
 
 import (
+	"strings"
 	"testing"
 	"time"
 
@@ -162,24 +163,29 @@ func TestUpdateCheckShowsNoticeWhenSignatureChanges(t *testing.T) {
 	m.prs = prs
 	m.prSignature = prListSignature(prs)
 
+	newPRs := []pullRequest{
+		{
+			URL:       "https://example.test/pr/1",
+			UpdatedAt: time.Date(2026, 5, 14, 10, 1, 0, 0, time.UTC),
+		},
+	}
 	updated, _ := m.Update(updateCheckMsg{
 		previousSignature: m.prSignature,
-		currentSignature: prListSignature([]pullRequest{
-			{
-				URL:       "https://example.test/pr/1",
-				UpdatedAt: time.Date(2026, 5, 14, 10, 1, 0, 0, time.UTC),
-			},
-		}),
-		previousCount: 1,
-		count:         1,
+		currentSignature:  prListSignature(newPRs),
+		previousCount:     1,
+		count:             1,
+		prs:               newPRs,
 	})
 
 	got := updated.(model)
 	if got.updateNotice == nil {
 		t.Fatal("update check did not show notice")
 	}
-	if got.status != "review requests changed" {
-		t.Fatalf("status = %q, want review requests changed", got.status)
+	if got.status != "1 review request(s)" {
+		t.Fatalf("status = %q, want 1 review request(s)", got.status)
+	}
+	if !got.prs[0].UpdatedAt.Equal(newPRs[0].UpdatedAt) {
+		t.Fatal("update check did not refresh prs in place")
 	}
 }
 
@@ -261,25 +267,117 @@ func TestUpdateCheckSilentReloadWhenPRsDecrease(t *testing.T) {
 	}
 }
 
-func TestUpdateNoticeEnterStartsReload(t *testing.T) {
-	m := newModel()
-	m.loading = false
-	m.updateNotice = &updateNotice{count: 2}
-
-	updated, cmd := m.handleKey(enterKeyMsg())
-	if cmd == nil {
-		t.Fatal("enter did not return reload command")
+func TestUpdateCheckMarksNewPRs(t *testing.T) {
+	prs := []pullRequest{
+		{URL: "https://example.test/pr/1"},
 	}
+	m := newModel()
+	m.prs = prs
+	m.prSignature = prListSignature(prs)
+
+	newPRs := []pullRequest{
+		prs[0],
+		{URL: "https://example.test/pr/2"},
+	}
+	updated, _ := m.Update(updateCheckMsg{
+		previousSignature: m.prSignature,
+		currentSignature:  prListSignature(newPRs),
+		previousCount:     1,
+		count:             2,
+		prs:               newPRs,
+	})
 
 	got := updated.(model)
-	if got.updateNotice != nil {
-		t.Fatal("enter did not clear update notice")
+	if !got.markedPRs["https://example.test/pr/2"] {
+		t.Fatal("new PR was not marked")
 	}
-	if !got.loading {
-		t.Fatal("enter did not set loading")
+	if got.markedPRs["https://example.test/pr/1"] {
+		t.Fatal("previously known PR should not be marked")
 	}
-	if got.status != "refreshing..." {
-		t.Fatalf("status = %q, want refreshing...", got.status)
+}
+
+func TestKeyPressClearsMarkOnSelectedPR(t *testing.T) {
+	m := newModel()
+	m.loading = false
+	m.prs = []pullRequest{
+		{URL: "https://example.test/pr/1"},
+		{URL: "https://example.test/pr/2"},
+	}
+	m.markedPRs["https://example.test/pr/1"] = true
+	m.markedPRs["https://example.test/pr/2"] = true
+	m.cursor = 1
+
+	updated, _ := m.handleKey(keyMsg("j"))
+	got := updated.(model)
+	if got.markedPRs["https://example.test/pr/2"] {
+		t.Fatal("mark on selected PR should be cleared on key press")
+	}
+	if !got.markedPRs["https://example.test/pr/1"] {
+		t.Fatal("mark on non-selected PR should remain")
+	}
+}
+
+func TestPopupDismissMsgClearsCurrentNoticeOnly(t *testing.T) {
+	m := newModel()
+	m.updateNotice = &updateNotice{count: 1, id: 5}
+	m.popupSeq = 5
+	m.prs = []pullRequest{{URL: "u"}}
+
+	updated, _ := m.Update(popupDismissMsg{id: 4})
+	if updated.(model).updateNotice == nil {
+		t.Fatal("stale dismiss should not clear notice")
+	}
+
+	updated, _ = updated.(model).Update(popupDismissMsg{id: 5})
+	if updated.(model).updateNotice != nil {
+		t.Fatal("matching dismiss should clear notice")
+	}
+}
+
+func TestRenderListShowsMarkForNewPR(t *testing.T) {
+	m := newModel()
+	m.width = 120
+	m.height = 30
+	m.loading = false
+	m.prs = []pullRequest{
+		{
+			Repository: "owner/repo",
+			Number:     1,
+			Title:      "first",
+			URL:        "https://example.test/pr/1",
+			Author:     "alice",
+			Request:    "@me",
+		},
+		{
+			Repository: "owner/repo",
+			Number:     2,
+			Title:      "second",
+			URL:        "https://example.test/pr/2",
+			Author:     "bob",
+			Request:    "@me",
+		},
+	}
+	m.markedPRs["https://example.test/pr/2"] = true
+	m.resizeViewport()
+
+	out := m.renderGroupedList()
+	if !strings.Contains(out, "[!]") {
+		t.Fatal("expected [!] mark in rendered list")
+	}
+}
+
+func TestPrListMsgPrunesStaleMarks(t *testing.T) {
+	m := newModel()
+	m.markedPRs["https://example.test/pr/1"] = true
+	m.markedPRs["https://example.test/pr/2"] = true
+
+	updated, _ := m.Update(prListMsg{prs: []pullRequest{{URL: "https://example.test/pr/1"}}})
+	got := updated.(model)
+	if got.markedPRs["https://example.test/pr/2"] {
+		t.Fatal("mark for removed PR should be pruned")
+	}
+	if !got.markedPRs["https://example.test/pr/1"] {
+		t.Fatal("mark for surviving PR should remain")
 	}
 }
 
@@ -303,8 +401,4 @@ func modelWithLoadedDetail() model {
 
 func keyMsg(key string) tea.KeyPressMsg {
 	return tea.KeyPressMsg(tea.Key{Text: key, Code: []rune(key)[0]})
-}
-
-func enterKeyMsg() tea.KeyPressMsg {
-	return tea.KeyPressMsg(tea.Key{Code: tea.KeyEnter})
 }
