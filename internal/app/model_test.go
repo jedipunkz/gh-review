@@ -2,6 +2,7 @@ package app
 
 import (
 	"testing"
+	"time"
 
 	tea "charm.land/bubbletea/v2"
 	"charm.land/lipgloss/v2"
@@ -150,6 +151,62 @@ func TestApproveLabelUsesLocalApprovedState(t *testing.T) {
 	}
 }
 
+func TestUpdateCheckShowsNoticeWhenSignatureChanges(t *testing.T) {
+	prs := []pullRequest{
+		{
+			URL:       "https://example.test/pr/1",
+			UpdatedAt: time.Date(2026, 5, 14, 10, 0, 0, 0, time.UTC),
+		},
+	}
+	m := newModel()
+	m.prs = prs
+	m.prSignature = prListSignature(prs)
+
+	updated, cmd := m.Update(updateCheckMsg{
+		previousSignature: m.prSignature,
+		currentSignature: prListSignature([]pullRequest{
+			{
+				URL:       "https://example.test/pr/1",
+				UpdatedAt: time.Date(2026, 5, 14, 10, 1, 0, 0, time.UTC),
+			},
+		}),
+		count: 1,
+	})
+	if cmd != nil {
+		t.Fatal("update check returned command")
+	}
+
+	got := updated.(model)
+	if got.updateNotice == nil {
+		t.Fatal("update check did not show notice")
+	}
+	if got.status != "review requests changed" {
+		t.Fatalf("status = %q, want review requests changed", got.status)
+	}
+}
+
+func TestUpdateNoticeEnterStartsReload(t *testing.T) {
+	m := newModel()
+	m.loading = false
+	m.updateNotice = &updateNotice{count: 2}
+
+	updated, cmd := m.handleKey(enterKeyMsg())
+	if cmd == nil {
+		t.Fatal("enter did not return reload command")
+	}
+
+	got := updated.(model)
+	if got.updateNotice != nil {
+		t.Fatal("enter did not clear update notice")
+	}
+	if !got.loading {
+		t.Fatal("enter did not set loading")
+	}
+	if got.status != "refreshing..." {
+		t.Fatalf("status = %q, want refreshing...", got.status)
+	}
+}
+
 func modelWithLoadedDetail() model {
 	m := newModel()
 	m.loading = false
@@ -170,4 +227,8 @@ func modelWithLoadedDetail() model {
 
 func keyMsg(key string) tea.KeyPressMsg {
 	return tea.KeyPressMsg(tea.Key{Text: key, Code: []rune(key)[0]})
+}
+
+func enterKeyMsg() tea.KeyPressMsg {
+	return tea.KeyPressMsg(tea.Key{Code: tea.KeyEnter})
 }

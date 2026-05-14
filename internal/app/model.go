@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"os/exec"
+	"sort"
 	"strings"
 	"time"
 
@@ -35,11 +36,26 @@ type copyURLMsg struct {
 	err error
 }
 
+type updateCheckTickMsg time.Time
+
+type updateCheckMsg struct {
+	previousSignature string
+	currentSignature  string
+	count             int
+	err               error
+}
+
+type updateNotice struct {
+	count int
+}
+
 type model struct {
 	loading        bool
 	status         string
 	err            string
 	prs            []pullRequest
+	prSignature    string
+	prListLoaded   bool
 	cursor         int
 	currentDetail  *pullRequestDetail
 	detailLoading  bool
@@ -50,6 +66,7 @@ type model struct {
 	height         int
 	approved       map[string]bool
 	pendingApprove *pullRequest
+	updateNotice   *updateNotice
 }
 
 var (
@@ -88,7 +105,10 @@ var (
 	meFrameStyle        = lipgloss.NewStyle().Border(lipgloss.RoundedBorder()).BorderForeground(tokyoNightCyan)
 	teamFrameStyle      = lipgloss.NewStyle().Border(lipgloss.RoundedBorder()).BorderForeground(tokyoNightOrange)
 	detailFrameStyle    = lipgloss.NewStyle().Border(lipgloss.RoundedBorder()).BorderForeground(tokyoNightMagenta).PaddingLeft(1)
+	updateNoticeStyle   = lipgloss.NewStyle().Border(lipgloss.RoundedBorder()).BorderForeground(tokyoNightYellow).Padding(1, 2)
 )
+
+const updateCheckInterval = time.Minute
 
 func newModel() model {
 	vp := viewport.New()
@@ -102,7 +122,7 @@ func newModel() model {
 }
 
 func (m model) Init() tea.Cmd {
-	return loadPRsCmd()
+	return tea.Batch(loadPRsCmd(), updateCheckTickCmd())
 }
 
 func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
@@ -114,6 +134,19 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, nil
 	case tea.KeyPressMsg:
 		return m.handleKey(msg)
+	case updateCheckTickMsg:
+		cmds := []tea.Cmd{updateCheckTickCmd()}
+		if !m.loading && m.updateNotice == nil && m.prListLoaded {
+			cmds = append(cmds, checkForUpdatesCmd(m.prSignature))
+		}
+		return m, tea.Batch(cmds...)
+	case updateCheckMsg:
+		if msg.err != nil || msg.previousSignature != m.prSignature || msg.currentSignature == m.prSignature {
+			return m, nil
+		}
+		m.updateNotice = &updateNotice{count: msg.count}
+		m.status = "review requests changed"
+		return m, nil
 	case prListMsg:
 		m.loading = false
 		if msg.err != nil {
@@ -123,6 +156,9 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		m.err = ""
 		m.prs = msg.prs
+		m.prSignature = prListSignature(msg.prs)
+		m.prListLoaded = true
+		m.updateNotice = nil
 		if m.cursor >= len(m.prs) {
 			m.cursor = max(0, len(m.prs)-1)
 		}
@@ -174,6 +210,9 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 func (m model) handleKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 	key := msg.String()
+	if m.updateNotice != nil {
+		return m.handleUpdateNotice(key)
+	}
 	if m.pendingApprove != nil {
 		return m.handleApproveConfirmation(key)
 	}
@@ -228,6 +267,25 @@ func (m model) handleKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 	return m, nil
 }
 
+func (m model) handleUpdateNotice(key string) (tea.Model, tea.Cmd) {
+	switch key {
+	case "ctrl+c", "q":
+		return m, tea.Quit
+	case "enter":
+		m.updateNotice = nil
+		m.loading = true
+		m.status = "refreshing..."
+		m.err = ""
+		return m, loadPRsCmd()
+	case "esc":
+		m.updateNotice = nil
+		m.status = fmt.Sprintf("%d review request(s)", len(m.prs))
+		return m, nil
+	default:
+		return m, nil
+	}
+}
+
 func (m model) handleApproveConfirmation(key string) (tea.Model, tea.Cmd) {
 	pr := *m.pendingApprove
 	switch strings.ToLower(key) {
@@ -270,7 +328,11 @@ func (m model) View() tea.View {
 		m.renderDetailSection(),
 		m.renderFooter(),
 	}
-	return tea.NewView(strings.Join(parts, "\n"))
+	view := strings.Join(parts, "\n")
+	if m.updateNotice != nil {
+		view = m.renderUpdateNotice(view)
+	}
+	return tea.NewView(view)
 }
 
 func (m model) renderHeader() string {
@@ -488,6 +550,9 @@ func frameContentWidth(style lipgloss.Style, width int) int {
 }
 
 func (m model) renderFooter() string {
+	if m.updateNotice != nil {
+		return mutedStyle.Render("enter reload  esc dismiss  q quit")
+	}
 	if m.pendingApprove != nil {
 		return mutedStyle.Render("confirm approve: y/yes approve  n/no cancel")
 	}
@@ -533,6 +598,26 @@ func loadPRsCmd() tea.Cmd {
 	}
 }
 
+func updateCheckTickCmd() tea.Cmd {
+	return tea.Tick(updateCheckInterval, func(t time.Time) tea.Msg {
+		return updateCheckTickMsg(t)
+	})
+}
+
+func checkForUpdatesCmd(previousSignature string) tea.Cmd {
+	return func() tea.Msg {
+		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		defer cancel()
+		prs, err := loadReviewRequests(ctx)
+		return updateCheckMsg{
+			previousSignature: previousSignature,
+			currentSignature:  prListSignature(prs),
+			count:             len(prs),
+			err:               err,
+		}
+	}
+}
+
 func loadDiffCmd(pr pullRequest) tea.Cmd {
 	return func() tea.Msg {
 		ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
@@ -574,8 +659,43 @@ func copyURLCmd(pr pullRequest) tea.Cmd {
 	}
 }
 
+func prListSignature(prs []pullRequest) string {
+	parts := make([]string, 0, len(prs))
+	for _, pr := range prs {
+		parts = append(parts, strings.Join([]string{
+			pr.URL,
+			pr.UpdatedAt.UTC().Format(time.RFC3339Nano),
+			pr.Request,
+			pr.ReviewDecision,
+		}, "\x00"))
+	}
+	sort.Strings(parts)
+	return strings.Join(parts, "\x01")
+}
+
 func prLabel(pr pullRequest) string {
 	return fmt.Sprintf("%s#%d", pr.Repository, pr.Number)
+}
+
+func (m model) renderUpdateNotice(base string) string {
+	width := max(40, m.frameWidth())
+	height := m.height
+	if height == 0 {
+		height = lipgloss.Height(base)
+	}
+	count := "review requests"
+	if m.updateNotice.count >= 0 {
+		count = fmt.Sprintf("%d review request(s)", m.updateNotice.count)
+	}
+	body := strings.Join([]string{
+		titleStyle.Render("Review requests updated"),
+		mutedStyle.Render(count + " are available."),
+		"",
+		okStyle.Render("Press Enter to reload."),
+		mutedStyle.Render("Esc dismisses this notice."),
+	}, "\n")
+	dialog := updateNoticeStyle.Width(min(52, max(32, width-8))).Render(body)
+	return lipgloss.Place(width, height, lipgloss.Center, lipgloss.Center, dialog)
 }
 
 func renderDiffContent(detail pullRequestDetail, diff string) string {

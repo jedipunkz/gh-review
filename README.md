@@ -32,7 +32,9 @@ are not `gh-review`.
 - `esc` / `b`: return to the list
 - `r`: refresh
 - `q`: quit
+- When review requests change during auto-check, press `enter` on the notice to reload or `esc` to dismiss.
 
 ## Notes
 
 This extension shells out to `gh`, so it uses the same authentication, host, and GitHub Enterprise configuration as GitHub CLI.
+While running, it checks for review request updates every minute.
