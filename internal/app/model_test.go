@@ -170,7 +170,8 @@ func TestUpdateCheckShowsNoticeWhenSignatureChanges(t *testing.T) {
 				UpdatedAt: time.Date(2026, 5, 14, 10, 1, 0, 0, time.UTC),
 			},
 		}),
-		count: 1,
+		previousCount: 1,
+		count:         1,
 	})
 
 	got := updated.(model)
@@ -179,6 +180,84 @@ func TestUpdateCheckShowsNoticeWhenSignatureChanges(t *testing.T) {
 	}
 	if got.status != "review requests changed" {
 		t.Fatalf("status = %q, want review requests changed", got.status)
+	}
+}
+
+func TestUpdateCheckShowsNoticeWhenPRsIncrease(t *testing.T) {
+	prs := []pullRequest{
+		{
+			URL:       "https://example.test/pr/1",
+			UpdatedAt: time.Date(2026, 5, 14, 10, 0, 0, 0, time.UTC),
+		},
+	}
+	m := newModel()
+	m.prs = prs
+	m.prSignature = prListSignature(prs)
+
+	newPRs := []pullRequest{
+		prs[0],
+		{
+			URL:       "https://example.test/pr/2",
+			UpdatedAt: time.Date(2026, 5, 14, 10, 5, 0, 0, time.UTC),
+		},
+	}
+	updated, cmd := m.Update(updateCheckMsg{
+		previousSignature: m.prSignature,
+		currentSignature:  prListSignature(newPRs),
+		previousCount:     1,
+		count:             2,
+		prs:               newPRs,
+	})
+
+	got := updated.(model)
+	if got.updateNotice == nil {
+		t.Fatal("increased PR count should show notice")
+	}
+	if cmd == nil {
+		t.Fatal("increased PR count should return sound command")
+	}
+}
+
+func TestUpdateCheckSilentReloadWhenPRsDecrease(t *testing.T) {
+	prs := []pullRequest{
+		{
+			URL:       "https://example.test/pr/1",
+			UpdatedAt: time.Date(2026, 5, 14, 10, 0, 0, 0, time.UTC),
+		},
+		{
+			URL:       "https://example.test/pr/2",
+			UpdatedAt: time.Date(2026, 5, 14, 10, 0, 0, 0, time.UTC),
+		},
+	}
+	m := newModel()
+	m.loading = false
+	m.prListLoaded = true
+	m.prs = prs
+	m.prSignature = prListSignature(prs)
+
+	newPRs := []pullRequest{prs[0]}
+	updated, cmd := m.Update(updateCheckMsg{
+		previousSignature: m.prSignature,
+		currentSignature:  prListSignature(newPRs),
+		previousCount:     2,
+		count:             1,
+		prs:               newPRs,
+	})
+
+	got := updated.(model)
+	if got.updateNotice != nil {
+		t.Fatal("decreased PR count should not show notice")
+	}
+	if cmd == nil {
+		t.Fatal("decreased PR count should return reload command")
+	}
+
+	reloadMsg, ok := cmd().(prListMsg)
+	if !ok {
+		t.Fatalf("decreased PR count should dispatch prListMsg, got %T", cmd())
+	}
+	if len(reloadMsg.prs) != 1 {
+		t.Fatalf("reload msg should contain 1 pr, got %d", len(reloadMsg.prs))
 	}
 }
 

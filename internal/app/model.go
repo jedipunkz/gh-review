@@ -42,7 +42,9 @@ type updateCheckTickMsg time.Time
 type updateCheckMsg struct {
 	previousSignature string
 	currentSignature  string
+	previousCount     int
 	count             int
+	prs               []pullRequest
 	err               error
 }
 
@@ -139,12 +141,18 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case updateCheckTickMsg:
 		cmds := []tea.Cmd{updateCheckTickCmd()}
 		if !m.loading && m.updateNotice == nil && m.prListLoaded {
-			cmds = append(cmds, checkForUpdatesCmd(m.prSignature))
+			cmds = append(cmds, checkForUpdatesCmd(m.prSignature, len(m.prs)))
 		}
 		return m, tea.Batch(cmds...)
 	case updateCheckMsg:
 		if msg.err != nil || msg.previousSignature != m.prSignature || msg.currentSignature == m.prSignature {
 			return m, nil
+		}
+		if msg.count < msg.previousCount {
+			prs := msg.prs
+			return m, func() tea.Msg {
+				return prListMsg{prs: prs}
+			}
 		}
 		m.updateNotice = &updateNotice{count: msg.count}
 		m.status = "review requests changed"
@@ -606,7 +614,7 @@ func updateCheckTickCmd() tea.Cmd {
 	})
 }
 
-func checkForUpdatesCmd(previousSignature string) tea.Cmd {
+func checkForUpdatesCmd(previousSignature string, previousCount int) tea.Cmd {
 	return func() tea.Msg {
 		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 		defer cancel()
@@ -614,7 +622,9 @@ func checkForUpdatesCmd(previousSignature string) tea.Cmd {
 		return updateCheckMsg{
 			previousSignature: previousSignature,
 			currentSignature:  prListSignature(prs),
+			previousCount:     previousCount,
 			count:             len(prs),
+			prs:               prs,
 			err:               err,
 		}
 	}
