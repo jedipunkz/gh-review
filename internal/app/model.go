@@ -89,6 +89,7 @@ var (
 	selectedOKStyle     = lipgloss.NewStyle().Foreground(tokyoNightGreen).Background(tokyoNightSelected)
 	selectedErrorStyle  = lipgloss.NewStyle().Foreground(tokyoNightRed).Background(tokyoNightSelected)
 	mutedStyle          = lipgloss.NewStyle().Foreground(tokyoNightMuted)
+	footerStyle         = lipgloss.NewStyle().Foreground(tokyoNightFG)
 	errorStyle          = lipgloss.NewStyle().Foreground(tokyoNightRed)
 	okStyle             = lipgloss.NewStyle().Foreground(tokyoNightGreen)
 	listMeTitleStyle    = lipgloss.NewStyle().Bold(true).Foreground(tokyoNightCyan)
@@ -551,12 +552,12 @@ func frameContentWidth(style lipgloss.Style, width int) int {
 
 func (m model) renderFooter() string {
 	if m.updateNotice != nil {
-		return mutedStyle.Render("enter reload  esc dismiss  q quit")
+		return footerStyle.Render("enter reload  esc dismiss  q quit")
 	}
 	if m.pendingApprove != nil {
-		return mutedStyle.Render("confirm approve: y/yes approve  n/no cancel")
+		return footerStyle.Render("confirm approve: y/yes approve  n/no cancel")
 	}
-	return mutedStyle.Render("ctrl+n/p list  j/k scroll  pgup/pgdn page  a approve  r refresh  q quit")
+	return footerStyle.Render("ctrl+n/p list  j/k scroll  pgup/pgdn page  a approve  r refresh  q quit")
 }
 
 func (m *model) resizeViewport() {
