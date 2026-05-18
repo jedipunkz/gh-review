@@ -67,6 +67,7 @@ type model struct {
 	prSignature    string
 	prListLoaded   bool
 	cursor         int
+	listOffset     int
 	currentDetail  *pullRequestDetail
 	detailLoading  bool
 	detailErr      string
@@ -80,6 +81,8 @@ type model struct {
 	markedPRs      map[string]bool
 	popupSeq       int
 }
+
+const maxListItems = 10
 
 var (
 	tokyoNightFG         = lipgloss.Color("#c0caf5")
@@ -176,6 +179,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if m.cursor >= len(m.prs) {
 			m.cursor = max(0, len(m.prs)-1)
 		}
+		m.ensureCursorVisible()
 		m.resizeViewport()
 		m.popupSeq++
 		m.updateNotice = &updateNotice{count: msg.count, id: m.popupSeq}
@@ -208,6 +212,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if m.cursor >= len(m.prs) {
 			m.cursor = max(0, len(m.prs)-1)
 		}
+		m.ensureCursorVisible()
 		m.status = fmt.Sprintf("%d review request(s)", len(m.prs))
 		m.resizeViewport()
 		if len(m.prs) > 0 {
@@ -278,12 +283,14 @@ func (m model) handleKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 	case "ctrl+n":
 		if !m.loading && m.cursor < len(m.prs)-1 {
 			m.cursor++
+			m.ensureCursorVisible()
 			cmd := m.triggerDetailLoad()
 			return m, cmd
 		}
 	case "ctrl+p":
 		if !m.loading && m.cursor > 0 {
 			m.cursor--
+			m.ensureCursorVisible()
 			cmd := m.triggerDetailLoad()
 			return m, cmd
 		}
@@ -333,6 +340,45 @@ func (m model) handleApproveConfirmation(key string) (tea.Model, tea.Cmd) {
 	default:
 		m.status = fmt.Sprintf("Approve %s? yes/no", prLabel(pr))
 		return m, nil
+	}
+}
+
+func (m model) visibleRange() (int, int) {
+	n := len(m.prs)
+	if n == 0 {
+		return 0, 0
+	}
+	if n <= maxListItems {
+		return 0, n
+	}
+	start := m.listOffset
+	if start < 0 {
+		start = 0
+	}
+	maxOffset := n - maxListItems
+	if start > maxOffset {
+		start = maxOffset
+	}
+	return start, start + maxListItems
+}
+
+func (m *model) ensureCursorVisible() {
+	n := len(m.prs)
+	if n <= maxListItems {
+		m.listOffset = 0
+		return
+	}
+	if m.cursor < m.listOffset {
+		m.listOffset = m.cursor
+	} else if m.cursor >= m.listOffset+maxListItems {
+		m.listOffset = m.cursor - maxListItems + 1
+	}
+	maxOffset := n - maxListItems
+	if m.listOffset > maxOffset {
+		m.listOffset = maxOffset
+	}
+	if m.listOffset < 0 {
+		m.listOffset = 0
 	}
 }
 
@@ -440,7 +486,9 @@ func (m model) renderHeader() string {
 }
 
 func (m model) groupPRs() (me, team []pullRequest) {
-	for _, pr := range m.prs {
+	start, end := m.visibleRange()
+	for i := start; i < end; i++ {
+		pr := m.prs[i]
 		if strings.Contains(pr.Request, "@me") {
 			me = append(me, pr)
 		} else {
@@ -498,7 +546,9 @@ type indexedPR struct {
 }
 
 func (m model) groupPRsByIndex() (me, team []indexedPR) {
-	for i, pr := range m.prs {
+	start, end := m.visibleRange()
+	for i := start; i < end; i++ {
+		pr := m.prs[i]
 		if strings.Contains(pr.Request, "@me") {
 			me = append(me, indexedPR{i, pr})
 		} else {

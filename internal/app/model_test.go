@@ -1,6 +1,7 @@
 package app
 
 import (
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -451,4 +452,85 @@ func modelWithLoadedDetail() model {
 
 func keyMsg(key string) tea.KeyPressMsg {
 	return tea.KeyPressMsg(tea.Key{Text: key, Code: []rune(key)[0]})
+}
+
+func TestListShowsAtMostMaxListItems(t *testing.T) {
+	m := newModel()
+	m.width = 120
+	m.height = 40
+	m.loading = false
+	for i := range maxListItems + 5 {
+		m.prs = append(m.prs, pullRequest{
+			Repository: "owner/repo",
+			Number:     i + 1,
+			Title:      "title",
+			URL:        prURL(i),
+			Author:     "alice",
+			Request:    "@me",
+		})
+	}
+	m.resizeViewport()
+
+	out := m.renderGroupedList()
+	for i := range maxListItems {
+		want := "#" + itoa(i+1)
+		if !strings.Contains(out, want) {
+			t.Fatalf("expected list to contain %q", want)
+		}
+	}
+	for i := maxListItems; i < len(m.prs); i++ {
+		notWant := "#" + itoa(i+1)
+		if strings.Contains(out, notWant) {
+			t.Fatalf("expected list to hide %q when scrolled to top", notWant)
+		}
+	}
+}
+
+func TestCtrlNScrollsBeyondMaxListItems(t *testing.T) {
+	m := newModel()
+	m.width = 120
+	m.height = 40
+	m.loading = false
+	total := maxListItems + 3
+	for i := range total {
+		m.prs = append(m.prs, pullRequest{
+			Repository: "owner/repo",
+			Number:     i + 1,
+			Title:      "title",
+			URL:        prURL(i),
+			Author:     "alice",
+			Request:    "@me",
+		})
+	}
+	m.resizeViewport()
+
+	got := tea.Model(m)
+	for range maxListItems {
+		next, _ := got.(model).handleKey(keyMsg("ctrl+n"))
+		got = next
+	}
+	final := got.(model)
+	if final.cursor != maxListItems {
+		t.Fatalf("cursor = %d, want %d", final.cursor, maxListItems)
+	}
+	if final.listOffset != 1 {
+		t.Fatalf("listOffset = %d, want 1", final.listOffset)
+	}
+
+	out := final.renderGroupedList()
+	if strings.Contains(out, "#1 ") || strings.Contains(out, "#1 ") {
+		t.Fatalf("first PR should be scrolled out of view: %q", out)
+	}
+	want := "#" + itoa(maxListItems+1)
+	if !strings.Contains(out, want) {
+		t.Fatalf("expected list to reveal %q after scrolling", want)
+	}
+}
+
+func prURL(i int) string {
+	return "https://example.test/pr/" + strconv.Itoa(i+1)
+}
+
+func itoa(i int) string {
+	return strconv.Itoa(i)
 }
