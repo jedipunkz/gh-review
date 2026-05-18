@@ -190,6 +190,65 @@ func TestUpdateCheckShowsNoticeWhenSignatureChanges(t *testing.T) {
 	}
 }
 
+func TestUpdateCheckPlaysSoundOnlyForNewReviewRequests(t *testing.T) {
+	orig := playNotifySoundCmd
+	var playCount int
+	playNotifySoundCmd = func() tea.Cmd {
+		playCount++
+		return nil
+	}
+	t.Cleanup(func() { playNotifySoundCmd = orig })
+
+	prs := []pullRequest{
+		{
+			URL:       "https://example.test/pr/1",
+			UpdatedAt: time.Date(2026, 5, 14, 10, 0, 0, 0, time.UTC),
+			Request:   "@me",
+		},
+	}
+
+	m := newModel()
+	m.prs = prs
+	m.prSignature = prListSignature(prs)
+	updatedExisting := []pullRequest{
+		{
+			URL:       "https://example.test/pr/1",
+			UpdatedAt: time.Date(2026, 5, 14, 10, 5, 0, 0, time.UTC),
+			Request:   "@me",
+		},
+	}
+	updated, _ := m.Update(updateCheckMsg{
+		previousSignature: m.prSignature,
+		currentSignature:  prListSignature(updatedExisting),
+		previousCount:     1,
+		count:             1,
+		prs:               updatedExisting,
+	})
+	if playCount != 0 {
+		t.Fatalf("signature-only change should not play sound, playCount=%d", playCount)
+	}
+
+	m = updated.(model)
+	added := []pullRequest{
+		updatedExisting[0],
+		{
+			URL:       "https://example.test/pr/2",
+			UpdatedAt: time.Date(2026, 5, 14, 10, 6, 0, 0, time.UTC),
+			Request:   "@me",
+		},
+	}
+	m.Update(updateCheckMsg{
+		previousSignature: m.prSignature,
+		currentSignature:  prListSignature(added),
+		previousCount:     1,
+		count:             2,
+		prs:               added,
+	})
+	if playCount != 1 {
+		t.Fatalf("new review request should play sound once, playCount=%d", playCount)
+	}
+}
+
 func TestUpdateCheckShowsNoticeWhenPRsIncrease(t *testing.T) {
 	prs := []pullRequest{
 		{

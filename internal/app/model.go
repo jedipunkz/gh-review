@@ -185,7 +185,10 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.updateNotice = &updateNotice{count: msg.count, id: m.popupSeq}
 		m.status = fmt.Sprintf("%d review request(s)", len(m.prs))
 		var cmds []tea.Cmd
-		cmds = append(cmds, playNotifySoundCmd(), dismissPopupCmd(m.popupSeq))
+		if len(newURLs) > 0 {
+			cmds = append(cmds, playNotifySoundCmd())
+		}
+		cmds = append(cmds, dismissPopupCmd(m.popupSeq))
 		if detailCmd := m.refreshDetailIfNeeded(); detailCmd != nil {
 			cmds = append(cmds, detailCmd)
 		}
@@ -802,7 +805,7 @@ func approveCmd(pr pullRequest) tea.Cmd {
 
 var notifySoundFile = "/System/Library/Sounds/Pop.aiff"
 
-func playNotifySoundCmd() tea.Cmd {
+var playNotifySoundCmd = func() tea.Cmd {
 	if runtime.GOOS != "darwin" {
 		return nil
 	}
