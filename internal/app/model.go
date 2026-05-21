@@ -131,7 +131,7 @@ const updateCheckInterval = time.Minute
 
 func newModel() model {
 	vp := viewport.New()
-	vp.SoftWrap = false
+	vp.SoftWrap = true
 	return model{
 		loading:   true,
 		status:    "loading review requests...",
