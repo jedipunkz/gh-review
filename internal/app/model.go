@@ -13,6 +13,7 @@ import (
 	tea "charm.land/bubbletea/v2"
 	"charm.land/lipgloss/v2"
 	"github.com/mattn/go-runewidth"
+	"golang.org/x/sync/errgroup"
 )
 
 type prListMsg struct {
@@ -798,22 +799,47 @@ func loadDiffCmd(pr pullRequest, cache *detailCache) tea.Cmd {
 	return func() tea.Msg {
 		ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 		defer cancel()
-		detail, err := loadPRDetail(ctx, pr)
-		if err != nil {
+
+		var (
+			detail  pullRequestDetail
+			diff    string
+			diffErr error
+		)
+		g, gctx := errgroup.WithContext(ctx)
+		g.Go(func() error {
+			d, err := loadPRDetail(gctx, pr)
+			if err != nil {
+				return err
+			}
+			detail = d
+			return nil
+		})
+		g.Go(func() error {
+			d, err := loadDiff(gctx, pr)
+			// Treat too_large as a non-fatal condition so the detail goroutine
+			// still produces a usable result.
+			if isPRDiffTooLargeError(err) {
+				diff = mutedStyle.Render("Diff omitted because GitHub reports this PR diff is too large to display.")
+				diffErr = nil
+				return nil
+			}
+			diff = d
+			diffErr = err
+			return err
+		})
+		if err := g.Wait(); err != nil {
+			// If only the diff failed (non-too_large), surface that error; detail
+			// errors are surfaced via g.Wait()'s first-error semantics too.
 			return diffMsg{pr: pr, err: err}
 		}
-		diff, err := loadDiff(ctx, pr)
-		if isPRDiffTooLargeError(err) {
-			diff = mutedStyle.Render("Diff omitted because GitHub reports this PR diff is too large to display.")
-			err = nil
+		if diffErr != nil {
+			return diffMsg{pr: pr, err: diffErr}
 		}
-		if err == nil {
-			// Use the fetched UpdatedAt so the cache key matches what the next
-			// list refresh will produce for this PR.
-			key := cacheKey(pr.URL, detail.UpdatedAt)
-			cache.put(key, cacheEntry{Detail: detail, Diff: diff})
-		}
-		return diffMsg{pr: pr, detail: detail, diff: diff, err: err}
+		// Use the fetched UpdatedAt so the cache key matches what the next
+		// list refresh will produce for this PR.
+		key := cacheKey(pr.URL, detail.UpdatedAt)
+		cache.put(key, cacheEntry{Detail: detail, Diff: diff})
+		return diffMsg{pr: pr, detail: detail, diff: diff}
 	}
 }
 
