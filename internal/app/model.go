@@ -211,7 +211,15 @@ func (m model) View() tea.View {
 		content += m.renderList()
 	}
 	content += "\n" + m.renderFooter()
-	return tea.NewView(content)
+
+	v := tea.NewView(content)
+	v.AltScreen = true
+	v.MouseMode = tea.MouseModeCellMotion
+	v.WindowTitle = "gh review"
+	// Hide the cursor on list/diff screens by leaving Cursor nil; when set to
+	// non-nil it would be shown at the given position.
+	v.Cursor = nil
+	return v
 }
 
 func (m model) renderHeader() string {
