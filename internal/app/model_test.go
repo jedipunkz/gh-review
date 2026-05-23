@@ -112,22 +112,37 @@ func TestApproveConfirmationYesStartsApprove(t *testing.T) {
 	}
 }
 
-func TestApproveConfirmationNoCancelsApprove(t *testing.T) {
+func TestApproveConfirmationCancelCancelsApprove(t *testing.T) {
 	m := modelWithLoadedDetail()
 	updated, _ := m.handleKey(keyMsg("a"))
 	m = updated.(model)
 
-	updated, cmd := m.handleKey(keyMsg("n"))
+	updated, cmd := m.handleKey(keyMsg("c"))
 	if cmd != nil {
-		t.Fatal("no confirmation returned command")
+		t.Fatal("cancel confirmation returned command")
 	}
 
 	got := updated.(model)
 	if got.pendingApprove != nil {
-		t.Fatal("no confirmation did not clear pending approval")
+		t.Fatal("cancel confirmation did not clear pending approval")
 	}
 	if got.loading {
-		t.Fatal("no confirmation set loading")
+		t.Fatal("cancel confirmation set loading")
+	}
+}
+
+func TestApproveConfirmationRendersPopup(t *testing.T) {
+	m := modelWithLoadedDetail()
+	m.width = 100
+	m.height = 24
+
+	updated, _ := m.handleKey(keyMsg("a"))
+	out := updated.(model).View().Content
+
+	for _, want := range []string{"Approve pull request?", "owner/repo#123", "y Yes", "c Cancel"} {
+		if !strings.Contains(out, want) {
+			t.Fatalf("approve popup missing %q: %q", want, out)
+		}
 	}
 }
 
