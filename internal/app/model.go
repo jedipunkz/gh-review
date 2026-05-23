@@ -2,17 +2,20 @@ package app
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os/exec"
 	"runtime"
 	"sort"
 	"strings"
+	"sync"
 	"time"
 
 	"charm.land/bubbles/v2/viewport"
 	tea "charm.land/bubbletea/v2"
 	"charm.land/lipgloss/v2"
 	"github.com/mattn/go-runewidth"
+	"golang.org/x/sync/errgroup"
 )
 
 type prListMsg struct {
@@ -57,7 +60,13 @@ type popupDismissMsg struct {
 	id int
 }
 
+type debounceFireMsg struct {
+	seq int
+	url string
+}
+
 const popupDismissDelay = 6 * time.Second
+const detailLoadDebounce = 80 * time.Millisecond
 
 type model struct {
 	loading        bool
@@ -80,6 +89,10 @@ type model struct {
 	updateNotice   *updateNotice
 	markedPRs      map[string]bool
 	popupSeq       int
+	cache          *detailCache
+	inflight       *inflightLoader
+	prefetcher     *prefetcher
+	debounceSeq    int
 }
 
 const maxListItems = 10
@@ -132,12 +145,16 @@ const updateCheckInterval = time.Minute
 func newModel() model {
 	vp := viewport.New()
 	vp.SoftWrap = true
+	cache := newDetailCache()
 	return model{
-		loading:   true,
-		status:    "loading review requests...",
-		detailVP:  vp,
-		approved:  make(map[string]bool),
-		markedPRs: make(map[string]bool),
+		loading:    true,
+		status:     "loading review requests...",
+		detailVP:   vp,
+		approved:   make(map[string]bool),
+		markedPRs:  make(map[string]bool),
+		cache:      cache,
+		inflight:   newInflightLoader(),
+		prefetcher: newPrefetcher(cache),
 	}
 }
 
@@ -219,12 +236,20 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.status = fmt.Sprintf("%d review request(s)", len(m.prs))
 		m.resizeViewport()
 		if len(m.prs) > 0 {
-			cmd := m.triggerDetailLoad()
-			return m, cmd
+			cmds := []tea.Cmd{m.triggerDetailLoad()}
+			if pre := m.prefetchTopCmd(); pre != nil {
+				cmds = append(cmds, pre)
+			}
+			return m, tea.Batch(cmds...)
 		}
 		return m, nil
 	case diffMsg:
 		if msg.pr.URL != m.loadingForURL {
+			return m, nil
+		}
+		// A canceled load belongs to a previous cursor position; drop it
+		// silently so the user does not see a spurious error.
+		if errors.Is(msg.err, context.Canceled) {
 			return m, nil
 		}
 		m.detailLoading = false
@@ -238,6 +263,18 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.detailVP.SetContent(renderDiffContent(msg.detail, msg.diff))
 		m.detailVP.GotoTop()
 		return m, nil
+	case debounceFireMsg:
+		if msg.seq != m.debounceSeq {
+			return m, nil
+		}
+		if len(m.prs) == 0 || m.cursor >= len(m.prs) {
+			return m, nil
+		}
+		pr := m.prs[m.cursor]
+		if pr.URL != msg.url || pr.URL != m.loadingForURL {
+			return m, nil
+		}
+		return m, loadDiffCmd(pr, m.cache, m.inflight)
 	case approveMsg:
 		m.loading = false
 		if msg.err != nil {
@@ -287,15 +324,13 @@ func (m model) handleKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 		if !m.loading && m.cursor < len(m.prs)-1 {
 			m.cursor++
 			m.ensureCursorVisible()
-			cmd := m.triggerDetailLoad()
-			return m, cmd
+			return m, m.detailAndPrefetchCmds()
 		}
 	case "ctrl+p":
 		if !m.loading && m.cursor > 0 {
 			m.cursor--
 			m.ensureCursorVisible()
-			cmd := m.triggerDetailLoad()
-			return m, cmd
+			return m, m.detailAndPrefetchCmds()
 		}
 	case "j":
 		m.detailVP.ScrollDown(1)
@@ -450,6 +485,36 @@ func dismissPopupCmd(id int) tea.Cmd {
 	})
 }
 
+// prefetchTopCmd warms the cache with the first prefetchTopN PRs, skipping
+// the one currently under the cursor (it is already being loaded in the
+// foreground).
+func (m *model) prefetchTopCmd() tea.Cmd {
+	if m.prefetcher == nil || len(m.prs) == 0 {
+		return nil
+	}
+	candidates := topN(m.prs, prefetchTopN)
+	filtered := make([]pullRequest, 0, len(candidates))
+	for i, pr := range candidates {
+		if i == m.cursor {
+			continue
+		}
+		filtered = append(filtered, pr)
+	}
+	return m.prefetcher.prefetchCmd(filtered)
+}
+
+// detailAndPrefetchCmds combines the foreground detail load with a background
+// prefetch of the cursor's neighbors.
+func (m *model) detailAndPrefetchCmds() tea.Cmd {
+	cmds := []tea.Cmd{m.triggerDetailLoad()}
+	if m.prefetcher != nil {
+		if pre := m.prefetcher.prefetchCmd(neighborPRs(m.prs, m.cursor)); pre != nil {
+			cmds = append(cmds, pre)
+		}
+	}
+	return tea.Batch(cmds...)
+}
+
 func (m *model) triggerDetailLoad() tea.Cmd {
 	if len(m.prs) == 0 {
 		return nil
@@ -460,7 +525,37 @@ func (m *model) triggerDetailLoad() tea.Cmd {
 	m.detailLoading = true
 	m.detailErr = ""
 	m.detailVP.GotoTop()
-	return loadDiffCmd(pr)
+
+	cache := m.cache
+	key := cacheKey(pr.URL, pr.UpdatedAt)
+	if entry, ok := cache.getMem(key); ok {
+		// Cache hit: cancel any in-flight network load, bump debounce seq so
+		// any pending tick is ignored, and render immediately.
+		m.inflight.cancel()
+		m.debounceSeq++
+		return func() tea.Msg {
+			return diffMsg{pr: pr, detail: entry.Detail, diff: entry.Diff}
+		}
+	}
+	if entry, ok := cache.getDisk(key); ok {
+		m.inflight.cancel()
+		m.debounceSeq++
+		immediate := func() tea.Msg {
+			return diffMsg{pr: pr, detail: entry.Detail, diff: entry.Diff}
+		}
+		// Schedule a background refresh so any new commits/comments land in
+		// cache. Run it through the inflight loader so a later cursor move
+		// cancels the lingering gh subprocess.
+		return tea.Batch(immediate, loadDiffCmd(pr, cache, m.inflight))
+	}
+	// Cache miss: debounce so rapid cursor movement does not spawn a flurry
+	// of gh subprocesses.
+	m.debounceSeq++
+	seq := m.debounceSeq
+	url := pr.URL
+	return tea.Tick(detailLoadDebounce, func(time.Time) tea.Msg {
+		return debounceFireMsg{seq: seq, url: url}
+	})
 }
 
 func (m model) View() tea.View {
@@ -777,20 +872,110 @@ func checkForUpdatesCmd(previousSignature string, previousCount int) tea.Cmd {
 	}
 }
 
-func loadDiffCmd(pr pullRequest) tea.Cmd {
+// inflightLoader tracks the currently running detail load so that a newer
+// cursor move can cancel its gh subprocesses before issuing a new one.
+// Each begin() bumps gen; done() only clears the stored cancel when its
+// generation still matches, so a newer load's cancel is never wiped by an
+// older completion.
+type inflightLoader struct {
+	mu       sync.Mutex
+	cancelFn context.CancelFunc
+	gen      uint64
+}
+
+func newInflightLoader() *inflightLoader { return &inflightLoader{} }
+
+// begin cancels any previous load, then registers a new context. The returned
+// done callback releases resources and clears the stored cancel func when
+// this generation is still the most recent one.
+func (l *inflightLoader) begin(timeout time.Duration) (context.Context, func()) {
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	if l == nil {
+		return ctx, cancel
+	}
+	l.mu.Lock()
+	if l.cancelFn != nil {
+		l.cancelFn()
+	}
+	l.gen++
+	myGen := l.gen
+	l.cancelFn = cancel
+	l.mu.Unlock()
+	done := func() {
+		l.mu.Lock()
+		if l.gen == myGen {
+			l.cancelFn = nil
+		}
+		l.mu.Unlock()
+		cancel()
+	}
+	return ctx, done
+}
+
+// cancel any in-flight load. Safe to call when nothing is running.
+func (l *inflightLoader) cancel() {
+	if l == nil {
+		return
+	}
+	l.mu.Lock()
+	if l.cancelFn != nil {
+		l.cancelFn()
+		l.cancelFn = nil
+	}
+	l.mu.Unlock()
+}
+
+func loadDiffCmd(pr pullRequest, cache *detailCache, inflight *inflightLoader) tea.Cmd {
 	return func() tea.Msg {
-		ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
-		defer cancel()
-		detail, err := loadPRDetail(ctx, pr)
-		if err != nil {
+		ctx, done := inflight.begin(60 * time.Second)
+		defer done()
+
+		var (
+			detail  pullRequestDetail
+			diff    string
+			diffErr error
+		)
+		g, gctx := errgroup.WithContext(ctx)
+		g.Go(func() error {
+			d, err := loadPRDetail(gctx, pr)
+			if err != nil {
+				return err
+			}
+			detail = d
+			return nil
+		})
+		g.Go(func() error {
+			d, err := loadDiff(gctx, pr)
+			// Treat too_large as a non-fatal condition so the detail goroutine
+			// still produces a usable result.
+			if isPRDiffTooLargeError(err) {
+				diff = mutedStyle.Render("Diff omitted because GitHub reports this PR diff is too large to display.")
+				diffErr = nil
+				return nil
+			}
+			diff = d
+			diffErr = err
+			return err
+		})
+		if err := g.Wait(); err != nil {
+			// If only the diff failed (non-too_large), surface that error; detail
+			// errors are surfaced via g.Wait()'s first-error semantics too.
+			if ctx.Err() != nil {
+				return diffMsg{pr: pr, err: context.Canceled}
+			}
 			return diffMsg{pr: pr, err: err}
 		}
-		diff, err := loadDiff(ctx, pr)
-		if isPRDiffTooLargeError(err) {
-			diff = mutedStyle.Render("Diff omitted because GitHub reports this PR diff is too large to display.")
-			err = nil
+		if diffErr != nil {
+			if ctx.Err() != nil {
+				return diffMsg{pr: pr, err: context.Canceled}
+			}
+			return diffMsg{pr: pr, err: diffErr}
 		}
-		return diffMsg{pr: pr, detail: detail, diff: diff, err: err}
+		// Use the fetched UpdatedAt so the cache key matches what the next
+		// list refresh will produce for this PR.
+		key := cacheKey(pr.URL, detail.UpdatedAt)
+		cache.put(key, cacheEntry{Detail: detail, Diff: diff})
+		return diffMsg{pr: pr, detail: detail, diff: diff}
 	}
 }
 
