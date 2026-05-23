@@ -141,6 +141,9 @@ var (
 	teamFrameStyle      = lipgloss.NewStyle().Border(lipgloss.RoundedBorder()).BorderForeground(frameGray)
 	detailFrameStyle    = lipgloss.NewStyle().Border(lipgloss.RoundedBorder()).BorderForeground(frameGray).PaddingLeft(1)
 	updateNoticeStyle   = lipgloss.NewStyle().Border(lipgloss.RoundedBorder()).BorderForeground(tokyoNightYellow).Padding(0, 1)
+	approvePopupStyle   = lipgloss.NewStyle().Border(lipgloss.RoundedBorder()).BorderForeground(tokyoNightGreen).Padding(1, 2)
+	approveButtonStyle  = lipgloss.NewStyle().Bold(true).Foreground(tokyoNightGreen)
+	cancelButtonStyle   = lipgloss.NewStyle().Bold(true).Foreground(tokyoNightRed)
 	markStyle           = lipgloss.NewStyle().Bold(true).Foreground(tokyoNightYellow)
 	diffFileHeaderStyle = lipgloss.NewStyle().Bold(true).Foreground(tokyoNightCyan)
 	diffMetaStyle       = lipgloss.NewStyle().Foreground(tokyoNightMuted)
@@ -380,7 +383,7 @@ func (m model) handleKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 			pr := m.currentDetail.pullRequest
 			m.err = ""
 			m.pendingApprove = &pr
-			m.status = fmt.Sprintf("Approve %s? yes/no", prLabel(pr))
+			m.status = "approval confirmation open"
 			return m, nil
 		}
 	}
@@ -439,13 +442,13 @@ func (m model) handleApproveConfirmation(key string) (tea.Model, tea.Cmd) {
 		m.status = "approving..."
 		m.err = ""
 		return m, approveCmd(pr)
-	case "n", "no", "esc":
+	case "c", "cancel", "esc":
 		m.pendingApprove = nil
 		m.status = "approval canceled"
 		m.err = ""
 		return m, nil
 	default:
-		m.status = fmt.Sprintf("Approve %s? yes/no", prLabel(pr))
+		m.status = "press y to approve or c to cancel"
 		return m, nil
 	}
 }
@@ -711,6 +714,9 @@ func (m model) View() tea.View {
 	if m.updateNotice != nil {
 		view = m.overlayUpdateNotice(view)
 	}
+	if m.pendingApprove != nil {
+		view = m.overlayApproveConfirmation(view)
+	}
 	return tea.NewView(view)
 }
 
@@ -968,9 +974,6 @@ func frameContentWidth(style lipgloss.Style, width int) int {
 }
 
 func (m model) renderFooter() string {
-	if m.pendingApprove != nil {
-		return footerStyle.Render("confirm approve: y/yes approve  n/no cancel")
-	}
 	return footerStyle.Render("ctrl+n/p list  j/k scroll  pgup/pgdn page  / filter  a approve  r refresh  q quit")
 }
 
@@ -1225,6 +1228,26 @@ func (m model) overlayUpdateNotice(base string) string {
 	).Render()
 }
 
+func (m model) overlayApproveConfirmation(base string) string {
+	popup := m.renderApproveConfirmationPopup()
+	if popup == "" {
+		return base
+	}
+	width := lipgloss.Width(base)
+	height := lipgloss.Height(base)
+	if width <= 0 || height <= 0 {
+		return base
+	}
+	pw := lipgloss.Width(popup)
+	ph := lipgloss.Height(popup)
+	x := max(0, (width-pw)/2)
+	y := max(0, (height-ph)/2)
+	return lipgloss.NewCompositor(
+		lipgloss.NewLayer(base),
+		lipgloss.NewLayer(popup).X(x).Y(y).Z(2),
+	).Render()
+}
+
 func (m model) renderUpdateNoticePopup() string {
 	count := "review requests changed"
 	if m.updateNotice != nil && m.updateNotice.count >= 0 {
@@ -1235,6 +1258,20 @@ func (m model) renderUpdateNoticePopup() string {
 		mutedStyle.Render(count),
 	}, "\n")
 	return updateNoticeStyle.Render(body)
+}
+
+func (m model) renderApproveConfirmationPopup() string {
+	if m.pendingApprove == nil {
+		return ""
+	}
+	pr := *m.pendingApprove
+	body := strings.Join([]string{
+		titleStyle.Render("Approve pull request?"),
+		mutedStyle.Render(prLabel(pr)),
+		"",
+		approveButtonStyle.Render("y Yes") + mutedStyle.Render("   ") + cancelButtonStyle.Render("c Cancel"),
+	}, "\n")
+	return approvePopupStyle.Render(body)
 }
 
 func renderDiffContent(detail pullRequestDetail, diff string) string {
