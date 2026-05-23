@@ -11,6 +11,7 @@ import (
 	"charm.land/bubbles/v2/key"
 	"charm.land/bubbles/v2/list"
 	"charm.land/bubbles/v2/progress"
+	"charm.land/bubbles/v2/spinner"
 	"charm.land/bubbles/v2/viewport"
 	tea "charm.land/bubbletea/v2"
 	"charm.land/lipgloss/v2"
@@ -144,6 +145,12 @@ type model struct {
 	bulkTotal  int
 	bulkDone   int
 	bulkErrs   []error
+	// spinner animates next to loadingLabel while a non-bulk async command is
+	// in flight (PR list / diff / single approve). Bulk approve uses the
+	// progress bar instead, so the spinner is suppressed during bulk runs to
+	// avoid two competing indicators in the header.
+	spinner      spinner.Model
+	loadingLabel string
 }
 
 // lightDark resolves a pair of (light, dark) colors based on the terminal
@@ -212,23 +219,30 @@ func newModel() model {
 	fl.SetShowHelp(false)
 	fl.SetShowPagination(false)
 
+	sp := spinner.New(spinner.WithSpinner(spinner.Dot))
+	sp.Style = lipgloss.NewStyle().Foreground(accentColor)
+
 	return model{
-		loading:   true,
-		status:    "loading review requests...",
-		list:      l,
-		diff:      vp,
-		fileList:  fl,
-		focusArea: focusDiff,
-		keys:      newKeyMap(),
-		help:      help.New(),
-		approved:  make(map[string]bool),
-		selected:  make(map[string]bool),
-		progress:  progress.New(progress.WithDefaultBlend()),
+		loading:      true,
+		status:       "loading review requests...",
+		loadingLabel: "fetching review requests...",
+		list:         l,
+		diff:         vp,
+		fileList:     fl,
+		focusArea:    focusDiff,
+		keys:         newKeyMap(),
+		help:         help.New(),
+		approved:     make(map[string]bool),
+		selected:     make(map[string]bool),
+		progress:     progress.New(progress.WithDefaultBlend()),
+		spinner:      sp,
 	}
 }
 
 func (m model) Init() tea.Cmd {
-	return loadPRsCmd()
+	// Kick off the initial PR fetch and start ticking the spinner so the
+	// header animates immediately while the request is in flight.
+	return tea.Batch(loadPRsCmd(), m.spinner.Tick)
 }
 
 func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
@@ -242,6 +256,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m.handleKey(msg)
 	case prListMsg:
 		m.loading = false
+		m.loadingLabel = ""
 		if msg.err != nil {
 			m.err = msg.err.Error()
 			m.status = "failed to load review requests"
@@ -273,6 +288,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, cmd
 	case diffMsg:
 		m.loading = false
+		m.loadingLabel = ""
 		if msg.err != nil {
 			m.err = msg.err.Error()
 			m.status = "failed to load diff"
@@ -302,6 +318,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, flCmd
 	case approveMsg:
 		m.loading = false
+		m.loadingLabel = ""
 		if msg.err != nil {
 			m.err = msg.err.Error()
 			m.status = "failed to approve"
@@ -312,7 +329,11 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.status = "approved " + prLabel(msg.pr)
 		m.screen = screenList
 		m.keys.setScreen(screenList)
-		return m, loadPRsCmd()
+		// Re-enter the loading state for the implicit list refresh that follows
+		// a successful approve, and restart the spinner tick.
+		m.loading = true
+		m.loadingLabel = "fetching review requests..."
+		return m, tea.Batch(loadPRsCmd(), m.spinner.Tick)
 	case bulkApproveStartMsg:
 		m.bulkActive = true
 		m.bulkTotal = msg.total
@@ -350,12 +371,25 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.status = fmt.Sprintf("approved %d", ok)
 		}
 		m.selected = make(map[string]bool)
-		return m, loadPRsCmd()
+		// The implicit list refresh after a bulk approve is a plain async load,
+		// so flip back into the spinner-driven loading state for the user.
+		m.loading = true
+		m.loadingLabel = "fetching review requests..."
+		return m, tea.Batch(loadPRsCmd(), m.spinner.Tick)
 	case progress.FrameMsg:
 		// Forward animation frames to the progress component so its spring
 		// settles smoothly between SetPercent calls.
 		var cmd tea.Cmd
 		m.progress, cmd = m.progress.Update(msg)
+		return m, cmd
+	case spinner.TickMsg:
+		// Only keep ticking while a non-bulk async op is in flight; otherwise
+		// drop the tick so the spinner naturally stops between operations.
+		if !m.loading || m.bulkActive {
+			return m, nil
+		}
+		var cmd tea.Cmd
+		m.spinner, cmd = m.spinner.Update(msg)
 		return m, cmd
 	}
 
@@ -409,9 +443,10 @@ func (m model) handleKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 			return m, nil
 		}
 		m.loading = true
+		m.loadingLabel = "fetching review requests..."
 		m.status = "refreshing..."
 		m.err = ""
-		return m, loadPRsCmd()
+		return m, tea.Batch(loadPRsCmd(), m.spinner.Tick)
 	}
 
 	switch m.screen {
@@ -434,9 +469,10 @@ func (m model) handleListKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 			return m, nil
 		}
 		m.loading = true
+		m.loadingLabel = fmt.Sprintf("loading diff for %s#%d...", pr.Repository, pr.Number)
 		m.status = "loading diff..."
 		m.err = ""
-		return m, loadDiffCmd(pr)
+		return m, tea.Batch(loadDiffCmd(pr), m.spinner.Tick)
 	}
 	if key.Matches(msg, m.keys.ToggleSelect) {
 		pr, ok := m.selectedPR()
@@ -512,9 +548,10 @@ func (m model) handleDiffKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 		}
 		pr := *m.diffPR
 		m.loading = true
+		m.loadingLabel = fmt.Sprintf("approving %s#%d...", pr.Repository, pr.Number)
 		m.status = "approving..."
 		m.err = ""
-		return m, approveCmd(pr)
+		return m, tea.Batch(approveCmd(pr), m.spinner.Tick)
 	case key.Matches(msg, m.keys.ToggleFocus):
 		if len(m.files) == 0 || !m.sidebarVisible() {
 			// Without a sidebar there's nothing to toggle to.
@@ -654,8 +691,15 @@ func (m model) renderHeader() string {
 	if m.status != "" {
 		parts = append(parts, mutedStyle.Render(m.status))
 	}
-	if m.loading {
-		parts = append(parts, mutedStyle.Render("working"))
+	// Show the animated spinner + a contextual label while a non-bulk async
+	// command is in flight. Bulk approve owns the progress bar below, so we
+	// suppress the spinner there to avoid two competing indicators.
+	if m.loading && !m.bulkActive {
+		label := m.loadingLabel
+		if label == "" {
+			label = "working..."
+		}
+		parts = append(parts, m.spinner.View()+mutedStyle.Render(label))
 	}
 	line := strings.Join(parts, "  ")
 	if m.bulkActive {
