@@ -11,6 +11,8 @@ import (
 	"sync"
 	"time"
 
+	"charm.land/bubbles/v2/spinner"
+	"charm.land/bubbles/v2/textinput"
 	"charm.land/bubbles/v2/viewport"
 	tea "charm.land/bubbletea/v2"
 	"charm.land/lipgloss/v2"
@@ -93,6 +95,9 @@ type model struct {
 	inflight       *inflightLoader
 	prefetcher     *prefetcher
 	debounceSeq    int
+	searchInput    textinput.Model
+	searchActive   bool
+	spinner        spinner.Model
 }
 
 const maxListItems = 10
@@ -107,7 +112,7 @@ var (
 	tokyoNightOrange     = lipgloss.Color("#ff9e64")
 	tokyoNightRed        = lipgloss.Color("#f7768e")
 	tokyoNightYellow     = lipgloss.Color("#e0af68")
-	tokyoNightSelected   = lipgloss.Color("#283457")
+	tokyoNightSelected   = lipgloss.Color("#3d59a1")
 	tokyoNightSelectedFg = lipgloss.Color("#ffffff")
 
 	titleStyle          = lipgloss.NewStyle().Bold(true).Foreground(tokyoNightBlue)
@@ -138,6 +143,11 @@ var (
 	detailFrameStyle    = lipgloss.NewStyle().Border(lipgloss.RoundedBorder()).BorderForeground(frameGray).PaddingLeft(1)
 	updateNoticeStyle   = lipgloss.NewStyle().Border(lipgloss.RoundedBorder()).BorderForeground(tokyoNightYellow).Padding(0, 1)
 	markStyle           = lipgloss.NewStyle().Bold(true).Foreground(tokyoNightYellow)
+	diffFileHeaderStyle = lipgloss.NewStyle().Bold(true).Foreground(tokyoNightCyan)
+	diffMetaStyle       = lipgloss.NewStyle().Foreground(tokyoNightMuted)
+	diffHunkStyle       = lipgloss.NewStyle().Foreground(tokyoNightMagenta)
+	diffAddStyle        = lipgloss.NewStyle().Foreground(tokyoNightGreen)
+	diffDelStyle        = lipgloss.NewStyle().Foreground(tokyoNightRed)
 )
 
 const updateCheckInterval = time.Minute
@@ -146,20 +156,27 @@ func newModel() model {
 	vp := viewport.New()
 	vp.SoftWrap = true
 	cache := newDetailCache()
+	ti := textinput.New()
+	ti.Placeholder = "filter repo / title / author"
+	ti.Prompt = ""
+	sp := spinner.New(spinner.WithSpinner(spinner.MiniDot))
+	sp.Style = lipgloss.NewStyle().Foreground(tokyoNightCyan)
 	return model{
-		loading:    true,
-		status:     "loading review requests...",
-		detailVP:   vp,
-		approved:   make(map[string]bool),
-		markedPRs:  make(map[string]bool),
-		cache:      cache,
-		inflight:   newInflightLoader(),
-		prefetcher: newPrefetcher(cache),
+		loading:     true,
+		status:      "loading review requests...",
+		detailVP:    vp,
+		approved:    make(map[string]bool),
+		markedPRs:   make(map[string]bool),
+		cache:       cache,
+		inflight:    newInflightLoader(),
+		prefetcher:  newPrefetcher(cache),
+		searchInput: ti,
+		spinner:     sp,
 	}
 }
 
 func (m model) Init() tea.Cmd {
-	return tea.Batch(loadPRsCmd(), updateCheckTickCmd())
+	return tea.Batch(loadPRsCmd(), updateCheckTickCmd(), m.spinner.Tick)
 }
 
 func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
@@ -170,7 +187,14 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.resizeViewport()
 		return m, nil
 	case tea.KeyPressMsg:
+		if m.searchActive {
+			return m.handleSearchKey(msg)
+		}
 		return m.handleKey(msg)
+	case spinner.TickMsg:
+		var cmd tea.Cmd
+		m.spinner, cmd = m.spinner.Update(msg)
+		return m, cmd
 	case updateCheckTickMsg:
 		cmds := []tea.Cmd{updateCheckTickCmd()}
 		if !m.loading && m.updateNotice == nil && m.prListLoaded {
@@ -321,16 +345,21 @@ func (m model) handleKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 		m.err = ""
 		return m, loadPRsCmd()
 	case "ctrl+n":
-		if !m.loading && m.cursor < len(m.prs)-1 {
-			m.cursor++
+		if !m.loading && m.advanceCursor(+1) {
 			m.ensureCursorVisible()
 			return m, m.detailAndPrefetchCmds()
 		}
 	case "ctrl+p":
-		if !m.loading && m.cursor > 0 {
-			m.cursor--
+		if !m.loading && m.advanceCursor(-1) {
 			m.ensureCursorVisible()
 			return m, m.detailAndPrefetchCmds()
+		}
+	case "/":
+		if !m.loading {
+			m.searchActive = true
+			cmd := m.searchInput.Focus()
+			m.resizeViewport()
+			return m, cmd
 		}
 	case "j":
 		m.detailVP.ScrollDown(1)
@@ -357,6 +386,47 @@ func (m model) handleKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 		}
 	}
 	return m, nil
+}
+
+func (m model) handleSearchKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
+	key := msg.String()
+	switch key {
+	case "ctrl+c":
+		return m, tea.Quit
+	case "esc":
+		m.searchActive = false
+		m.searchInput.Reset()
+		m.searchInput.Blur()
+		m.ensureCursorVisible()
+		m.resizeViewport()
+		return m, nil
+	case "enter":
+		m.searchActive = false
+		m.searchInput.Blur()
+		m.resizeViewport()
+		return m, nil
+	case "ctrl+n":
+		if !m.loading && m.advanceCursor(+1) {
+			m.ensureCursorVisible()
+			return m, m.detailAndPrefetchCmds()
+		}
+		return m, nil
+	case "ctrl+p":
+		if !m.loading && m.advanceCursor(-1) {
+			m.ensureCursorVisible()
+			return m, m.detailAndPrefetchCmds()
+		}
+		return m, nil
+	}
+	prev := m.cursor
+	var cmd tea.Cmd
+	m.searchInput, cmd = m.searchInput.Update(msg)
+	m.ensureCursorVisible()
+	var detailCmd tea.Cmd
+	if m.cursor != prev && !m.loading && len(m.prs) > 0 {
+		detailCmd = m.detailAndPrefetchCmds()
+	}
+	return m, tea.Batch(cmd, detailCmd)
 }
 
 func (m model) handleApproveConfirmation(key string) (tea.Model, tea.Cmd) {
@@ -400,16 +470,108 @@ func (m model) visibleRange() (int, int) {
 	return start, start + maxListItems
 }
 
+// matchingIndices returns indices into m.prs that pass the active search
+// filter. With no filter, returns every index in order.
+func (m model) matchingIndices() []int {
+	q := strings.ToLower(strings.TrimSpace(m.searchInput.Value()))
+	if q == "" {
+		out := make([]int, len(m.prs))
+		for i := range m.prs {
+			out[i] = i
+		}
+		return out
+	}
+	out := make([]int, 0, len(m.prs))
+	for i, pr := range m.prs {
+		if strings.Contains(strings.ToLower(pr.Repository), q) ||
+			strings.Contains(strings.ToLower(pr.Title), q) ||
+			strings.Contains(strings.ToLower(pr.Author), q) {
+			out = append(out, i)
+		}
+	}
+	return out
+}
+
+// visiblePRIndices returns the indices into m.prs that should be shown in
+// the list panel after filtering and pagination.
+func (m model) visiblePRIndices() []int {
+	matched := m.matchingIndices()
+	n := len(matched)
+	if n <= maxListItems {
+		return matched
+	}
+	start := m.listOffset
+	if start < 0 {
+		start = 0
+	}
+	maxOffset := n - maxListItems
+	if start > maxOffset {
+		start = maxOffset
+	}
+	return matched[start : start+maxListItems]
+}
+
+// advanceCursor moves the cursor by delta positions within the currently
+// matching PR set. Returns true if the cursor moved.
+func (m *model) advanceCursor(delta int) bool {
+	matched := m.matchingIndices()
+	if len(matched) == 0 {
+		return false
+	}
+	pos := -1
+	for i, idx := range matched {
+		if idx == m.cursor {
+			pos = i
+			break
+		}
+	}
+	if pos == -1 {
+		m.cursor = matched[0]
+		return true
+	}
+	newPos := pos + delta
+	if newPos < 0 || newPos >= len(matched) {
+		return false
+	}
+	m.cursor = matched[newPos]
+	return true
+}
+
 func (m *model) ensureCursorVisible() {
-	n := len(m.prs)
+	matched := m.matchingIndices()
+	n := len(matched)
+	if n == 0 {
+		m.listOffset = 0
+		return
+	}
+	pos := -1
+	for i, idx := range matched {
+		if idx == m.cursor {
+			pos = i
+			break
+		}
+	}
+	if pos == -1 {
+		for i, idx := range matched {
+			if idx >= m.cursor {
+				m.cursor = idx
+				pos = i
+				break
+			}
+		}
+		if pos == -1 {
+			pos = n - 1
+			m.cursor = matched[pos]
+		}
+	}
 	if n <= maxListItems {
 		m.listOffset = 0
 		return
 	}
-	if m.cursor < m.listOffset {
-		m.listOffset = m.cursor
-	} else if m.cursor >= m.listOffset+maxListItems {
-		m.listOffset = m.cursor - maxListItems + 1
+	if pos < m.listOffset {
+		m.listOffset = pos
+	} else if pos >= m.listOffset+maxListItems {
+		m.listOffset = pos - maxListItems + 1
 	}
 	maxOffset := n - maxListItems
 	if m.listOffset > maxOffset {
@@ -559,17 +721,31 @@ func (m *model) triggerDetailLoad() tea.Cmd {
 }
 
 func (m model) View() tea.View {
-	parts := []string{
-		m.renderHeader(),
+	parts := []string{m.renderHeader()}
+	if m.searchVisible() {
+		parts = append(parts, m.renderSearchLine())
+	}
+	parts = append(parts,
 		m.renderGroupedList(),
 		m.renderDetailSection(),
 		m.renderFooter(),
-	}
+	)
 	view := strings.Join(parts, "\n")
 	if m.updateNotice != nil {
 		view = m.overlayUpdateNotice(view)
 	}
 	return tea.NewView(view)
+}
+
+func (m model) searchVisible() bool {
+	return m.searchActive || m.searchInput.Value() != ""
+}
+
+func (m model) renderSearchLine() string {
+	if m.searchActive {
+		return mutedStyle.Render("/ ") + m.searchInput.View()
+	}
+	return mutedStyle.Render(fmt.Sprintf("filter: %s  (/ to edit, esc to clear)", m.searchInput.Value()))
 }
 
 func (m model) renderHeader() string {
@@ -578,14 +754,13 @@ func (m model) renderHeader() string {
 		parts = append(parts, mutedStyle.Render(m.status))
 	}
 	if m.loading || m.detailLoading {
-		parts = append(parts, mutedStyle.Render("working..."))
+		parts = append(parts, m.spinner.View()+" "+mutedStyle.Render("working..."))
 	}
 	return strings.Join(parts, "  ")
 }
 
 func (m model) groupPRs() (me, team []pullRequest) {
-	start, end := m.visibleRange()
-	for i := start; i < end; i++ {
+	for _, i := range m.visiblePRIndices() {
 		pr := m.prs[i]
 		if strings.Contains(pr.Request, "@me") {
 			me = append(me, pr)
@@ -602,6 +777,9 @@ func (m model) renderGroupedList() string {
 	}
 	if len(m.prs) == 0 {
 		return mutedStyle.Render("No open PRs are requesting your review.")
+	}
+	if len(m.matchingIndices()) == 0 {
+		return mutedStyle.Render("No PRs match the current filter.")
 	}
 
 	boxW := m.frameWidth()
@@ -644,8 +822,7 @@ type indexedPR struct {
 }
 
 func (m model) groupPRsByIndex() (me, team []indexedPR) {
-	start, end := m.visibleRange()
-	for i := start; i < end; i++ {
+	for _, i := range m.visiblePRIndices() {
 		pr := m.prs[i]
 		if strings.Contains(pr.Request, "@me") {
 			me = append(me, indexedPR{i, pr})
@@ -688,16 +865,21 @@ func (m model) renderPRLine(idx int, pr pullRequest, boxW int) string {
 	approve := m.approveLabel(pr)
 	selected := idx == m.cursor
 
-	line := fmt.Sprintf("%s %s  %s  %s  %s  %s",
-		m.markCell(pr, selected),
-		m.listRepoStyle(selected).Render(padRight(pr.Repository, colRepoW)),
-		m.listNumStyle(selected).Render(padRight(fmt.Sprintf("#%d", pr.Number), colNumW)),
-		m.listTitleStyle(selected).Render(padRight(pr.Title, titleW)),
-		m.listAuthorStyle(selected).Render("@"+padRight(pr.Author, colAuthorW)),
-		m.approveStyle(approve, selected).Render(padRight(approve, colApproveW)),
-	)
+	sp1, sp2 := " ", "  "
 	if selected {
-		return selectedStyle.Render(" " + line + " ")
+		sp1 = selectedStyle.Render(" ")
+		sp2 = selectedStyle.Render("  ")
+	}
+
+	line := m.markCell(pr, selected) + sp1 +
+		m.listRepoStyle(selected).Render(padRight(pr.Repository, colRepoW)) + sp2 +
+		m.listNumStyle(selected).Render(padRight(fmt.Sprintf("#%d", pr.Number), colNumW)) + sp2 +
+		m.listTitleStyle(selected).Render(padRight(pr.Title, titleW)) + sp2 +
+		m.listAuthorStyle(selected).Render("@"+padRight(pr.Author, colAuthorW)) + sp2 +
+		m.approveStyle(approve, selected).Render(padRight(approve, colApproveW))
+
+	if selected {
+		return sp1 + line + sp1
 	}
 	return " " + line
 }
@@ -710,7 +892,11 @@ func (m model) markCell(pr pullRequest, selected bool) string {
 		}
 		return style.Render(padRight("[!]", colMarkW))
 	}
-	return strings.Repeat(" ", colMarkW)
+	cell := strings.Repeat(" ", colMarkW)
+	if selected {
+		return selectedStyle.Render(cell)
+	}
+	return cell
 }
 
 func (m model) approveLabel(pr pullRequest) string {
@@ -782,7 +968,7 @@ func (m model) renderDetailSection() string {
 	var content string
 	switch {
 	case m.detailLoading:
-		content = mutedStyle.Render("loading detail...")
+		content = m.spinner.View() + " " + mutedStyle.Render("loading detail...")
 	case m.detailErr != "":
 		content = errorStyle.Render(m.detailErr)
 	case m.currentDetail == nil:
@@ -808,7 +994,7 @@ func (m model) renderFooter() string {
 	if m.pendingApprove != nil {
 		return footerStyle.Render("confirm approve: y/yes approve  n/no cancel")
 	}
-	return footerStyle.Render("ctrl+n/p list  j/k scroll  pgup/pgdn page  a approve  r refresh  q quit")
+	return footerStyle.Render("ctrl+n/p list  j/k scroll  pgup/pgdn page  / filter  a approve  r refresh  q quit")
 }
 
 func (m *model) resizeViewport() {
@@ -816,11 +1002,16 @@ func (m *model) resizeViewport() {
 		return
 	}
 	listH := m.computeListSectionHeight()
-	// layout: header(1) + list(listH) + detailBorder(2) + vpH + footer(1) = 4 + listH + vpH
-	vpH := max(3, m.height-4-listH)
+	searchH := 0
+	if m.searchVisible() {
+		searchH = 1
+	}
+	// layout: header(1) + search?(searchH) + list(listH) + detailBorder(2) + vpH + footer(1)
+	vpH := max(3, m.height-4-listH-searchH)
 	vpW := max(20, frameContentWidth(detailFrameStyle, m.frameWidth()))
 	m.detailVP.SetHeight(vpH)
 	m.detailVP.SetWidth(vpW)
+	m.searchInput.SetWidth(max(20, m.frameWidth()-4))
 }
 
 func (m model) computeListSectionHeight() int {
@@ -1116,7 +1307,50 @@ func renderDiffContent(detail pullRequestDetail, diff string) string {
 	b.WriteString("\n\n")
 	b.WriteString(detailRuleStyle.Render(strings.Repeat("-", 80)))
 	b.WriteString("\n\n")
-	b.WriteString(diff)
+	b.WriteString(highlightDiff(diff))
+	return b.String()
+}
+
+// highlightDiff applies tokyonight colors to a unified diff. The input is
+// assumed to come from `gh pr diff` (plain text); pre-styled placeholders
+// like the too-large notice start with an ANSI escape and fall through
+// unchanged.
+func highlightDiff(diff string) string {
+	if diff == "" {
+		return diff
+	}
+	lines := strings.Split(diff, "\n")
+	var b strings.Builder
+	b.Grow(len(diff) + len(lines)*8)
+	for i, line := range lines {
+		switch {
+		case strings.HasPrefix(line, "diff --git"):
+			b.WriteString(diffFileHeaderStyle.Render(line))
+		case strings.HasPrefix(line, "index "),
+			strings.HasPrefix(line, "new file mode"),
+			strings.HasPrefix(line, "deleted file mode"),
+			strings.HasPrefix(line, "old mode"),
+			strings.HasPrefix(line, "new mode"),
+			strings.HasPrefix(line, "rename from "),
+			strings.HasPrefix(line, "rename to "),
+			strings.HasPrefix(line, "similarity index"),
+			strings.HasPrefix(line, "Binary files"),
+			strings.HasPrefix(line, "--- "),
+			strings.HasPrefix(line, "+++ "):
+			b.WriteString(diffMetaStyle.Render(line))
+		case strings.HasPrefix(line, "@@"):
+			b.WriteString(diffHunkStyle.Render(line))
+		case strings.HasPrefix(line, "+"):
+			b.WriteString(diffAddStyle.Render(line))
+		case strings.HasPrefix(line, "-"):
+			b.WriteString(diffDelStyle.Render(line))
+		default:
+			b.WriteString(line)
+		}
+		if i < len(lines)-1 {
+			b.WriteByte('\n')
+		}
+	}
 	return b.String()
 }
 
