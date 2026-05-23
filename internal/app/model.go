@@ -6,6 +6,8 @@ import (
 	"strings"
 	"time"
 
+	"charm.land/bubbles/v2/help"
+	"charm.land/bubbles/v2/key"
 	"charm.land/bubbles/v2/viewport"
 	tea "charm.land/bubbletea/v2"
 	"charm.land/lipgloss/v2"
@@ -43,6 +45,8 @@ type model struct {
 	cursor   int
 	diffPR   *pullRequest
 	diff     viewport.Model
+	keys     keyMap
+	help     help.Model
 	width    int
 	height   int
 	approved map[string]bool
@@ -63,6 +67,8 @@ func newModel() model {
 		loading:  true,
 		status:   "loading review requests...",
 		diff:     vp,
+		keys:     newKeyMap(),
+		help:     help.New(),
 		approved: make(map[string]bool),
 	}
 }
@@ -103,6 +109,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		m.err = ""
 		m.screen = screenDiff
+		m.keys.setScreen(screenDiff)
 		m.diffPR = &msg.pr
 		m.diff.SetContent(msg.diff)
 		m.diff.GotoTop()
@@ -119,6 +126,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.approved[msg.pr.URL] = true
 		m.status = "approved " + prLabel(msg.pr)
 		m.screen = screenList
+		m.keys.setScreen(screenList)
 		return m, loadPRsCmd()
 	}
 
@@ -131,11 +139,13 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 }
 
 func (m model) handleKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
-	key := msg.String()
-	switch key {
-	case "ctrl+c", "q":
+	switch {
+	case key.Matches(msg, m.keys.Quit):
 		return m, tea.Quit
-	case "r":
+	case key.Matches(msg, m.keys.Help):
+		m.help.ShowAll = !m.help.ShowAll
+		return m, nil
+	case key.Matches(msg, m.keys.Refresh):
 		if m.loading {
 			return m, nil
 		}
@@ -147,28 +157,28 @@ func (m model) handleKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 
 	switch m.screen {
 	case screenList:
-		return m.handleListKey(key)
+		return m.handleListKey(msg)
 	case screenDiff:
-		return m.handleDiffKey(key, msg)
+		return m.handleDiffKey(msg)
 	default:
 		return m, nil
 	}
 }
 
-func (m model) handleListKey(key string) (tea.Model, tea.Cmd) {
+func (m model) handleListKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 	if m.loading {
 		return m, nil
 	}
-	switch key {
-	case "down", "j":
+	switch {
+	case key.Matches(msg, m.keys.Down):
 		if m.cursor < len(m.prs)-1 {
 			m.cursor++
 		}
-	case "up", "k":
+	case key.Matches(msg, m.keys.Up):
 		if m.cursor > 0 {
 			m.cursor--
 		}
-	case "enter", "d", "a":
+	case key.Matches(msg, m.keys.Open, m.keys.OpenAndApprove):
 		if len(m.prs) == 0 {
 			return m, nil
 		}
@@ -180,14 +190,15 @@ func (m model) handleListKey(key string) (tea.Model, tea.Cmd) {
 	return m, nil
 }
 
-func (m model) handleDiffKey(key string, msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
-	switch key {
-	case "esc", "b":
+func (m model) handleDiffKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
+	switch {
+	case key.Matches(msg, m.keys.Back):
 		m.screen = screenList
+		m.keys.setScreen(screenList)
 		m.diffPR = nil
 		m.status = fmt.Sprintf("%d review request(s)", len(m.prs))
 		return m, nil
-	case "a":
+	case key.Matches(msg, m.keys.Approve):
 		if m.diffPR == nil || m.loading {
 			return m, nil
 		}
@@ -278,15 +289,13 @@ func (m model) renderDiff() string {
 }
 
 func (m model) renderFooter() string {
-	if m.screen == screenDiff {
-		return mutedStyle.Render("j/k scroll  pgup/pgdn page  a approve  esc back  r refresh  q quit")
-	}
-	return mutedStyle.Render("j/k move  enter/d diff  a diff+approve  r refresh  q quit")
+	return m.help.View(m.keys)
 }
 
 func (m *model) resizeViewport() {
 	if m.width > 0 {
 		m.diff.SetWidth(m.width)
+		m.help.SetWidth(m.width)
 	}
 	if m.height > 6 {
 		m.diff.SetHeight(m.height - 6)
