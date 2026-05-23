@@ -3,6 +3,7 @@ package app
 import (
 	"context"
 	"fmt"
+	"os"
 	"strings"
 	"time"
 
@@ -28,9 +29,25 @@ const (
 	focusFiles
 )
 
-// reservedRows accounts for the header, padding, and footer that surround the
-// list when computing its available size.
-const reservedRows = 6
+// Layout constants for the bordered panes. Each pane uses a rounded border
+// (1 col per side) and horizontal padding (1 col per side), so the inner
+// content area is 4 columns narrower than the pane and 2 rows shorter than
+// the pane itself. The constants encode these overheads in a single place so
+// resizeChildren and View stay in sync.
+const (
+	borderH  = 2 // 1 left + 1 right
+	borderV  = 2 // 1 top + 1 bottom
+	paddingH = 2 // Padding(0, 1) -> 1 left + 1 right
+	// paneOverheadH is the total horizontal space (border + padding) consumed
+	// by a single bordered pane.
+	paneOverheadH = borderH + paddingH
+
+	// minBorderedWidth / minBorderedHeight are the thresholds below which we
+	// drop the borders entirely and fall back to plain text — borders eat too
+	// much space on tiny terminals and would otherwise hide the content.
+	minBorderedWidth  = 40
+	minBorderedHeight = 10
+)
 
 // sidebarWidth is the fixed column count used for the diff file sidebar. A
 // small gap is rendered between the sidebar and the diff body, so the diff
@@ -110,21 +127,46 @@ type model struct {
 	approved  map[string]bool
 }
 
+// lightDark resolves a pair of (light, dark) colors based on the terminal
+// background. Built once at package init so we don't probe the terminal on
+// every render — the result is stable for the life of the process.
+var lightDark = lipgloss.LightDark(lipgloss.HasDarkBackground(os.Stdin, os.Stdout))
+
 var (
-	titleStyle = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("39"))
-	mutedStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("245"))
-	errorStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("196"))
-	okStyle    = lipgloss.NewStyle().Foreground(lipgloss.Color("42"))
+	// titleStyle is adaptive: a deeper blue on light terminals, a brighter
+	// cyan on dark ones, so the header reads cleanly in both themes.
+	titleStyle = lipgloss.NewStyle().
+			Bold(true).
+			Foreground(lightDark(lipgloss.Color("27"), lipgloss.Color("39")))
+	mutedStyle = lipgloss.NewStyle().
+			Foreground(lightDark(lipgloss.Color("240"), lipgloss.Color("245")))
+	errorStyle = lipgloss.NewStyle().
+			Foreground(lightDark(lipgloss.Color("160"), lipgloss.Color("196")))
+	okStyle = lipgloss.NewStyle().
+		Foreground(lightDark(lipgloss.Color("28"), lipgloss.Color("42")))
+
+	// borderColor is the resting border color used for non-focused panes and
+	// the outer header/content/footer frames. accentColor highlights the
+	// currently focused pane on the diff screen.
+	borderColor = lightDark(lipgloss.Color("250"), lipgloss.Color("240"))
+	accentColor = lightDark(lipgloss.Color("27"), lipgloss.Color("39"))
+
+	// paneStyle is the shared frame used by the header, content, and footer
+	// rows. The width is set per-render so the frame spans the full terminal.
+	paneStyle = lipgloss.NewStyle().
+			Border(lipgloss.RoundedBorder()).
+			BorderForeground(borderColor).
+			Padding(0, 1)
 
 	// focusedPaneStyle outlines the currently focused pane (sidebar or diff)
-	// with a subtle border so the user can tell which side will receive
-	// scrolling input.
+	// with a rounded accent border; unfocusedPaneStyle keeps the same shape
+	// but uses the resting border color so the focused side stands out.
 	focusedPaneStyle = lipgloss.NewStyle().
-				Border(lipgloss.NormalBorder(), false, false, false, true).
-				BorderForeground(lipgloss.Color("39"))
+				Border(lipgloss.RoundedBorder()).
+				BorderForeground(accentColor)
 	unfocusedPaneStyle = lipgloss.NewStyle().
-				Border(lipgloss.NormalBorder(), false, false, false, true).
-				BorderForeground(lipgloss.Color("238"))
+				Border(lipgloss.RoundedBorder()).
+				BorderForeground(borderColor)
 )
 
 func newModel() model {
@@ -257,6 +299,9 @@ func (m model) handleKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 		return m, tea.Quit
 	case key.Matches(msg, m.keys.Help):
 		m.help.ShowAll = !m.help.ShowAll
+		// Toggling help changes the footer's height, so re-flow the children
+		// (the content pane shrinks to make room for the expanded help text).
+		m.resizeChildren()
 		return m, nil
 	case key.Matches(msg, m.keys.Refresh):
 		if m.loading {
@@ -393,15 +438,7 @@ func (m model) selectedPR() (pullRequest, bool) {
 }
 
 func (m model) View() tea.View {
-	content := m.renderHeader() + "\n\n"
-	if m.screen == screenDiff {
-		content += m.renderDiff()
-	} else {
-		content += m.renderList()
-	}
-	content += "\n" + m.renderFooter()
-
-	v := tea.NewView(content)
+	v := tea.NewView(m.renderFrame())
 	v.AltScreen = true
 	v.MouseMode = tea.MouseModeCellMotion
 	v.WindowTitle = "gh review"
@@ -409,6 +446,44 @@ func (m model) View() tea.View {
 	// non-nil it would be shown at the given position.
 	v.Cursor = nil
 	return v
+}
+
+// renderFrame composes the header, content, and footer panes vertically.
+// On terminals too small to host borders cleanly it falls back to the
+// previous plain-text layout so nothing gets clipped or wrapped weirdly.
+func (m model) renderFrame() string {
+	headerText := m.renderHeader()
+	bodyText := m.renderBody()
+	footerText := m.renderFooter()
+
+	if !m.borderedLayout() {
+		// Plain fallback for tiny terminals — keep the prior look so the app
+		// degrades gracefully on small panes / CI environments.
+		return headerText + "\n\n" + bodyText + "\n" + footerText
+	}
+
+	frame := paneStyle.Width(m.width)
+	header := frame.Render(headerText)
+	footer := frame.Render(footerText)
+
+	// We want header, content, footer to stack to exactly m.height rows.
+	// lipgloss's Width/Height set the *outer* block size (borders included),
+	// so the content frame's Height is the leftover rows after the header
+	// and footer have claimed theirs.
+	contentH := m.height - lipgloss.Height(header) - lipgloss.Height(footer)
+	if contentH < borderV+1 {
+		contentH = borderV + 1
+	}
+	content := frame.Height(contentH).Render(bodyText)
+
+	return lipgloss.JoinVertical(lipgloss.Left, header, content, footer)
+}
+
+// borderedLayout reports whether the current terminal size has room for the
+// rounded outer frame. Below the thresholds we drop borders so the content
+// still fits.
+func (m model) borderedLayout() bool {
+	return m.width >= minBorderedWidth && m.height >= minBorderedHeight
 }
 
 func (m model) renderHeader() string {
@@ -422,17 +497,22 @@ func (m model) renderHeader() string {
 	return strings.Join(parts, "  ")
 }
 
-func (m model) renderList() string {
+// renderBody returns the inner content for the middle pane, dispatching on
+// the active screen. Errors short-circuit to a single line so the surrounding
+// frame stays intact.
+func (m model) renderBody() string {
 	if m.err != "" {
 		return errorStyle.Render(m.err)
 	}
-	return m.list.View()
+	switch m.screen {
+	case screenDiff:
+		return m.renderDiff()
+	default:
+		return m.list.View()
+	}
 }
 
 func (m model) renderDiff() string {
-	if m.err != "" {
-		return errorStyle.Render(m.err)
-	}
 	if m.diffPR == nil {
 		return mutedStyle.Render("No PR selected.")
 	}
@@ -465,36 +545,92 @@ func (m model) renderFooter() string {
 	return m.help.View(m.keys)
 }
 
+// resizeChildren resizes the list / viewport / sidebar to fit the available
+// terminal space, after accounting for the outer header / content / footer
+// frames as well as the bordered sidebar and diff panes on the diff screen.
+//
+// The math is fiddly enough that the layout would silently desync if we
+// hand-rolled it inline twice (once here, once in renderFrame). To keep them
+// in lockstep we measure the actually rendered header and footer with
+// lipgloss.Height instead of guessing.
 func (m *model) resizeChildren() {
-	if m.width > 0 {
-		m.help.SetWidth(m.width)
-		// The sidebar consumes a fixed slice of horizontal space when visible;
-		// account for its border (one column) and the inter-pane gap so the
-		// diff body doesn't overflow into wrapped lines.
-		diffWidth := m.width
-		if m.sidebarVisible() {
-			// sidebar = sidebarWidth content + 1 col left border
-			// body left border = 1 col
-			diffWidth = m.width - sidebarWidth - 2 - sidebarGap
-			if diffWidth < 1 {
-				diffWidth = 1
-			}
-		}
-		m.diff.SetWidth(diffWidth)
+	if m.width <= 0 || m.height <= 0 {
+		return
 	}
-	if m.height > reservedRows {
-		body := m.height - reservedRows
+	m.help.SetWidth(m.width)
+
+	if !m.borderedLayout() {
+		// Plain fallback path: mirror the previous (pre-border) sizing so the
+		// children still get a sensible viewport on tiny terminals.
+		body := m.height - 4 // header (1) + blank (1) + footer (1) + slack (1)
+		if body < 1 {
+			body = 1
+		}
+		m.diff.SetWidth(m.width)
 		m.diff.SetHeight(body)
 		m.list.SetSize(m.width, body)
-		if m.sidebarVisible() {
-			m.fileList.SetSize(sidebarWidth, body)
-		} else {
-			m.fileList.SetSize(0, 0)
+		m.fileList.SetSize(0, 0)
+		return
+	}
+
+	// Width available inside the outer rounded frame:
+	//   m.width - border(2) - padding(2)
+	innerW := m.width - paneOverheadH
+	if innerW < 1 {
+		innerW = 1
+	}
+
+	// Measure the rendered header + footer to compute the leftover content
+	// height. The header itself is always a single line; the footer expands
+	// to two-ish lines when help.ShowAll is true. Each occupies +2 rows for
+	// its own top/bottom border (padding is 0,1 so no vertical padding).
+	headerRendered := paneStyle.Width(m.width).Render(m.renderHeader())
+	footerRendered := paneStyle.Width(m.width).Render(m.renderFooter())
+	innerH := m.height - lipgloss.Height(headerRendered) - lipgloss.Height(footerRendered) - borderV
+	if innerH < 1 {
+		innerH = 1
+	}
+
+	// Diff screen: the inner area is split into a bordered sidebar and a
+	// bordered diff body. Each sub-pane has its own rounded border (2 cols /
+	// 2 rows of overhead). The sidebar's outer width is sidebarWidth, so its
+	// inner text area is sidebarWidth - borderH.
+	if m.sidebarVisible() {
+		sidebarInnerW := sidebarWidth - borderH
+		if sidebarInnerW < 1 {
+			sidebarInnerW = 1
 		}
-	} else if m.width > 0 {
-		m.list.SetSize(m.width, 0)
+		diffInnerW := innerW - sidebarWidth - sidebarGap - borderH
+		if diffInnerW < 1 {
+			diffInnerW = 1
+		}
+		// Both sub-panes share the same inner height. They sit under a single
+		// title line, so subtract one more row for that header text.
+		subInnerH := innerH - 1 - borderV
+		if subInnerH < 1 {
+			subInnerH = 1
+		}
+		m.diff.SetWidth(diffInnerW)
+		m.diff.SetHeight(subInnerH)
+		m.fileList.SetSize(sidebarInnerW, subInnerH)
+	} else {
+		// No sidebar: diff body fills the inner width minus its own border,
+		// under the title line.
+		diffInnerW := innerW - borderH
+		if diffInnerW < 1 {
+			diffInnerW = 1
+		}
+		subInnerH := innerH - 1
+		if subInnerH < 1 {
+			subInnerH = 1
+		}
+		m.diff.SetWidth(diffInnerW)
+		m.diff.SetHeight(subInnerH)
 		m.fileList.SetSize(0, 0)
 	}
+
+	// List screen: the list fills the full inner area of the content frame.
+	m.list.SetSize(innerW, innerH)
 }
 
 func loadPRsCmd() tea.Cmd {
