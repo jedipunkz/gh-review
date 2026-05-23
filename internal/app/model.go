@@ -10,6 +10,7 @@ import (
 	"charm.land/bubbles/v2/help"
 	"charm.land/bubbles/v2/key"
 	"charm.land/bubbles/v2/list"
+	"charm.land/bubbles/v2/progress"
 	"charm.land/bubbles/v2/viewport"
 	tea "charm.land/bubbletea/v2"
 	"charm.land/lipgloss/v2"
@@ -75,10 +76,12 @@ type approveMsg struct {
 }
 
 // prItem is the list.Item adapter for pullRequest. It also satisfies
-// list.DefaultItem so the default delegate can render it.
+// list.DefaultItem so the default delegate can render it. The `selected`
+// flag drives the multi-select checkbox marker rendered in Title.
 type prItem struct {
 	pr       pullRequest
 	approved bool
+	selected bool
 }
 
 // fileItem adapts a diffFile for use with the bubbles list. It implements
@@ -94,7 +97,11 @@ func (f fileItem) Description() string { return "" }
 func (f fileItem) FilterValue() string { return f.file.Path }
 
 func (p prItem) Title() string {
-	title := fmt.Sprintf("%s #%d  %s", p.pr.Repository, p.pr.Number, p.pr.Title)
+	marker := mutedStyle.Render("[ ] ")
+	if p.selected {
+		marker = accentStyle.Render("[x] ")
+	}
+	title := fmt.Sprintf("%s%s #%d  %s", marker, p.pr.Repository, p.pr.Number, p.pr.Title)
 	if p.approved {
 		title += "  " + okStyle.Render("✓ approved")
 	}
@@ -125,6 +132,18 @@ type model struct {
 	width     int
 	height    int
 	approved  map[string]bool
+	// selected tracks which PRs (by URL) are currently checked for bulk
+	// approve. Items are toggled with space on the list screen.
+	selected map[string]bool
+	// progress drives the in-app gradient progress bar shown while a bulk
+	// approve is running. It animates between SetPercent calls.
+	progress progress.Model
+	// bulkActive guards the bulk-progress UI so only one bulk approve is in
+	// flight at a time and most key bindings can be suppressed during the run.
+	bulkActive bool
+	bulkTotal  int
+	bulkDone   int
+	bulkErrs   []error
 }
 
 // lightDark resolves a pair of (light, dark) colors based on the terminal
@@ -144,6 +163,11 @@ var (
 			Foreground(lightDark(lipgloss.Color("160"), lipgloss.Color("196")))
 	okStyle = lipgloss.NewStyle().
 		Foreground(lightDark(lipgloss.Color("28"), lipgloss.Color("42")))
+	// accentStyle highlights the selection marker on selected PR rows so the
+	// "[x]" reads as a strong visual cue even on busy backgrounds.
+	accentStyle = lipgloss.NewStyle().
+			Bold(true).
+			Foreground(lightDark(lipgloss.Color("27"), lipgloss.Color("39")))
 
 	// borderColor is the resting border color used for non-focused panes and
 	// the outer header/content/footer frames. accentColor highlights the
@@ -198,6 +222,8 @@ func newModel() model {
 		keys:      newKeyMap(),
 		help:      help.New(),
 		approved:  make(map[string]bool),
+		selected:  make(map[string]bool),
+		progress:  progress.New(progress.WithDefaultBlend()),
 	}
 }
 
@@ -222,9 +248,25 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m, nil
 		}
 		m.err = ""
+		// Drop selections for PRs that no longer appear in the refreshed list
+		// (e.g. they were approved & dismissed) so stale URLs don't quietly
+		// hang around in m.selected.
+		alive := make(map[string]bool, len(msg.prs))
+		for _, pr := range msg.prs {
+			alive[pr.URL] = true
+		}
+		for url := range m.selected {
+			if !alive[url] {
+				delete(m.selected, url)
+			}
+		}
 		items := make([]list.Item, 0, len(msg.prs))
 		for _, pr := range msg.prs {
-			items = append(items, prItem{pr: pr, approved: m.approved[pr.URL]})
+			items = append(items, prItem{
+				pr:       pr,
+				approved: m.approved[pr.URL],
+				selected: m.selected[pr.URL],
+			})
 		}
 		cmd := m.list.SetItems(items)
 		m.status = fmt.Sprintf("%d review request(s)", len(msg.prs))
@@ -271,6 +313,50 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.screen = screenList
 		m.keys.setScreen(screenList)
 		return m, loadPRsCmd()
+	case bulkApproveStartMsg:
+		m.bulkActive = true
+		m.bulkTotal = msg.total
+		m.bulkDone = 0
+		m.bulkErrs = nil
+		m.err = ""
+		m.status = fmt.Sprintf("approving 0/%d...", msg.total)
+		cmd := m.progress.SetPercent(0)
+		return m, cmd
+	case bulkApproveProgressMsg:
+		m.bulkDone = msg.done
+		if msg.err != nil {
+			m.bulkErrs = append(m.bulkErrs, msg.err)
+		} else {
+			m.approved[msg.pr.URL] = true
+			delete(m.selected, msg.pr.URL)
+		}
+		m.status = fmt.Sprintf("approving %d/%d...", msg.done, m.bulkTotal)
+		var pct float64
+		if m.bulkTotal > 0 {
+			pct = float64(msg.done) / float64(m.bulkTotal)
+		}
+		cmd := m.progress.SetPercent(pct)
+		return m, cmd
+	case bulkApproveDoneMsg:
+		m.bulkActive = false
+		failed := len(m.bulkErrs)
+		ok := m.bulkTotal - failed
+		if failed > 0 {
+			m.status = fmt.Sprintf("approved %d (%d failed)", ok, failed)
+			// Surface the first error so the user has something to act on; the
+			// rest are silently dropped because they'd typically be redundant.
+			m.err = m.bulkErrs[0].Error()
+		} else {
+			m.status = fmt.Sprintf("approved %d", ok)
+		}
+		m.selected = make(map[string]bool)
+		return m, loadPRsCmd()
+	case progress.FrameMsg:
+		// Forward animation frames to the progress component so its spring
+		// settles smoothly between SetPercent calls.
+		var cmd tea.Cmd
+		m.progress, cmd = m.progress.Update(msg)
+		return m, cmd
 	}
 
 	if m.screen == screenDiff {
@@ -286,6 +372,21 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 }
 
 func (m model) handleKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
+	// While a bulk approve is running, only allow Quit and Help so the user
+	// can bail out or check the keymap without interfering with the in-flight
+	// approvals.
+	if m.bulkActive {
+		switch {
+		case key.Matches(msg, m.keys.Quit):
+			return m, tea.Quit
+		case key.Matches(msg, m.keys.Help):
+			m.help.ShowAll = !m.help.ShowAll
+			m.resizeChildren()
+			return m, nil
+		}
+		return m, nil
+	}
+
 	// While the list is filtering, let it consume keystrokes so the user can
 	// type into the filter input without our shortcuts hijacking letters.
 	if m.screen == screenList && m.list.FilterState() == list.Filtering {
@@ -336,6 +437,57 @@ func (m model) handleListKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 		m.status = "loading diff..."
 		m.err = ""
 		return m, loadDiffCmd(pr)
+	}
+	if key.Matches(msg, m.keys.ToggleSelect) {
+		pr, ok := m.selectedPR()
+		if !ok {
+			return m, nil
+		}
+		if m.selected[pr.URL] {
+			delete(m.selected, pr.URL)
+		} else {
+			m.selected[pr.URL] = true
+		}
+		// Rebuild list items so the checkbox marker reflects the new state.
+		// Cheaper than mutating in place because items are stored by value.
+		idx := m.list.Index()
+		items := m.list.Items()
+		next := make([]list.Item, 0, len(items))
+		for _, it := range items {
+			pi, ok := it.(prItem)
+			if !ok {
+				next = append(next, it)
+				continue
+			}
+			pi.selected = m.selected[pi.pr.URL]
+			next = append(next, pi)
+		}
+		cmd := m.list.SetItems(next)
+		m.list.Select(idx)
+		m.status = fmt.Sprintf("%d selected", len(m.selected))
+		return m, cmd
+	}
+	if key.Matches(msg, m.keys.ApproveSelected) {
+		if len(m.selected) == 0 {
+			m.status = "nothing selected"
+			return m, nil
+		}
+		// Snapshot the selection in list order so progress messages arrive in
+		// the same order the user sees them.
+		prs := make([]pullRequest, 0, len(m.selected))
+		for _, it := range m.list.Items() {
+			pi, ok := it.(prItem)
+			if !ok {
+				continue
+			}
+			if m.selected[pi.pr.URL] {
+				prs = append(prs, pi.pr)
+			}
+		}
+		if len(prs) == 0 {
+			return m, nil
+		}
+		return m, bulkApproveCmd(prs)
 	}
 
 	// Defer movement, filtering, and pagination to the list component.
@@ -445,6 +597,17 @@ func (m model) View() tea.View {
 	// Hide the cursor on list/diff screens by leaving Cursor nil; when set to
 	// non-nil it would be shown at the given position.
 	v.Cursor = nil
+	// Mirror bulk-approve progress to the terminal's native progress bar
+	// (OSC 9;4) so terminals like Windows Terminal / WezTerm can surface it
+	// outside the TUI. Value is the integer percent; the field is only set
+	// while a bulk approve is in flight.
+	if m.bulkActive && m.bulkTotal > 0 {
+		pct := int(float64(m.bulkDone) / float64(m.bulkTotal) * 100)
+		v.ProgressBar = &tea.ProgressBar{
+			State: tea.ProgressBarDefault,
+			Value: pct,
+		}
+	}
 	return v
 }
 
@@ -494,7 +657,13 @@ func (m model) renderHeader() string {
 	if m.loading {
 		parts = append(parts, mutedStyle.Render("working"))
 	}
-	return strings.Join(parts, "  ")
+	line := strings.Join(parts, "  ")
+	if m.bulkActive {
+		// Stack the gradient progress bar under the status line so it's
+		// visible at a glance without crowding the title row.
+		line += "\n" + m.progress.View()
+	}
+	return line
 }
 
 // renderBody returns the inner content for the middle pane, dispatching on
@@ -558,6 +727,14 @@ func (m *model) resizeChildren() {
 		return
 	}
 	m.help.SetWidth(m.width)
+	// Keep the progress bar narrower than the header pane so it never wraps
+	// inside the rounded frame. The pane consumes paneOverheadH columns of
+	// border + padding, and we leave a small slack for the status text.
+	pw := m.width - paneOverheadH - 4
+	if pw < 10 {
+		pw = 10
+	}
+	m.progress.SetWidth(pw)
 
 	if !m.borderedLayout() {
 		// Plain fallback path: mirror the previous (pre-border) sizing so the
