@@ -107,7 +107,7 @@ var (
 	tokyoNightOrange     = lipgloss.Color("#ff9e64")
 	tokyoNightRed        = lipgloss.Color("#f7768e")
 	tokyoNightYellow     = lipgloss.Color("#e0af68")
-	tokyoNightSelected   = lipgloss.Color("#283457")
+	tokyoNightSelected   = lipgloss.Color("#3d59a1")
 	tokyoNightSelectedFg = lipgloss.Color("#ffffff")
 
 	titleStyle          = lipgloss.NewStyle().Bold(true).Foreground(tokyoNightBlue)
@@ -688,16 +688,21 @@ func (m model) renderPRLine(idx int, pr pullRequest, boxW int) string {
 	approve := m.approveLabel(pr)
 	selected := idx == m.cursor
 
-	line := fmt.Sprintf("%s %s  %s  %s  %s  %s",
-		m.markCell(pr, selected),
-		m.listRepoStyle(selected).Render(padRight(pr.Repository, colRepoW)),
-		m.listNumStyle(selected).Render(padRight(fmt.Sprintf("#%d", pr.Number), colNumW)),
-		m.listTitleStyle(selected).Render(padRight(pr.Title, titleW)),
-		m.listAuthorStyle(selected).Render("@"+padRight(pr.Author, colAuthorW)),
-		m.approveStyle(approve, selected).Render(padRight(approve, colApproveW)),
-	)
+	sp1, sp2 := " ", "  "
 	if selected {
-		return selectedStyle.Render(" " + line + " ")
+		sp1 = selectedStyle.Render(" ")
+		sp2 = selectedStyle.Render("  ")
+	}
+
+	line := m.markCell(pr, selected) + sp1 +
+		m.listRepoStyle(selected).Render(padRight(pr.Repository, colRepoW)) + sp2 +
+		m.listNumStyle(selected).Render(padRight(fmt.Sprintf("#%d", pr.Number), colNumW)) + sp2 +
+		m.listTitleStyle(selected).Render(padRight(pr.Title, titleW)) + sp2 +
+		m.listAuthorStyle(selected).Render("@"+padRight(pr.Author, colAuthorW)) + sp2 +
+		m.approveStyle(approve, selected).Render(padRight(approve, colApproveW))
+
+	if selected {
+		return sp1 + line + sp1
 	}
 	return " " + line
 }
@@ -710,7 +715,11 @@ func (m model) markCell(pr pullRequest, selected bool) string {
 		}
 		return style.Render(padRight("[!]", colMarkW))
 	}
-	return strings.Repeat(" ", colMarkW)
+	cell := strings.Repeat(" ", colMarkW)
+	if selected {
+		return selectedStyle.Render(cell)
+	}
+	return cell
 }
 
 func (m model) approveLabel(pr pullRequest) string {
