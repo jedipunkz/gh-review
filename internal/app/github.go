@@ -10,6 +10,8 @@ import (
 	"sort"
 	"strings"
 	"time"
+
+	"golang.org/x/sync/errgroup"
 )
 
 type pullRequest struct {
@@ -142,15 +144,36 @@ func loadReviewRequests(ctx context.Context) ([]pullRequest, error) {
 		}
 	}
 
+	type queryResult struct {
+		label string
+		prs   []pullRequest
+		err   error
+	}
+	results := make([]queryResult, len(queries))
+
+	g, gctx := errgroup.WithContext(ctx)
+	// Cap fan-out to respect gh CLI rate limits across @me + arbitrary team count.
+	g.SetLimit(8)
+	for i, query := range queries {
+		i, query := i, query
+		g.Go(func() error {
+			prs, err := searchPRs(gctx, query.q, query.label)
+			results[i] = queryResult{label: query.label, prs: prs, err: err}
+			// Always return nil: per-query failures are aggregated below so a
+			// single failure doesn't cancel sibling goroutines via gctx.
+			return nil
+		})
+	}
+	_ = g.Wait()
+
 	byURL := make(map[string]pullRequest)
 	var errs []error
-	for _, query := range queries {
-		prs, err := searchPRs(ctx, query.q, query.label)
-		if err != nil {
-			errs = append(errs, fmt.Errorf("%s: %w", query.label, err))
+	for _, r := range results {
+		if r.err != nil {
+			errs = append(errs, fmt.Errorf("%s: %w", r.label, r.err))
 			continue
 		}
-		for _, pr := range prs {
+		for _, pr := range r.prs {
 			if existing, ok := byURL[pr.URL]; ok {
 				if !strings.Contains(existing.Request, pr.Request) {
 					existing.Request += ", " + pr.Request
