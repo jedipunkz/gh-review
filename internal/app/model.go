@@ -21,9 +21,25 @@ const (
 	screenDiff
 )
 
+type focusArea int
+
+const (
+	focusDiff focusArea = iota
+	focusFiles
+)
+
 // reservedRows accounts for the header, padding, and footer that surround the
 // list when computing its available size.
 const reservedRows = 6
+
+// sidebarWidth is the fixed column count used for the diff file sidebar. A
+// small gap is rendered between the sidebar and the diff body, so the diff
+// viewport receives `width - sidebarWidth - sidebarGap` columns.
+const (
+	sidebarWidth   = 30
+	sidebarGap     = 1
+	sidebarMinTerm = 30 // below this terminal width we hide the sidebar entirely
+)
 
 type prListMsg struct {
 	prs []pullRequest
@@ -48,6 +64,18 @@ type prItem struct {
 	approved bool
 }
 
+// fileItem adapts a diffFile for use with the bubbles list. It implements
+// list.DefaultItem; Description is intentionally empty to keep the sidebar
+// compact (the default delegate renders the second line in a muted color but
+// gracefully accepts an empty string).
+type fileItem struct {
+	file diffFile
+}
+
+func (f fileItem) Title() string       { return f.file.Path }
+func (f fileItem) Description() string { return "" }
+func (f fileItem) FilterValue() string { return f.file.Path }
+
 func (p prItem) Title() string {
 	title := fmt.Sprintf("%s #%d  %s", p.pr.Repository, p.pr.Number, p.pr.Title)
 	if p.approved {
@@ -65,18 +93,21 @@ func (p prItem) FilterValue() string {
 }
 
 type model struct {
-	screen   screen
-	loading  bool
-	status   string
-	err      string
-	list     list.Model
-	diffPR   *pullRequest
-	diff     viewport.Model
-	keys     keyMap
-	help     help.Model
-	width    int
-	height   int
-	approved map[string]bool
+	screen    screen
+	loading   bool
+	status    string
+	err       string
+	list      list.Model
+	diffPR    *pullRequest
+	diff      viewport.Model
+	files     []diffFile
+	fileList  list.Model
+	focusArea focusArea
+	keys      keyMap
+	help      help.Model
+	width     int
+	height    int
+	approved  map[string]bool
 }
 
 var (
@@ -84,6 +115,16 @@ var (
 	mutedStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("245"))
 	errorStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("196"))
 	okStyle    = lipgloss.NewStyle().Foreground(lipgloss.Color("42"))
+
+	// focusedPaneStyle outlines the currently focused pane (sidebar or diff)
+	// with a subtle border so the user can tell which side will receive
+	// scrolling input.
+	focusedPaneStyle = lipgloss.NewStyle().
+				Border(lipgloss.NormalBorder(), false, false, false, true).
+				BorderForeground(lipgloss.Color("39"))
+	unfocusedPaneStyle = lipgloss.NewStyle().
+				Border(lipgloss.NormalBorder(), false, false, false, true).
+				BorderForeground(lipgloss.Color("238"))
 )
 
 func newModel() model {
@@ -98,14 +139,23 @@ func newModel() model {
 	// The app draws its own help footer, so suppress the list's built-in one.
 	l.SetShowHelp(false)
 
+	fl := list.New(nil, list.NewDefaultDelegate(), 0, 0)
+	fl.Title = "Files"
+	fl.SetShowStatusBar(false)
+	fl.SetFilteringEnabled(false)
+	fl.SetShowHelp(false)
+	fl.SetShowPagination(false)
+
 	return model{
-		loading:  true,
-		status:   "loading review requests...",
-		list:     l,
-		diff:     vp,
-		keys:     newKeyMap(),
-		help:     help.New(),
-		approved: make(map[string]bool),
+		loading:   true,
+		status:    "loading review requests...",
+		list:      l,
+		diff:      vp,
+		fileList:  fl,
+		focusArea: focusDiff,
+		keys:      newKeyMap(),
+		help:      help.New(),
+		approved:  make(map[string]bool),
 	}
 }
 
@@ -148,10 +198,24 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.screen = screenDiff
 		m.keys.setScreen(screenDiff)
 		m.diffPR = &msg.pr
+		// Parse file boundaries from the raw diff first — line numbers reported
+		// by splitDiffFiles map 1:1 onto highlightDiff's output because the
+		// highlighter never changes the newline layout.
+		m.files = splitDiffFiles(msg.diff)
+		items := make([]list.Item, 0, len(m.files))
+		for _, f := range m.files {
+			items = append(items, fileItem{file: f})
+		}
+		flCmd := m.fileList.SetItems(items)
+		if len(m.files) > 0 {
+			m.fileList.Select(0)
+		}
 		m.diff.SetContent(highlightDiff(msg.diff))
 		m.diff.GotoTop()
+		m.focusArea = focusDiff
+		m.resizeChildren()
 		m.status = "press a to approve, esc to go back"
-		return m, nil
+		return m, flCmd
 	case approveMsg:
 		m.loading = false
 		if msg.err != nil {
@@ -241,6 +305,8 @@ func (m model) handleDiffKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 		m.screen = screenList
 		m.keys.setScreen(screenList)
 		m.diffPR = nil
+		m.files = nil
+		m.focusArea = focusDiff
 		m.status = fmt.Sprintf("%d review request(s)", len(m.list.Items()))
 		return m, nil
 	case key.Matches(msg, m.keys.Approve):
@@ -252,11 +318,65 @@ func (m model) handleDiffKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 		m.status = "approving..."
 		m.err = ""
 		return m, approveCmd(pr)
+	case key.Matches(msg, m.keys.ToggleFocus):
+		if len(m.files) == 0 || !m.sidebarVisible() {
+			// Without a sidebar there's nothing to toggle to.
+			return m, nil
+		}
+		if m.focusArea == focusDiff {
+			m.focusArea = focusFiles
+		} else {
+			m.focusArea = focusDiff
+		}
+		return m, nil
+	case key.Matches(msg, m.keys.NextFile):
+		m.jumpToFile(+1)
+		return m, nil
+	case key.Matches(msg, m.keys.PrevFile):
+		m.jumpToFile(-1)
+		return m, nil
+	}
+
+	if m.focusArea == focusFiles {
+		prev := m.fileList.Index()
+		var cmd tea.Cmd
+		m.fileList, cmd = m.fileList.Update(msg)
+		if idx := m.fileList.Index(); idx != prev && idx >= 0 && idx < len(m.files) {
+			m.diff.SetYOffset(m.files[idx].StartLine)
+		}
+		return m, cmd
 	}
 
 	var cmd tea.Cmd
 	m.diff, cmd = m.diff.Update(msg)
 	return m, cmd
+}
+
+// jumpToFile scrolls the diff viewport to the next (delta=+1) or previous
+// (delta=-1) file boundary, syncing the sidebar selection along the way.
+func (m *model) jumpToFile(delta int) {
+	if len(m.files) == 0 {
+		return
+	}
+	// Find the file whose StartLine matches or contains the current YOffset.
+	cur := m.diff.YOffset()
+	idx := 0
+	for i, f := range m.files {
+		if f.StartLine <= cur {
+			idx = i
+		} else {
+			break
+		}
+	}
+	next := idx + delta
+	if next < 0 {
+		next = 0
+	}
+	if next >= len(m.files) {
+		next = len(m.files) - 1
+	}
+	m.diff.SetYOffset(m.files[next].StartLine)
+	m.fileList.Select(next)
 }
 
 // selectedPR returns the pullRequest currently highlighted in the list, if any.
@@ -317,7 +437,28 @@ func (m model) renderDiff() string {
 		return mutedStyle.Render("No PR selected.")
 	}
 	header := fmt.Sprintf("%s  #%d  %s", m.diffPR.Repository, m.diffPR.Number, m.diffPR.Title)
-	return titleStyle.Render(header) + "\n" + m.diff.View()
+
+	if !m.sidebarVisible() || len(m.files) == 0 {
+		return titleStyle.Render(header) + "\n" + m.diff.View()
+	}
+
+	sidebarBox := unfocusedPaneStyle
+	diffBox := focusedPaneStyle
+	if m.focusArea == focusFiles {
+		sidebarBox = focusedPaneStyle
+		diffBox = unfocusedPaneStyle
+	}
+
+	sidebar := sidebarBox.Render(m.fileList.View())
+	body := diffBox.Render(m.diff.View())
+	joined := lipgloss.JoinHorizontal(lipgloss.Top, sidebar, body)
+	return titleStyle.Render(header) + "\n" + joined
+}
+
+// sidebarVisible reports whether the terminal has enough room to render the
+// file sidebar without crowding out the diff body.
+func (m model) sidebarVisible() bool {
+	return m.width > sidebarMinTerm
 }
 
 func (m model) renderFooter() string {
@@ -326,14 +467,33 @@ func (m model) renderFooter() string {
 
 func (m *model) resizeChildren() {
 	if m.width > 0 {
-		m.diff.SetWidth(m.width)
 		m.help.SetWidth(m.width)
+		// The sidebar consumes a fixed slice of horizontal space when visible;
+		// account for its border (one column) and the inter-pane gap so the
+		// diff body doesn't overflow into wrapped lines.
+		diffWidth := m.width
+		if m.sidebarVisible() {
+			// sidebar = sidebarWidth content + 1 col left border
+			// body left border = 1 col
+			diffWidth = m.width - sidebarWidth - 2 - sidebarGap
+			if diffWidth < 1 {
+				diffWidth = 1
+			}
+		}
+		m.diff.SetWidth(diffWidth)
 	}
 	if m.height > reservedRows {
-		m.diff.SetHeight(m.height - reservedRows)
-		m.list.SetSize(m.width, m.height-reservedRows)
+		body := m.height - reservedRows
+		m.diff.SetHeight(body)
+		m.list.SetSize(m.width, body)
+		if m.sidebarVisible() {
+			m.fileList.SetSize(sidebarWidth, body)
+		} else {
+			m.fileList.SetSize(0, 0)
+		}
 	} else if m.width > 0 {
 		m.list.SetSize(m.width, 0)
+		m.fileList.SetSize(0, 0)
 	}
 }
 

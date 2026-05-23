@@ -18,6 +18,9 @@ type keyMap struct {
 	Approve        key.Binding
 	Refresh        key.Binding
 	Back           key.Binding
+	NextFile       key.Binding
+	PrevFile       key.Binding
+	ToggleFocus    key.Binding
 	Help           key.Binding
 	Quit           key.Binding
 
@@ -54,6 +57,18 @@ func newKeyMap() keyMap {
 			key.WithKeys("esc", "b"),
 			key.WithHelp("esc/b", "back"),
 		),
+		NextFile: key.NewBinding(
+			key.WithKeys("n"),
+			key.WithHelp("n", "next file"),
+		),
+		PrevFile: key.NewBinding(
+			key.WithKeys("p"),
+			key.WithHelp("p", "prev file"),
+		),
+		ToggleFocus: key.NewBinding(
+			key.WithKeys("tab"),
+			key.WithHelp("tab", "toggle focus"),
+		),
 		Help: key.NewBinding(
 			key.WithKeys("?"),
 			key.WithHelp("?", "help"),
@@ -78,11 +93,17 @@ func (k *keyMap) setScreen(s screen) {
 		k.Open.SetEnabled(true)
 		k.Approve.SetEnabled(false)
 		k.Back.SetEnabled(false)
+		k.NextFile.SetEnabled(false)
+		k.PrevFile.SetEnabled(false)
+		k.ToggleFocus.SetEnabled(false)
 	case screenDiff:
 		k.OpenAndApprove.SetEnabled(false)
 		k.Open.SetEnabled(false)
 		k.Approve.SetEnabled(true)
 		k.Back.SetEnabled(true)
+		k.NextFile.SetEnabled(true)
+		k.PrevFile.SetEnabled(true)
+		k.ToggleFocus.SetEnabled(true)
 	}
 }
 
@@ -90,7 +111,7 @@ func (k *keyMap) setScreen(s screen) {
 func (k keyMap) ShortHelp() []key.Binding {
 	switch k.screen {
 	case screenDiff:
-		return []key.Binding{k.Up, k.Down, k.Approve, k.Back, k.Refresh, k.Help, k.Quit}
+		return []key.Binding{k.Up, k.Down, k.NextFile, k.PrevFile, k.ToggleFocus, k.Approve, k.Back, k.Help, k.Quit}
 	default:
 		return []key.Binding{k.Up, k.Down, k.Open, k.OpenAndApprove, k.Refresh, k.Help, k.Quit}
 	}
@@ -102,6 +123,7 @@ func (k keyMap) FullHelp() [][]key.Binding {
 	case screenDiff:
 		return [][]key.Binding{
 			{k.Up, k.Down},
+			{k.NextFile, k.PrevFile, k.ToggleFocus},
 			{k.Approve, k.Back},
 			{k.Refresh, k.Help, k.Quit},
 		}
