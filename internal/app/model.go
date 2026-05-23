@@ -138,6 +138,11 @@ var (
 	detailFrameStyle    = lipgloss.NewStyle().Border(lipgloss.RoundedBorder()).BorderForeground(frameGray).PaddingLeft(1)
 	updateNoticeStyle   = lipgloss.NewStyle().Border(lipgloss.RoundedBorder()).BorderForeground(tokyoNightYellow).Padding(0, 1)
 	markStyle           = lipgloss.NewStyle().Bold(true).Foreground(tokyoNightYellow)
+	diffFileHeaderStyle = lipgloss.NewStyle().Bold(true).Foreground(tokyoNightCyan)
+	diffMetaStyle       = lipgloss.NewStyle().Foreground(tokyoNightMuted)
+	diffHunkStyle       = lipgloss.NewStyle().Foreground(tokyoNightMagenta)
+	diffAddStyle        = lipgloss.NewStyle().Foreground(tokyoNightGreen)
+	diffDelStyle        = lipgloss.NewStyle().Foreground(tokyoNightRed)
 )
 
 const updateCheckInterval = time.Minute
@@ -1125,7 +1130,50 @@ func renderDiffContent(detail pullRequestDetail, diff string) string {
 	b.WriteString("\n\n")
 	b.WriteString(detailRuleStyle.Render(strings.Repeat("-", 80)))
 	b.WriteString("\n\n")
-	b.WriteString(diff)
+	b.WriteString(highlightDiff(diff))
+	return b.String()
+}
+
+// highlightDiff applies tokyonight colors to a unified diff. The input is
+// assumed to come from `gh pr diff` (plain text); pre-styled placeholders
+// like the too-large notice start with an ANSI escape and fall through
+// unchanged.
+func highlightDiff(diff string) string {
+	if diff == "" {
+		return diff
+	}
+	lines := strings.Split(diff, "\n")
+	var b strings.Builder
+	b.Grow(len(diff) + len(lines)*8)
+	for i, line := range lines {
+		switch {
+		case strings.HasPrefix(line, "diff --git"):
+			b.WriteString(diffFileHeaderStyle.Render(line))
+		case strings.HasPrefix(line, "index "),
+			strings.HasPrefix(line, "new file mode"),
+			strings.HasPrefix(line, "deleted file mode"),
+			strings.HasPrefix(line, "old mode"),
+			strings.HasPrefix(line, "new mode"),
+			strings.HasPrefix(line, "rename from "),
+			strings.HasPrefix(line, "rename to "),
+			strings.HasPrefix(line, "similarity index"),
+			strings.HasPrefix(line, "Binary files"),
+			strings.HasPrefix(line, "--- "),
+			strings.HasPrefix(line, "+++ "):
+			b.WriteString(diffMetaStyle.Render(line))
+		case strings.HasPrefix(line, "@@"):
+			b.WriteString(diffHunkStyle.Render(line))
+		case strings.HasPrefix(line, "+"):
+			b.WriteString(diffAddStyle.Render(line))
+		case strings.HasPrefix(line, "-"):
+			b.WriteString(diffDelStyle.Render(line))
+		default:
+			b.WriteString(line)
+		}
+		if i < len(lines)-1 {
+			b.WriteByte('\n')
+		}
+	}
 	return b.String()
 }
 
