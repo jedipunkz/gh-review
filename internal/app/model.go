@@ -11,6 +11,7 @@ import (
 	"sync"
 	"time"
 
+	"charm.land/bubbles/v2/spinner"
 	"charm.land/bubbles/v2/textinput"
 	"charm.land/bubbles/v2/viewport"
 	tea "charm.land/bubbletea/v2"
@@ -96,6 +97,7 @@ type model struct {
 	debounceSeq    int
 	searchInput    textinput.Model
 	searchActive   bool
+	spinner        spinner.Model
 }
 
 const maxListItems = 10
@@ -157,6 +159,8 @@ func newModel() model {
 	ti := textinput.New()
 	ti.Placeholder = "filter repo / title / author"
 	ti.Prompt = ""
+	sp := spinner.New(spinner.WithSpinner(spinner.MiniDot))
+	sp.Style = lipgloss.NewStyle().Foreground(tokyoNightCyan)
 	return model{
 		loading:     true,
 		status:      "loading review requests...",
@@ -167,11 +171,12 @@ func newModel() model {
 		inflight:    newInflightLoader(),
 		prefetcher:  newPrefetcher(cache),
 		searchInput: ti,
+		spinner:     sp,
 	}
 }
 
 func (m model) Init() tea.Cmd {
-	return tea.Batch(loadPRsCmd(), updateCheckTickCmd())
+	return tea.Batch(loadPRsCmd(), updateCheckTickCmd(), m.spinner.Tick)
 }
 
 func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
@@ -186,6 +191,10 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m.handleSearchKey(msg)
 		}
 		return m.handleKey(msg)
+	case spinner.TickMsg:
+		var cmd tea.Cmd
+		m.spinner, cmd = m.spinner.Update(msg)
+		return m, cmd
 	case updateCheckTickMsg:
 		cmds := []tea.Cmd{updateCheckTickCmd()}
 		if !m.loading && m.updateNotice == nil && m.prListLoaded {
@@ -745,7 +754,7 @@ func (m model) renderHeader() string {
 		parts = append(parts, mutedStyle.Render(m.status))
 	}
 	if m.loading || m.detailLoading {
-		parts = append(parts, mutedStyle.Render("working..."))
+		parts = append(parts, m.spinner.View()+" "+mutedStyle.Render("working..."))
 	}
 	return strings.Join(parts, "  ")
 }
@@ -959,7 +968,7 @@ func (m model) renderDetailSection() string {
 	var content string
 	switch {
 	case m.detailLoading:
-		content = mutedStyle.Render("loading detail...")
+		content = m.spinner.View() + " " + mutedStyle.Render("loading detail...")
 	case m.detailErr != "":
 		content = errorStyle.Render(m.detailErr)
 	case m.currentDetail == nil:
