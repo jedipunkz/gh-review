@@ -1,6 +1,8 @@
 package app
 
 import (
+	"context"
+	"errors"
 	"strconv"
 	"strings"
 	"testing"
@@ -592,4 +594,133 @@ func prURL(i int) string {
 
 func itoa(i int) string {
 	return strconv.Itoa(i)
+}
+
+func TestInflightLoaderBeginCancelsPrevious(t *testing.T) {
+	l := newInflightLoader()
+	firstCtx, firstDone := l.begin(time.Minute)
+	defer firstDone()
+	if firstCtx.Err() != nil {
+		t.Fatalf("first ctx canceled prematurely: %v", firstCtx.Err())
+	}
+
+	secondCtx, secondDone := l.begin(time.Minute)
+	defer secondDone()
+
+	if !errors.Is(firstCtx.Err(), context.Canceled) {
+		t.Fatalf("first ctx should be canceled after second begin, got %v", firstCtx.Err())
+	}
+	if secondCtx.Err() != nil {
+		t.Fatalf("second ctx should be live, got %v", secondCtx.Err())
+	}
+}
+
+func TestInflightLoaderCancelStopsCurrent(t *testing.T) {
+	l := newInflightLoader()
+	ctx, done := l.begin(time.Minute)
+	defer done()
+
+	l.cancel()
+	if !errors.Is(ctx.Err(), context.Canceled) {
+		t.Fatalf("ctx should be canceled, got %v", ctx.Err())
+	}
+}
+
+func TestInflightLoaderDoneFromOlderGenerationDoesNotWipeNewer(t *testing.T) {
+	l := newInflightLoader()
+	_, firstDone := l.begin(time.Minute)
+	_, secondDone := l.begin(time.Minute)
+	defer secondDone()
+
+	// Older generation finishes after the newer one took over. It must not
+	// clear the newer generation's stored cancel func.
+	firstDone()
+
+	l.mu.Lock()
+	if l.cancelFn == nil {
+		l.mu.Unlock()
+		t.Fatal("newer generation cancel was wiped by older done()")
+	}
+	l.mu.Unlock()
+}
+
+func TestDiffMsgWithContextCanceledIsIgnored(t *testing.T) {
+	m := newModel()
+	m.loading = false
+	m.detailLoading = true
+	m.detailErr = ""
+	m.loadingForURL = "https://example.test/pr/1"
+	m.prs = []pullRequest{{URL: "https://example.test/pr/1"}}
+
+	updated, _ := m.Update(diffMsg{pr: m.prs[0], err: context.Canceled})
+	got := updated.(model)
+	if got.detailErr != "" {
+		t.Fatalf("canceled diff should not set detailErr, got %q", got.detailErr)
+	}
+	if !got.detailLoading {
+		t.Fatal("canceled diff should leave detailLoading=true for the newer load to finish")
+	}
+}
+
+func TestDebounceFireMsgWithStaleSeqIsIgnored(t *testing.T) {
+	m := newModel()
+	m.loading = false
+	m.prs = []pullRequest{{URL: "https://example.test/pr/1"}}
+	m.loadingForURL = "https://example.test/pr/1"
+	m.debounceSeq = 5
+
+	_, cmd := m.Update(debounceFireMsg{seq: 4, url: m.prs[0].URL})
+	if cmd != nil {
+		t.Fatal("stale debounce seq should not fire load command")
+	}
+}
+
+func TestTriggerDetailLoadCacheHitIsImmediate(t *testing.T) {
+	m := newModel()
+	pr := pullRequest{
+		URL:       "https://example.test/pr/1",
+		UpdatedAt: time.Date(2026, 5, 14, 10, 0, 0, 0, time.UTC),
+	}
+	m.prs = []pullRequest{pr}
+	key := cacheKey(pr.URL, pr.UpdatedAt)
+	m.cache.mu.Lock()
+	m.cache.mem[key] = cacheEntry{Detail: pullRequestDetail{pullRequest: pr}, Diff: "diff body"}
+	m.cache.mu.Unlock()
+
+	cmd := m.triggerDetailLoad()
+	if cmd == nil {
+		t.Fatal("cache hit should return a command")
+	}
+	msg := cmd()
+	dm, ok := msg.(diffMsg)
+	if !ok {
+		t.Fatalf("cache hit should produce diffMsg, got %T", msg)
+	}
+	if dm.diff != "diff body" {
+		t.Fatalf("diff = %q, want %q", dm.diff, "diff body")
+	}
+}
+
+func TestTriggerDetailLoadCacheMissReturnsDebounceTick(t *testing.T) {
+	m := newModel()
+	pr := pullRequest{
+		URL:       "https://example.test/pr/miss",
+		UpdatedAt: time.Date(2026, 5, 14, 10, 0, 0, 0, time.UTC),
+	}
+	m.prs = []pullRequest{pr}
+
+	startSeq := m.debounceSeq
+	cmd := m.triggerDetailLoad()
+	if cmd == nil {
+		t.Fatal("cache miss should return a debounce command")
+	}
+	if m.debounceSeq != startSeq+1 {
+		t.Fatalf("debounceSeq = %d, want %d", m.debounceSeq, startSeq+1)
+	}
+	// We cannot easily exercise the tick without sleeping; just confirm the
+	// returned closure executes without panicking when invoked.
+	got := cmd()
+	if _, ok := got.(debounceFireMsg); !ok {
+		t.Fatalf("expected debounceFireMsg, got %T", got)
+	}
 }

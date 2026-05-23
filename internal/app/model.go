@@ -2,11 +2,13 @@ package app
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os/exec"
 	"runtime"
 	"sort"
 	"strings"
+	"sync"
 	"time"
 
 	"charm.land/bubbles/v2/viewport"
@@ -58,7 +60,13 @@ type popupDismissMsg struct {
 	id int
 }
 
+type debounceFireMsg struct {
+	seq int
+	url string
+}
+
 const popupDismissDelay = 6 * time.Second
+const detailLoadDebounce = 80 * time.Millisecond
 
 type model struct {
 	loading        bool
@@ -82,6 +90,8 @@ type model struct {
 	markedPRs      map[string]bool
 	popupSeq       int
 	cache          *detailCache
+	inflight       *inflightLoader
+	debounceSeq    int
 }
 
 const maxListItems = 10
@@ -141,6 +151,7 @@ func newModel() model {
 		approved:  make(map[string]bool),
 		markedPRs: make(map[string]bool),
 		cache:     newDetailCache(),
+		inflight:  newInflightLoader(),
 	}
 }
 
@@ -230,6 +241,11 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if msg.pr.URL != m.loadingForURL {
 			return m, nil
 		}
+		// A canceled load belongs to a previous cursor position; drop it
+		// silently so the user does not see a spurious error.
+		if errors.Is(msg.err, context.Canceled) {
+			return m, nil
+		}
 		m.detailLoading = false
 		if msg.err != nil {
 			m.detailErr = msg.err.Error()
@@ -241,6 +257,18 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.detailVP.SetContent(renderDiffContent(msg.detail, msg.diff))
 		m.detailVP.GotoTop()
 		return m, nil
+	case debounceFireMsg:
+		if msg.seq != m.debounceSeq {
+			return m, nil
+		}
+		if len(m.prs) == 0 || m.cursor >= len(m.prs) {
+			return m, nil
+		}
+		pr := m.prs[m.cursor]
+		if pr.URL != msg.url || pr.URL != m.loadingForURL {
+			return m, nil
+		}
+		return m, loadDiffCmd(pr, m.cache, m.inflight)
 	case approveMsg:
 		m.loading = false
 		if msg.err != nil {
@@ -467,18 +495,33 @@ func (m *model) triggerDetailLoad() tea.Cmd {
 	cache := m.cache
 	key := cacheKey(pr.URL, pr.UpdatedAt)
 	if entry, ok := cache.getMem(key); ok {
+		// Cache hit: cancel any in-flight network load, bump debounce seq so
+		// any pending tick is ignored, and render immediately.
+		m.inflight.cancel()
+		m.debounceSeq++
 		return func() tea.Msg {
 			return diffMsg{pr: pr, detail: entry.Detail, diff: entry.Diff}
 		}
 	}
 	if entry, ok := cache.getDisk(key); ok {
+		m.inflight.cancel()
+		m.debounceSeq++
 		immediate := func() tea.Msg {
 			return diffMsg{pr: pr, detail: entry.Detail, diff: entry.Diff}
 		}
-		// Schedule a background refresh so any new commits/comments land in cache.
-		return tea.Batch(immediate, loadDiffCmd(pr, cache))
+		// Schedule a background refresh so any new commits/comments land in
+		// cache. Run it through the inflight loader so a later cursor move
+		// cancels the lingering gh subprocess.
+		return tea.Batch(immediate, loadDiffCmd(pr, cache, m.inflight))
 	}
-	return loadDiffCmd(pr, cache)
+	// Cache miss: debounce so rapid cursor movement does not spawn a flurry
+	// of gh subprocesses.
+	m.debounceSeq++
+	seq := m.debounceSeq
+	url := pr.URL
+	return tea.Tick(detailLoadDebounce, func(time.Time) tea.Msg {
+		return debounceFireMsg{seq: seq, url: url}
+	})
 }
 
 func (m model) View() tea.View {
@@ -795,10 +838,63 @@ func checkForUpdatesCmd(previousSignature string, previousCount int) tea.Cmd {
 	}
 }
 
-func loadDiffCmd(pr pullRequest, cache *detailCache) tea.Cmd {
+// inflightLoader tracks the currently running detail load so that a newer
+// cursor move can cancel its gh subprocesses before issuing a new one.
+// Each begin() bumps gen; done() only clears the stored cancel when its
+// generation still matches, so a newer load's cancel is never wiped by an
+// older completion.
+type inflightLoader struct {
+	mu       sync.Mutex
+	cancelFn context.CancelFunc
+	gen      uint64
+}
+
+func newInflightLoader() *inflightLoader { return &inflightLoader{} }
+
+// begin cancels any previous load, then registers a new context. The returned
+// done callback releases resources and clears the stored cancel func when
+// this generation is still the most recent one.
+func (l *inflightLoader) begin(timeout time.Duration) (context.Context, func()) {
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	if l == nil {
+		return ctx, cancel
+	}
+	l.mu.Lock()
+	if l.cancelFn != nil {
+		l.cancelFn()
+	}
+	l.gen++
+	myGen := l.gen
+	l.cancelFn = cancel
+	l.mu.Unlock()
+	done := func() {
+		l.mu.Lock()
+		if l.gen == myGen {
+			l.cancelFn = nil
+		}
+		l.mu.Unlock()
+		cancel()
+	}
+	return ctx, done
+}
+
+// cancel any in-flight load. Safe to call when nothing is running.
+func (l *inflightLoader) cancel() {
+	if l == nil {
+		return
+	}
+	l.mu.Lock()
+	if l.cancelFn != nil {
+		l.cancelFn()
+		l.cancelFn = nil
+	}
+	l.mu.Unlock()
+}
+
+func loadDiffCmd(pr pullRequest, cache *detailCache, inflight *inflightLoader) tea.Cmd {
 	return func() tea.Msg {
-		ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
-		defer cancel()
+		ctx, done := inflight.begin(60 * time.Second)
+		defer done()
 
 		var (
 			detail  pullRequestDetail
@@ -830,9 +926,15 @@ func loadDiffCmd(pr pullRequest, cache *detailCache) tea.Cmd {
 		if err := g.Wait(); err != nil {
 			// If only the diff failed (non-too_large), surface that error; detail
 			// errors are surfaced via g.Wait()'s first-error semantics too.
+			if ctx.Err() != nil {
+				return diffMsg{pr: pr, err: context.Canceled}
+			}
 			return diffMsg{pr: pr, err: err}
 		}
 		if diffErr != nil {
+			if ctx.Err() != nil {
+				return diffMsg{pr: pr, err: context.Canceled}
+			}
 			return diffMsg{pr: pr, err: diffErr}
 		}
 		// Use the fetched UpdatedAt so the cache key matches what the next
