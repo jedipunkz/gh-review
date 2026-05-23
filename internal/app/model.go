@@ -80,6 +80,7 @@ type model struct {
 	updateNotice   *updateNotice
 	markedPRs      map[string]bool
 	popupSeq       int
+	cache          *detailCache
 }
 
 const maxListItems = 10
@@ -138,6 +139,7 @@ func newModel() model {
 		detailVP:  vp,
 		approved:  make(map[string]bool),
 		markedPRs: make(map[string]bool),
+		cache:     newDetailCache(),
 	}
 }
 
@@ -460,7 +462,22 @@ func (m *model) triggerDetailLoad() tea.Cmd {
 	m.detailLoading = true
 	m.detailErr = ""
 	m.detailVP.GotoTop()
-	return loadDiffCmd(pr)
+
+	cache := m.cache
+	key := cacheKey(pr.URL, pr.UpdatedAt)
+	if entry, ok := cache.getMem(key); ok {
+		return func() tea.Msg {
+			return diffMsg{pr: pr, detail: entry.Detail, diff: entry.Diff}
+		}
+	}
+	if entry, ok := cache.getDisk(key); ok {
+		immediate := func() tea.Msg {
+			return diffMsg{pr: pr, detail: entry.Detail, diff: entry.Diff}
+		}
+		// Schedule a background refresh so any new commits/comments land in cache.
+		return tea.Batch(immediate, loadDiffCmd(pr, cache))
+	}
+	return loadDiffCmd(pr, cache)
 }
 
 func (m model) View() tea.View {
@@ -777,7 +794,7 @@ func checkForUpdatesCmd(previousSignature string, previousCount int) tea.Cmd {
 	}
 }
 
-func loadDiffCmd(pr pullRequest) tea.Cmd {
+func loadDiffCmd(pr pullRequest, cache *detailCache) tea.Cmd {
 	return func() tea.Msg {
 		ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 		defer cancel()
@@ -789,6 +806,12 @@ func loadDiffCmd(pr pullRequest) tea.Cmd {
 		if isPRDiffTooLargeError(err) {
 			diff = mutedStyle.Render("Diff omitted because GitHub reports this PR diff is too large to display.")
 			err = nil
+		}
+		if err == nil {
+			// Use the fetched UpdatedAt so the cache key matches what the next
+			// list refresh will produce for this PR.
+			key := cacheKey(pr.URL, detail.UpdatedAt)
+			cache.put(key, cacheEntry{Detail: detail, Diff: diff})
 		}
 		return diffMsg{pr: pr, detail: detail, diff: diff, err: err}
 	}
