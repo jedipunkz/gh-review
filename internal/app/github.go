@@ -37,6 +37,12 @@ type pullRequestDetail struct {
 	Deletions        int
 	ChangedFiles     int
 	Labels           []string
+	Reviewers        []reviewSummary
+}
+
+type reviewSummary struct {
+	Author string
+	State  string
 }
 
 type team struct {
@@ -88,6 +94,12 @@ type prViewResponse struct {
 	Labels []struct {
 		Name string `json:"name"`
 	} `json:"labels"`
+	LatestReviews []struct {
+		State  string `json:"state"`
+		Author struct {
+			Login string `json:"login"`
+		} `json:"author"`
+	} `json:"latestReviews"`
 }
 
 const searchPRsGraphQLQuery = `
@@ -285,7 +297,7 @@ func parseSearchPRsResponse(out []byte, label string) (searchPRsPage, error) {
 }
 
 func loadPRDetail(ctx context.Context, pr pullRequest) (pullRequestDetail, error) {
-	out, err := runGH(ctx, "pr", "view", pr.URL, "--json", "number,title,url,body,createdAt,updatedAt,baseRefName,headRefName,reviewDecision,mergeStateStatus,additions,deletions,changedFiles,author,labels")
+	out, err := runGH(ctx, "pr", "view", pr.URL, "--json", "number,title,url,body,createdAt,updatedAt,baseRefName,headRefName,reviewDecision,mergeStateStatus,additions,deletions,changedFiles,author,labels,latestReviews")
 	if err != nil {
 		return pullRequestDetail{}, err
 	}
@@ -326,6 +338,15 @@ func loadPRDetail(ctx context.Context, pr pullRequest) (pullRequestDetail, error
 		if label.Name != "" {
 			detail.Labels = append(detail.Labels, label.Name)
 		}
+	}
+	for _, review := range res.LatestReviews {
+		if review.Author.Login == "" || review.State == "" || review.State == "PENDING" {
+			continue
+		}
+		detail.Reviewers = append(detail.Reviewers, reviewSummary{
+			Author: review.Author.Login,
+			State:  review.State,
+		})
 	}
 	return detail, nil
 }
