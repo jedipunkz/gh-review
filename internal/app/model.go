@@ -91,6 +91,7 @@ type model struct {
 	popupSeq       int
 	cache          *detailCache
 	inflight       *inflightLoader
+	prefetcher     *prefetcher
 	debounceSeq    int
 }
 
@@ -144,14 +145,16 @@ const updateCheckInterval = time.Minute
 func newModel() model {
 	vp := viewport.New()
 	vp.SoftWrap = true
+	cache := newDetailCache()
 	return model{
-		loading:   true,
-		status:    "loading review requests...",
-		detailVP:  vp,
-		approved:  make(map[string]bool),
-		markedPRs: make(map[string]bool),
-		cache:     newDetailCache(),
-		inflight:  newInflightLoader(),
+		loading:    true,
+		status:     "loading review requests...",
+		detailVP:   vp,
+		approved:   make(map[string]bool),
+		markedPRs:  make(map[string]bool),
+		cache:      cache,
+		inflight:   newInflightLoader(),
+		prefetcher: newPrefetcher(cache),
 	}
 }
 
@@ -233,8 +236,11 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.status = fmt.Sprintf("%d review request(s)", len(m.prs))
 		m.resizeViewport()
 		if len(m.prs) > 0 {
-			cmd := m.triggerDetailLoad()
-			return m, cmd
+			cmds := []tea.Cmd{m.triggerDetailLoad()}
+			if pre := m.prefetchTopCmd(); pre != nil {
+				cmds = append(cmds, pre)
+			}
+			return m, tea.Batch(cmds...)
 		}
 		return m, nil
 	case diffMsg:
@@ -318,15 +324,13 @@ func (m model) handleKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 		if !m.loading && m.cursor < len(m.prs)-1 {
 			m.cursor++
 			m.ensureCursorVisible()
-			cmd := m.triggerDetailLoad()
-			return m, cmd
+			return m, m.detailAndPrefetchCmds()
 		}
 	case "ctrl+p":
 		if !m.loading && m.cursor > 0 {
 			m.cursor--
 			m.ensureCursorVisible()
-			cmd := m.triggerDetailLoad()
-			return m, cmd
+			return m, m.detailAndPrefetchCmds()
 		}
 	case "j":
 		m.detailVP.ScrollDown(1)
@@ -479,6 +483,36 @@ func dismissPopupCmd(id int) tea.Cmd {
 	return tea.Tick(popupDismissDelay, func(time.Time) tea.Msg {
 		return popupDismissMsg{id: id}
 	})
+}
+
+// prefetchTopCmd warms the cache with the first prefetchTopN PRs, skipping
+// the one currently under the cursor (it is already being loaded in the
+// foreground).
+func (m *model) prefetchTopCmd() tea.Cmd {
+	if m.prefetcher == nil || len(m.prs) == 0 {
+		return nil
+	}
+	candidates := topN(m.prs, prefetchTopN)
+	filtered := make([]pullRequest, 0, len(candidates))
+	for i, pr := range candidates {
+		if i == m.cursor {
+			continue
+		}
+		filtered = append(filtered, pr)
+	}
+	return m.prefetcher.prefetchCmd(filtered)
+}
+
+// detailAndPrefetchCmds combines the foreground detail load with a background
+// prefetch of the cursor's neighbors.
+func (m *model) detailAndPrefetchCmds() tea.Cmd {
+	cmds := []tea.Cmd{m.triggerDetailLoad()}
+	if m.prefetcher != nil {
+		if pre := m.prefetcher.prefetchCmd(neighborPRs(m.prs, m.cursor)); pre != nil {
+			cmds = append(cmds, pre)
+		}
+	}
+	return tea.Batch(cmds...)
 }
 
 func (m *model) triggerDetailLoad() tea.Cmd {
