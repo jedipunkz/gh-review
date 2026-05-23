@@ -148,7 +148,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.screen = screenDiff
 		m.keys.setScreen(screenDiff)
 		m.diffPR = &msg.pr
-		m.diff.SetContent(msg.diff)
+		m.diff.SetContent(highlightDiff(msg.diff))
 		m.diff.GotoTop()
 		m.status = "press a to approve, esc to go back"
 		return m, nil
