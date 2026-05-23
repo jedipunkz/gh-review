@@ -136,10 +136,9 @@ var (
 	detailMetaKeyStyle  = lipgloss.NewStyle().Foreground(tokyoNightYellow)
 	detailMetaTextStyle = lipgloss.NewStyle().Foreground(tokyoNightFG)
 	detailRuleStyle     = lipgloss.NewStyle().Foreground(tokyoNightMuted)
-	framePink           = lipgloss.Color("#f7768e")
-	frameGray           = lipgloss.Color("#a9b1d6")
-	meFrameStyle        = lipgloss.NewStyle().Border(lipgloss.RoundedBorder()).BorderForeground(framePink)
-	teamFrameStyle      = lipgloss.NewStyle().Border(lipgloss.RoundedBorder()).BorderForeground(framePink)
+	frameGray           = lipgloss.Color("#414868")
+	meFrameStyle        = lipgloss.NewStyle().Border(lipgloss.RoundedBorder()).BorderForeground(frameGray)
+	teamFrameStyle      = lipgloss.NewStyle().Border(lipgloss.RoundedBorder()).BorderForeground(frameGray)
 	detailFrameStyle    = lipgloss.NewStyle().Border(lipgloss.RoundedBorder()).BorderForeground(frameGray).PaddingLeft(1)
 	updateNoticeStyle   = lipgloss.NewStyle().Border(lipgloss.RoundedBorder()).BorderForeground(tokyoNightYellow).Padding(0, 1)
 	markStyle           = lipgloss.NewStyle().Bold(true).Foreground(tokyoNightYellow)
@@ -1259,6 +1258,10 @@ func renderDiffContent(detail pullRequestDetail, diff string) string {
 	b.WriteString(okStyle.Render(fmt.Sprintf("+%d", detail.Additions)))
 	b.WriteString(" ")
 	b.WriteString(errorStyle.Render(fmt.Sprintf("-%d", detail.Deletions)))
+	if len(detail.Reviewers) > 0 {
+		b.WriteByte('\n')
+		b.WriteString(formatReviewersMeta(detail.Reviewers))
+	}
 	if !detail.CreatedAt.IsZero() || !detail.UpdatedAt.IsZero() {
 		b.WriteByte('\n')
 		if !detail.CreatedAt.IsZero() {
@@ -1339,6 +1342,16 @@ func formatMeta(label, value string) string {
 func formatReviewMeta(decision string) string {
 	value := nonEmpty(decision, "none")
 	return detailMetaKeyStyle.Render("Review:") + " " + reviewDecisionStyle(decision).Render(value)
+}
+
+func formatReviewersMeta(reviewers []reviewSummary) string {
+	parts := make([]string, 0, len(reviewers))
+	for _, reviewer := range reviewers {
+		name := "@" + reviewer.Author
+		state := reviewDecisionStyle(reviewer.State).Render(reviewer.State)
+		parts = append(parts, detailMetaTextStyle.Render(name)+" "+state)
+	}
+	return detailMetaKeyStyle.Render("Reviewed by:") + " " + strings.Join(parts, detailMetaTextStyle.Render(", "))
 }
 
 func reviewDecisionStyle(decision string) lipgloss.Style {

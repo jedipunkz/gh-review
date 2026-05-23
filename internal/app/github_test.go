@@ -139,7 +139,7 @@ func TestLoadPRDetailMergesGhResponseWithListPR(t *testing.T) {
 		if len(args) != 5 || args[0] != "pr" || args[1] != "view" || args[2] != base.URL || args[3] != "--json" {
 			t.Fatalf("unexpected args: %#v", args)
 		}
-		if !strings.Contains(args[4], "mergeStateStatus") || !strings.Contains(args[4], "labels") {
+		if !strings.Contains(args[4], "mergeStateStatus") || !strings.Contains(args[4], "labels") || !strings.Contains(args[4], "latestReviews") {
 			t.Fatalf("json fields missing detail fields: %q", args[4])
 		}
 		return []byte(`{
@@ -157,7 +157,13 @@ func TestLoadPRDetailMergesGhResponseWithListPR(t *testing.T) {
 			"deletions": 2,
 			"changedFiles": 3,
 			"author": {"login": "detail-author"},
-			"labels": [{"name": "bug"}, {"name": ""}, {"name": "ui"}]
+			"labels": [{"name": "bug"}, {"name": ""}, {"name": "ui"}],
+			"latestReviews": [
+				{"state": "APPROVED", "author": {"login": "alice"}},
+				{"state": "PENDING", "author": {"login": "pending-reviewer"}},
+				{"state": "CHANGES_REQUESTED", "author": {"login": "bob"}},
+				{"state": "COMMENTED", "author": {"login": ""}}
+			]
 		}`), nil
 	})
 
@@ -179,6 +185,9 @@ func TestLoadPRDetailMergesGhResponseWithListPR(t *testing.T) {
 	}
 	if !reflect.DeepEqual(got.Labels, []string{"bug", "ui"}) {
 		t.Fatalf("labels = %#v, want bug/ui", got.Labels)
+	}
+	if !reflect.DeepEqual(got.Reviewers, []reviewSummary{{Author: "alice", State: "APPROVED"}, {Author: "bob", State: "CHANGES_REQUESTED"}}) {
+		t.Fatalf("reviewers = %#v, want alice/bob", got.Reviewers)
 	}
 	wantUpdatedAt := time.Date(2026, 5, 14, 4, 5, 6, 0, time.UTC)
 	if !got.UpdatedAt.Equal(wantUpdatedAt) {

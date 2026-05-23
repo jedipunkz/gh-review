@@ -53,6 +53,29 @@ func TestFrameSectionsUseSameRenderedWidth(t *testing.T) {
 	}
 }
 
+func TestRenderDiffContentShowsReviewedBy(t *testing.T) {
+	detail := pullRequestDetail{
+		pullRequest: pullRequest{
+			Repository: "owner/repo",
+			Number:     42,
+			Title:      "Add reviewer header",
+			Author:     "octocat",
+			Request:    "@me",
+		},
+		Reviewers: []reviewSummary{
+			{Author: "alice", State: "APPROVED"},
+			{Author: "bob", State: "CHANGES_REQUESTED"},
+		},
+	}
+
+	out := renderDiffContent(detail, "")
+	for _, want := range []string{"Reviewed by:", "@alice", "APPROVED", "@bob", "CHANGES_REQUESTED"} {
+		if !strings.Contains(out, want) {
+			t.Fatalf("rendered detail missing %q: %q", want, out)
+		}
+	}
+}
+
 func TestApproveKeyRequiresConfirmation(t *testing.T) {
 	m := modelWithLoadedDetail()
 
