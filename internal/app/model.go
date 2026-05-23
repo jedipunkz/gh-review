@@ -8,6 +8,7 @@ import (
 
 	"charm.land/bubbles/v2/help"
 	"charm.land/bubbles/v2/key"
+	"charm.land/bubbles/v2/list"
 	"charm.land/bubbles/v2/viewport"
 	tea "charm.land/bubbletea/v2"
 	"charm.land/lipgloss/v2"
@@ -19,6 +20,10 @@ const (
 	screenList screen = iota
 	screenDiff
 )
+
+// reservedRows accounts for the header, padding, and footer that surround the
+// list when computing its available size.
+const reservedRows = 6
 
 type prListMsg struct {
 	prs []pullRequest
@@ -36,13 +41,35 @@ type approveMsg struct {
 	err error
 }
 
+// prItem is the list.Item adapter for pullRequest. It also satisfies
+// list.DefaultItem so the default delegate can render it.
+type prItem struct {
+	pr       pullRequest
+	approved bool
+}
+
+func (p prItem) Title() string {
+	title := fmt.Sprintf("%s #%d  %s", p.pr.Repository, p.pr.Number, p.pr.Title)
+	if p.approved {
+		title += "  " + okStyle.Render("✓ approved")
+	}
+	return title
+}
+
+func (p prItem) Description() string {
+	return fmt.Sprintf("@%s • %s", p.pr.Author, p.pr.Request)
+}
+
+func (p prItem) FilterValue() string {
+	return p.pr.Title + " " + p.pr.Repository + " " + p.pr.Author
+}
+
 type model struct {
 	screen   screen
 	loading  bool
 	status   string
 	err      string
-	prs      []pullRequest
-	cursor   int
+	list     list.Model
 	diffPR   *pullRequest
 	diff     viewport.Model
 	keys     keyMap
@@ -53,19 +80,28 @@ type model struct {
 }
 
 var (
-	titleStyle    = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("39"))
-	selectedStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("230")).Background(lipgloss.Color("62"))
-	mutedStyle    = lipgloss.NewStyle().Foreground(lipgloss.Color("245"))
-	errorStyle    = lipgloss.NewStyle().Foreground(lipgloss.Color("196"))
-	okStyle       = lipgloss.NewStyle().Foreground(lipgloss.Color("42"))
+	titleStyle = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("39"))
+	mutedStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("245"))
+	errorStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("196"))
+	okStyle    = lipgloss.NewStyle().Foreground(lipgloss.Color("42"))
 )
 
 func newModel() model {
 	vp := viewport.New()
 	vp.SoftWrap = false
+
+	l := list.New(nil, list.NewDefaultDelegate(), 0, 0)
+	l.Title = "Review requests"
+	l.SetShowStatusBar(true)
+	l.SetFilteringEnabled(true)
+	l.SetStatusBarItemName("review request", "review requests")
+	// The app draws its own help footer, so suppress the list's built-in one.
+	l.SetShowHelp(false)
+
 	return model{
 		loading:  true,
 		status:   "loading review requests...",
+		list:     l,
 		diff:     vp,
 		keys:     newKeyMap(),
 		help:     help.New(),
@@ -82,7 +118,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case tea.WindowSizeMsg:
 		m.width = msg.Width
 		m.height = msg.Height
-		m.resizeViewport()
+		m.resizeChildren()
 		return m, nil
 	case tea.KeyPressMsg:
 		return m.handleKey(msg)
@@ -94,12 +130,13 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m, nil
 		}
 		m.err = ""
-		m.prs = msg.prs
-		if m.cursor >= len(m.prs) {
-			m.cursor = max(0, len(m.prs)-1)
+		items := make([]list.Item, 0, len(msg.prs))
+		for _, pr := range msg.prs {
+			items = append(items, prItem{pr: pr, approved: m.approved[pr.URL]})
 		}
-		m.status = fmt.Sprintf("%d review request(s)", len(m.prs))
-		return m, nil
+		cmd := m.list.SetItems(items)
+		m.status = fmt.Sprintf("%d review request(s)", len(msg.prs))
+		return m, cmd
 	case diffMsg:
 		m.loading = false
 		if msg.err != nil {
@@ -135,10 +172,22 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.diff, cmd = m.diff.Update(msg)
 		return m, cmd
 	}
-	return m, nil
+
+	// Forward any other messages (timers, filter spinner, etc.) to the list.
+	var cmd tea.Cmd
+	m.list, cmd = m.list.Update(msg)
+	return m, cmd
 }
 
 func (m model) handleKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
+	// While the list is filtering, let it consume keystrokes so the user can
+	// type into the filter input without our shortcuts hijacking letters.
+	if m.screen == screenList && m.list.FilterState() == list.Filtering {
+		var cmd tea.Cmd
+		m.list, cmd = m.list.Update(msg)
+		return m, cmd
+	}
+
 	switch {
 	case key.Matches(msg, m.keys.Quit):
 		return m, tea.Quit
@@ -169,25 +218,21 @@ func (m model) handleListKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 	if m.loading {
 		return m, nil
 	}
-	switch {
-	case key.Matches(msg, m.keys.Down):
-		if m.cursor < len(m.prs)-1 {
-			m.cursor++
-		}
-	case key.Matches(msg, m.keys.Up):
-		if m.cursor > 0 {
-			m.cursor--
-		}
-	case key.Matches(msg, m.keys.Open, m.keys.OpenAndApprove):
-		if len(m.prs) == 0 {
+	if key.Matches(msg, m.keys.Open, m.keys.OpenAndApprove) {
+		pr, ok := m.selectedPR()
+		if !ok {
 			return m, nil
 		}
 		m.loading = true
 		m.status = "loading diff..."
 		m.err = ""
-		return m, loadDiffCmd(m.prs[m.cursor])
+		return m, loadDiffCmd(pr)
 	}
-	return m, nil
+
+	// Defer movement, filtering, and pagination to the list component.
+	var cmd tea.Cmd
+	m.list, cmd = m.list.Update(msg)
+	return m, cmd
 }
 
 func (m model) handleDiffKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
@@ -196,7 +241,7 @@ func (m model) handleDiffKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 		m.screen = screenList
 		m.keys.setScreen(screenList)
 		m.diffPR = nil
-		m.status = fmt.Sprintf("%d review request(s)", len(m.prs))
+		m.status = fmt.Sprintf("%d review request(s)", len(m.list.Items()))
 		return m, nil
 	case key.Matches(msg, m.keys.Approve):
 		if m.diffPR == nil || m.loading {
@@ -212,6 +257,19 @@ func (m model) handleDiffKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 	var cmd tea.Cmd
 	m.diff, cmd = m.diff.Update(msg)
 	return m, cmd
+}
+
+// selectedPR returns the pullRequest currently highlighted in the list, if any.
+func (m model) selectedPR() (pullRequest, bool) {
+	item := m.list.SelectedItem()
+	if item == nil {
+		return pullRequest{}, false
+	}
+	p, ok := item.(prItem)
+	if !ok {
+		return pullRequest{}, false
+	}
+	return p.pr, true
 }
 
 func (m model) View() tea.View {
@@ -248,33 +306,7 @@ func (m model) renderList() string {
 	if m.err != "" {
 		return errorStyle.Render(m.err)
 	}
-	if len(m.prs) == 0 {
-		return mutedStyle.Render("No open PRs are requesting your review.")
-	}
-
-	var b strings.Builder
-	for i, pr := range m.prs {
-		line := fmt.Sprintf("%s  #%d  %s  %s  %s",
-			truncate(pr.Repository, 28),
-			pr.Number,
-			truncate(pr.Title, max(20, m.width-70)),
-			mutedStyle.Render("@"+pr.Author),
-			mutedStyle.Render(pr.Request),
-		)
-		if m.approved[pr.URL] {
-			line += " " + okStyle.Render("approved")
-		}
-		if i == m.cursor {
-			line = selectedStyle.Render(" " + line + " ")
-		} else {
-			line = " " + line
-		}
-		b.WriteString(line)
-		if i < len(m.prs)-1 {
-			b.WriteByte('\n')
-		}
-	}
-	return b.String()
+	return m.list.View()
 }
 
 func (m model) renderDiff() string {
@@ -292,13 +324,16 @@ func (m model) renderFooter() string {
 	return m.help.View(m.keys)
 }
 
-func (m *model) resizeViewport() {
+func (m *model) resizeChildren() {
 	if m.width > 0 {
 		m.diff.SetWidth(m.width)
 		m.help.SetWidth(m.width)
 	}
-	if m.height > 6 {
-		m.diff.SetHeight(m.height - 6)
+	if m.height > reservedRows {
+		m.diff.SetHeight(m.height - reservedRows)
+		m.list.SetSize(m.width, m.height-reservedRows)
+	} else if m.width > 0 {
+		m.list.SetSize(m.width, 0)
 	}
 }
 
@@ -331,12 +366,4 @@ func approveCmd(pr pullRequest) tea.Cmd {
 
 func prLabel(pr pullRequest) string {
 	return fmt.Sprintf("%s#%d", pr.Repository, pr.Number)
-}
-
-func truncate(s string, maxWidth int) string {
-	runes := []rune(s)
-	if maxWidth <= 3 || len(runes) <= maxWidth {
-		return s
-	}
-	return string(runes[:maxWidth-3]) + "..."
 }
