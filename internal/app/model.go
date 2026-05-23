@@ -451,25 +451,6 @@ func (m model) handleApproveConfirmation(key string) (tea.Model, tea.Cmd) {
 	}
 }
 
-func (m model) visibleRange() (int, int) {
-	n := len(m.prs)
-	if n == 0 {
-		return 0, 0
-	}
-	if n <= maxListItems {
-		return 0, n
-	}
-	start := m.listOffset
-	if start < 0 {
-		start = 0
-	}
-	maxOffset := n - maxListItems
-	if start > maxOffset {
-		start = maxOffset
-	}
-	return start, start + maxListItems
-}
-
 // matchingIndices returns indices into m.prs that pass the active search
 // filter. With no filter, returns every index in order.
 func (m model) matchingIndices() []int {
@@ -518,13 +499,7 @@ func (m *model) advanceCursor(delta int) bool {
 	if len(matched) == 0 {
 		return false
 	}
-	pos := -1
-	for i, idx := range matched {
-		if idx == m.cursor {
-			pos = i
-			break
-		}
-	}
+	pos := cursorPosition(matched, m.cursor)
 	if pos == -1 {
 		m.cursor = matched[0]
 		return true
@@ -544,13 +519,7 @@ func (m *model) ensureCursorVisible() {
 		m.listOffset = 0
 		return
 	}
-	pos := -1
-	for i, idx := range matched {
-		if idx == m.cursor {
-			pos = i
-			break
-		}
-	}
+	pos := cursorPosition(matched, m.cursor)
 	if pos == -1 {
 		for i, idx := range matched {
 			if idx >= m.cursor {
@@ -580,6 +549,15 @@ func (m *model) ensureCursorVisible() {
 	if m.listOffset < 0 {
 		m.listOffset = 0
 	}
+}
+
+func cursorPosition(indices []int, cursor int) int {
+	for i, idx := range indices {
+		if idx == cursor {
+			return i
+		}
+	}
+	return -1
 }
 
 func (m *model) refreshDetailIfNeeded() tea.Cmd {
@@ -1394,14 +1372,6 @@ func branchLabel(detail pullRequestDetail) string {
 		return detail.HeadRefName
 	}
 	return detail.HeadRefName + " -> " + detail.BaseRefName
-}
-
-func truncate(s string, maxWidth int) string {
-	runes := []rune(s)
-	if maxWidth <= 3 || len(runes) <= maxWidth {
-		return s
-	}
-	return string(runes[:maxWidth-3]) + "..."
 }
 
 func padRight(s string, width int) string {

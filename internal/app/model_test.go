@@ -3,6 +3,7 @@ package app
 import (
 	"context"
 	"errors"
+	"reflect"
 	"strconv"
 	"strings"
 	"testing"
@@ -723,4 +724,77 @@ func TestTriggerDetailLoadCacheMissReturnsDebounceTick(t *testing.T) {
 	if _, ok := got.(debounceFireMsg); !ok {
 		t.Fatalf("expected debounceFireMsg, got %T", got)
 	}
+}
+
+func TestSearchFilterMatchesRepositoryTitleAndAuthor(t *testing.T) {
+	m := modelWithPRsForSearch()
+
+	tests := []struct {
+		name  string
+		query string
+		want  []int
+	}{
+		{name: "repository", query: "api", want: []int{0}},
+		{name: "title", query: "billing", want: []int{1}},
+		{name: "author", query: "CAROL", want: []int{2}},
+		{name: "empty returns all", query: " ", want: []int{0, 1, 2}},
+		{name: "no match", query: "missing", want: []int{}},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			m.searchInput.SetValue(tt.query)
+			got := m.matchingIndices()
+			if !reflect.DeepEqual(got, tt.want) {
+				t.Fatalf("matchingIndices() = %#v, want %#v", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestSearchCursorMovesWithinFilteredMatches(t *testing.T) {
+	m := modelWithPRsForSearch()
+	m.searchInput.SetValue("fix")
+	m.cursor = 0
+
+	if !m.advanceCursor(+1) {
+		t.Fatal("advanceCursor should move to the next filtered match")
+	}
+	if m.cursor != 2 {
+		t.Fatalf("cursor = %d, want 2", m.cursor)
+	}
+	if m.advanceCursor(+1) {
+		t.Fatal("advanceCursor should stop at the last filtered match")
+	}
+	if !m.advanceCursor(-1) {
+		t.Fatal("advanceCursor should move to the previous filtered match")
+	}
+	if m.cursor != 0 {
+		t.Fatalf("cursor = %d, want 0", m.cursor)
+	}
+}
+
+func TestEnsureCursorVisibleSnapsToNearestFilteredMatch(t *testing.T) {
+	m := modelWithPRsForSearch()
+	m.searchInput.SetValue("fix")
+	m.cursor = 1
+
+	m.ensureCursorVisible()
+
+	if m.cursor != 2 {
+		t.Fatalf("cursor = %d, want nearest filtered index 2", m.cursor)
+	}
+	if m.listOffset != 0 {
+		t.Fatalf("listOffset = %d, want 0", m.listOffset)
+	}
+}
+
+func modelWithPRsForSearch() model {
+	m := newModel()
+	m.prs = []pullRequest{
+		{Repository: "owner/api", Number: 1, Title: "Fix API auth", URL: "https://example.test/pr/1", Author: "alice", Request: "@me"},
+		{Repository: "owner/web", Number: 2, Title: "Add billing view", URL: "https://example.test/pr/2", Author: "bob", Request: "@me"},
+		{Repository: "owner/cli", Number: 3, Title: "Fix command output", URL: "https://example.test/pr/3", Author: "carol", Request: "org/team"},
+	}
+	return m
 }

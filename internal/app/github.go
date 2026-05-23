@@ -352,7 +352,9 @@ func approvePR(ctx context.Context, pr pullRequest) error {
 	return err
 }
 
-func runGH(ctx context.Context, args ...string) ([]byte, error) {
+var runGH = runGHCommand
+
+func runGHCommand(ctx context.Context, args ...string) ([]byte, error) {
 	cmd := exec.CommandContext(ctx, "gh", args...)
 	var stderr bytes.Buffer
 	cmd.Stderr = &stderr
