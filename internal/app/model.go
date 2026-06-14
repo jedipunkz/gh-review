@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"image/color"
 	"os/exec"
 	"runtime"
 	"sort"
@@ -16,6 +17,7 @@ import (
 	"charm.land/bubbles/v2/viewport"
 	tea "charm.land/bubbletea/v2"
 	"charm.land/lipgloss/v2"
+	"github.com/charmbracelet/x/ansi"
 	"github.com/mattn/go-runewidth"
 	"golang.org/x/sync/errgroup"
 )
@@ -114,6 +116,20 @@ var (
 	tokyoNightYellow     = lipgloss.Color("#e0af68")
 	tokyoNightSelected   = lipgloss.Color("#3d59a1")
 	tokyoNightSelectedFg = lipgloss.Color("#ffffff")
+	tokyoNightBarBG      = lipgloss.Color("#1f2335")
+	tokyoNightInk        = lipgloss.Color("#1a1b26")
+
+	// Top / bottom bars share a single background so the UI reads as one
+	// framed app rather than loose lines of text.
+	barStyle       = lipgloss.NewStyle().Background(tokyoNightBarBG)
+	badgeStyle     = lipgloss.NewStyle().Bold(true).Foreground(tokyoNightInk).Background(tokyoNightBlue)
+	barStatusStyle = lipgloss.NewStyle().Foreground(tokyoNightFG).Background(tokyoNightBarBG)
+	barMutedStyle  = lipgloss.NewStyle().Foreground(tokyoNightMuted).Background(tokyoNightBarBG)
+	barErrorStyle  = lipgloss.NewStyle().Foreground(tokyoNightRed).Background(tokyoNightBarBG)
+	helpKeyStyle   = lipgloss.NewStyle().Bold(true).Foreground(tokyoNightYellow).Background(tokyoNightBarBG)
+	helpDescStyle  = lipgloss.NewStyle().Foreground(tokyoNightMuted).Background(tokyoNightBarBG)
+	helpSepStyle   = lipgloss.NewStyle().Foreground(frameGray).Background(tokyoNightBarBG)
+	cursorBarStyle = lipgloss.NewStyle().Foreground(tokyoNightCyan).Background(tokyoNightSelected)
 
 	titleStyle          = lipgloss.NewStyle().Bold(true).Foreground(tokyoNightBlue)
 	selectedStyle       = lipgloss.NewStyle().Foreground(tokyoNightFG).Background(tokyoNightSelected)
@@ -122,11 +138,8 @@ var (
 	selectedOKStyle     = lipgloss.NewStyle().Foreground(tokyoNightGreen).Background(tokyoNightSelected)
 	selectedErrorStyle  = lipgloss.NewStyle().Foreground(tokyoNightRed).Background(tokyoNightSelected)
 	mutedStyle          = lipgloss.NewStyle().Foreground(tokyoNightMuted)
-	footerStyle         = lipgloss.NewStyle().Foreground(tokyoNightFG)
 	errorStyle          = lipgloss.NewStyle().Foreground(tokyoNightRed)
 	okStyle             = lipgloss.NewStyle().Foreground(tokyoNightGreen)
-	listMeTitleStyle    = lipgloss.NewStyle().Bold(true).Foreground(tokyoNightCyan)
-	listTeamTitleStyle  = lipgloss.NewStyle().Bold(true).Foreground(tokyoNightOrange)
 	listHeaderStyle     = lipgloss.NewStyle().Foreground(tokyoNightMuted)
 	listRepoStyle       = lipgloss.NewStyle().Foreground(tokyoNightCyan)
 	listNumStyle        = lipgloss.NewStyle().Foreground(tokyoNightBlue)
@@ -779,14 +792,27 @@ func (m model) renderSearchLine() string {
 }
 
 func (m model) renderHeader() string {
-	parts := []string{titleStyle.Render("gh review")}
-	if m.status != "" {
-		parts = append(parts, mutedStyle.Render(m.status))
-	}
+	w := m.frameWidth()
+	badge := badgeStyle.Render(" gh review ")
+	right := m.renderHeaderStatus(max(1, w-lipgloss.Width(badge)-1))
+	gap := max(1, w-lipgloss.Width(badge)-lipgloss.Width(right))
+	return badge + barStyle.Render(strings.Repeat(" ", gap)) + right
+}
+
+// renderHeaderStatus builds the right-aligned status segment of the top bar,
+// truncating the status text so the whole bar stays on a single line.
+func (m model) renderHeaderStatus(maxW int) string {
+	var lead string
 	if m.loading || m.detailLoading {
-		parts = append(parts, m.spinner.View()+" "+mutedStyle.Render("working..."))
+		lead = m.spinner.View() + " "
 	}
-	return strings.Join(parts, "  ")
+	style := barMutedStyle
+	if m.err != "" {
+		style = barErrorStyle
+	}
+	avail := max(1, maxW-lipgloss.Width(lead))
+	txt := runewidth.Truncate(m.status, avail, "…")
+	return barStyle.Render(lead) + style.Render(txt)
 }
 
 func (m model) groupPRs() (me, team []pullRequest) {
@@ -814,13 +840,14 @@ func (m model) renderGroupedList() string {
 
 	boxW := m.frameWidth()
 	me, team := m.groupPRsByIndex()
+	meTotal, teamTotal := m.groupCounts()
 
 	var sections []string
 
 	if len(me) > 0 {
 		contentW := frameContentWidth(meFrameStyle, boxW)
 		var lines []string
-		lines = append(lines, listMeTitleStyle.Render("Me"))
+		lines = append(lines, sectionTab("Me", meTotal, tokyoNightCyan))
 		lines = append(lines, m.renderListHeader(contentW))
 		for _, item := range me {
 			lines = append(lines, m.renderPRLine(item.idx, item.pr, contentW))
@@ -833,7 +860,7 @@ func (m model) renderGroupedList() string {
 	if len(team) > 0 {
 		contentW := frameContentWidth(teamFrameStyle, boxW)
 		var lines []string
-		lines = append(lines, listTeamTitleStyle.Render("Team"))
+		lines = append(lines, sectionTab("Team", teamTotal, tokyoNightOrange))
 		lines = append(lines, m.renderListHeader(contentW))
 		for _, item := range team {
 			lines = append(lines, m.renderPRLine(item.idx, item.pr, contentW))
@@ -844,6 +871,26 @@ func (m model) renderGroupedList() string {
 	}
 
 	return strings.Join(sections, "\n")
+}
+
+// sectionTab renders a group heading as a colored pill followed by a muted
+// count, e.g. " Me  3", matching the tab-style headers common to polished TUIs.
+func sectionTab(label string, count int, accent color.Color) string {
+	pill := lipgloss.NewStyle().Bold(true).Foreground(tokyoNightInk).Background(accent).Padding(0, 1).Render(label)
+	return pill + mutedStyle.Render(fmt.Sprintf("  %d", count))
+}
+
+// groupCounts returns the total number of filtered PRs in the Me and Team
+// groups, independent of list pagination, so the section tabs show real totals.
+func (m model) groupCounts() (me, team int) {
+	for _, i := range m.matchingIndices() {
+		if strings.Contains(m.prs[i].Request, "@me") {
+			me++
+		} else {
+			team++
+		}
+	}
+	return
 }
 
 type indexedPR struct {
@@ -909,7 +956,7 @@ func (m model) renderPRLine(idx int, pr pullRequest, boxW int) string {
 		m.approveStyle(approve, selected).Render(padRight(approve, colApproveW))
 
 	if selected {
-		return sp1 + line + sp1
+		return cursorBarStyle.Render("▌") + line + sp1
 	}
 	return " " + line
 }
@@ -1021,7 +1068,35 @@ func frameContentWidth(style lipgloss.Style, width int) int {
 }
 
 func (m model) renderFooter() string {
-	return footerStyle.Render("ctrl+n/p list  j/k scroll  pgup/pgdn page  / filter  a approve  r refresh  q quit")
+	bindings := [][2]string{
+		{"ctrl+n/p", "list"},
+		{"j/k", "scroll"},
+		{"pgup/dn", "page"},
+		{"/", "filter"},
+		{"y", "copy"},
+		{"a", "approve"},
+		{"r", "refresh"},
+		{"q", "quit"},
+	}
+	sep := helpSepStyle.Render(" · ")
+	parts := make([]string, len(bindings))
+	for i, b := range bindings {
+		parts[i] = helpKeyStyle.Render(b[0]) + " " + helpDescStyle.Render(b[1])
+	}
+	return renderBar(" "+strings.Join(parts, sep), m.frameWidth())
+}
+
+// renderBar pads or truncates content to exactly w columns on a single line,
+// filling any slack with the shared bar background.
+func renderBar(content string, w int) string {
+	cw := lipgloss.Width(content)
+	if cw > w {
+		return ansi.Truncate(content, w, "…")
+	}
+	if cw < w {
+		return content + barStyle.Render(strings.Repeat(" ", w-cw))
+	}
+	return content
 }
 
 func (m *model) resizeViewport() {
@@ -1370,7 +1445,7 @@ func renderDiffContent(detail pullRequestDetail, diff string) string {
 		b.WriteString(body)
 	}
 	b.WriteString("\n\n")
-	b.WriteString(detailRuleStyle.Render(strings.Repeat("-", 80)))
+	b.WriteString(detailRuleStyle.Render(strings.Repeat("─", 80)))
 	b.WriteString("\n\n")
 	b.WriteString(highlightDiff(diff))
 	return b.String()
