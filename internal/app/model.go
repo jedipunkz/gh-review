@@ -217,11 +217,10 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		for _, url := range newURLs {
 			m.markedPRs[url] = true
 		}
+		prevPRs, prevCursor := m.prs, m.cursor
 		m.prs = msg.prs
 		m.prSignature = msg.currentSignature
-		if m.cursor >= len(m.prs) {
-			m.cursor = max(0, len(m.prs)-1)
-		}
+		m.reconcileCursor(prevPRs, prevCursor)
 		m.ensureCursorVisible()
 		m.resizeViewport()
 		m.popupSeq++
@@ -250,14 +249,13 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m, nil
 		}
 		m.err = ""
+		prevPRs, prevCursor := m.prs, m.cursor
 		m.prs = msg.prs
 		m.prSignature = prListSignature(msg.prs)
 		m.prListLoaded = true
 		m.updateNotice = nil
 		m.pruneMarkedPRs()
-		if m.cursor >= len(m.prs) {
-			m.cursor = max(0, len(m.prs)-1)
-		}
+		m.reconcileCursor(prevPRs, prevCursor)
 		m.ensureCursorVisible()
 		m.status = fmt.Sprintf("%d review request(s)", len(m.prs))
 		m.resizeViewport()
@@ -551,6 +549,55 @@ func (m *model) ensureCursorVisible() {
 	if m.listOffset < 0 {
 		m.listOffset = 0
 	}
+}
+
+// reconcileCursor repositions the cursor after the PR list changes so it keeps
+// pointing at the same PR (matched by URL) instead of a fixed numeric index.
+// When the previously selected PR is gone (e.g. just approved), it falls back
+// to the nearest surviving PR after it, then before it, so the user's place in
+// the list is preserved even when an item above the cursor is removed.
+func (m *model) reconcileCursor(prevPRs []pullRequest, prevCursor int) {
+	if len(m.prs) == 0 {
+		m.cursor = 0
+		return
+	}
+	if prevCursor >= 0 && prevCursor < len(prevPRs) {
+		prevURL := prevPRs[prevCursor].URL
+		if idx := indexOfPRURL(m.prs, prevURL); idx >= 0 {
+			m.cursor = idx
+			return
+		}
+		for i := prevCursor + 1; i < len(prevPRs); i++ {
+			if idx := indexOfPRURL(m.prs, prevPRs[i].URL); idx >= 0 {
+				m.cursor = idx
+				return
+			}
+		}
+		for i := prevCursor - 1; i >= 0; i-- {
+			if idx := indexOfPRURL(m.prs, prevPRs[i].URL); idx >= 0 {
+				m.cursor = idx
+				return
+			}
+		}
+	}
+	if m.cursor >= len(m.prs) {
+		m.cursor = len(m.prs) - 1
+	}
+	if m.cursor < 0 {
+		m.cursor = 0
+	}
+}
+
+func indexOfPRURL(prs []pullRequest, url string) int {
+	if url == "" {
+		return -1
+	}
+	for i, pr := range prs {
+		if pr.URL == url {
+			return i
+		}
+	}
+	return -1
 }
 
 func cursorPosition(indices []int, cursor int) int {

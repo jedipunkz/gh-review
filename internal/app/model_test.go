@@ -790,6 +790,50 @@ func TestSearchFilterMatchesRepositoryTitleAndAuthor(t *testing.T) {
 	}
 }
 
+func TestReconcileCursorKeepsSelectionWhenItemAboveRemoved(t *testing.T) {
+	prev := []pullRequest{
+		{URL: "https://example.test/pr/1"},
+		{URL: "https://example.test/pr/2"},
+		{URL: "https://example.test/pr/3"},
+	}
+	m := newModel()
+	m.prs = []pullRequest{prev[0], prev[2]} // pr/2 was removed
+	m.reconcileCursor(prev, 2)              // cursor was on pr/3
+
+	if m.prs[m.cursor].URL != "https://example.test/pr/3" {
+		t.Fatalf("cursor points at %s, want pr/3", m.prs[m.cursor].URL)
+	}
+}
+
+func TestReconcileCursorFallsForwardWhenSelectedRemoved(t *testing.T) {
+	prev := []pullRequest{
+		{URL: "https://example.test/pr/1"},
+		{URL: "https://example.test/pr/2"},
+		{URL: "https://example.test/pr/3"},
+	}
+	m := newModel()
+	m.prs = []pullRequest{prev[0], prev[2]} // pr/2 (selected) was removed
+	m.reconcileCursor(prev, 1)
+
+	if m.prs[m.cursor].URL != "https://example.test/pr/3" {
+		t.Fatalf("cursor points at %s, want next surviving pr/3", m.prs[m.cursor].URL)
+	}
+}
+
+func TestReconcileCursorFallsBackWhenTailRemoved(t *testing.T) {
+	prev := []pullRequest{
+		{URL: "https://example.test/pr/1"},
+		{URL: "https://example.test/pr/2"},
+	}
+	m := newModel()
+	m.prs = []pullRequest{prev[0]} // pr/2 (selected, last) was removed
+	m.reconcileCursor(prev, 1)
+
+	if m.prs[m.cursor].URL != "https://example.test/pr/1" {
+		t.Fatalf("cursor points at %s, want prior surviving pr/1", m.prs[m.cursor].URL)
+	}
+}
+
 func TestSearchCursorMovesWithinFilteredMatches(t *testing.T) {
 	m := modelWithPRsForSearch()
 	m.searchInput.SetValue("fix")
