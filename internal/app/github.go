@@ -9,6 +9,7 @@ import (
 	"os/exec"
 	"sort"
 	"strings"
+	"sync"
 	"time"
 
 	"golang.org/x/sync/errgroup"
@@ -211,7 +212,36 @@ func loadReviewRequests(ctx context.Context) ([]pullRequest, error) {
 	return prs, nil
 }
 
+// teamsCacheTTL bounds how long a team-membership snapshot is reused. Teams
+// change rarely, but loadReviewRequests runs on every poll (once per minute),
+// so re-paginating user/teams each time is pure overhead. The TTL keeps newly
+// joined/left teams visible within a bounded delay.
+const teamsCacheTTL = 10 * time.Minute
+
+var (
+	teamsCacheMu    sync.Mutex
+	teamsCache      []team
+	teamsCacheValid bool
+	teamsCacheAt    time.Time
+)
+
+func resetTeamsCache() {
+	teamsCacheMu.Lock()
+	teamsCache = nil
+	teamsCacheValid = false
+	teamsCacheAt = time.Time{}
+	teamsCacheMu.Unlock()
+}
+
 func loadTeams(ctx context.Context) ([]team, error) {
+	teamsCacheMu.Lock()
+	if teamsCacheValid && time.Since(teamsCacheAt) < teamsCacheTTL {
+		cached := teamsCache
+		teamsCacheMu.Unlock()
+		return cached, nil
+	}
+	teamsCacheMu.Unlock()
+
 	out, err := runGH(ctx, "api", "user/teams", "--paginate", "--jq", `.[] | [.organization.login, .slug] | @tsv`)
 	if err != nil {
 		return nil, err
@@ -232,6 +262,14 @@ func loadTeams(ctx context.Context) ([]team, error) {
 			Slug:         parts[1],
 		})
 	}
+
+	// The cached slice is treated as immutable; callers only range over it.
+	teamsCacheMu.Lock()
+	teamsCache = teams
+	teamsCacheValid = true
+	teamsCacheAt = time.Now()
+	teamsCacheMu.Unlock()
+
 	return teams, nil
 }
 

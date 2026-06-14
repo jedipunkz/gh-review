@@ -124,6 +124,28 @@ func TestLoadTeamsParsesTSVAndSkipsMalformedLines(t *testing.T) {
 	}
 }
 
+func TestLoadTeamsCachesResultAcrossCalls(t *testing.T) {
+	var calls int
+	withRunGH(t, func(ctx context.Context, args ...string) ([]byte, error) {
+		calls++
+		return []byte("owner\tcore\n"), nil
+	})
+
+	want := []team{{Organization: "owner", Slug: "core"}}
+	for i := 0; i < 3; i++ {
+		got, err := loadTeams(context.Background())
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !reflect.DeepEqual(got, want) {
+			t.Fatalf("call %d: teams = %#v, want %#v", i, got, want)
+		}
+	}
+	if calls != 1 {
+		t.Fatalf("runGH calls = %d, want 1 (subsequent loads should hit cache)", calls)
+	}
+}
+
 func TestLoadPRDetailMergesGhResponseWithListPR(t *testing.T) {
 	base := pullRequest{
 		Repository:     "owner/repo",
@@ -199,5 +221,9 @@ func withRunGH(t *testing.T, fn func(context.Context, ...string) ([]byte, error)
 	t.Helper()
 	orig := runGH
 	runGH = fn
-	t.Cleanup(func() { runGH = orig })
+	resetTeamsCache()
+	t.Cleanup(func() {
+		runGH = orig
+		resetTeamsCache()
+	})
 }
