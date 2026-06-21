@@ -68,7 +68,7 @@ func TestRenderDiffContentShowsReviewedBy(t *testing.T) {
 		},
 	}
 
-	out := renderDiffContent(detail, "")
+	out := renderDiffContent(detail, "", 80)
 	for _, want := range []string{"Reviewed by:", "@alice", "APPROVED", "@bob", "CHANGES_REQUESTED"} {
 		if !strings.Contains(out, want) {
 			t.Fatalf("rendered detail missing %q: %q", want, out)
