@@ -340,11 +340,13 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.err = ""
 		m.approved[msg.pr.URL] = true
 		m.status = "approved " + prLabel(msg.pr)
-		// The PR now moves to the Reviewed tab; keep the cursor on a row that
-		// still belongs to the active tab so the highlight stays valid until the
-		// reload lands.
+		// The local approved map already moves this PR to the Reviewed tab, so it
+		// drops out of the Awaiting list on the next render without a full reload
+		// (which takes a few seconds). Reposition the cursor onto a surviving row
+		// and refresh the detail panel for the new selection so the list updates
+		// instantly. New PRs are still picked up by the background update check.
 		m.ensureCursorVisible()
-		return m, loadPRsCmd()
+		return m, m.refreshDetailIfNeeded()
 	case copyURLMsg:
 		if msg.err != nil {
 			m.err = msg.err.Error()
