@@ -17,6 +17,8 @@ import (
 	"charm.land/bubbles/v2/viewport"
 	tea "charm.land/bubbletea/v2"
 	"charm.land/lipgloss/v2"
+	"github.com/charmbracelet/glamour"
+	"github.com/charmbracelet/glamour/styles"
 	"github.com/charmbracelet/x/ansi"
 	"github.com/mattn/go-runewidth"
 	"golang.org/x/sync/errgroup"
@@ -82,6 +84,7 @@ type model struct {
 	cursor         int
 	listOffset     int
 	currentDetail  *pullRequestDetail
+	currentDiff    string
 	detailLoading  bool
 	detailErr      string
 	loadingForURL  string
@@ -200,6 +203,11 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.width = msg.Width
 		m.height = msg.Height
 		m.resizeViewport()
+		// Re-render so the glamour-formatted description re-wraps to the new
+		// viewport width instead of being soft-wrapped by the viewport.
+		if m.currentDetail != nil {
+			m.detailVP.SetContent(renderDiffContent(*m.currentDetail, m.currentDiff, m.detailVP.Width()))
+		}
 		return m, nil
 	case tea.KeyPressMsg:
 		if m.searchActive {
@@ -297,7 +305,8 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.detailErr = ""
 		d := msg.detail
 		m.currentDetail = &d
-		m.detailVP.SetContent(renderDiffContent(msg.detail, msg.diff))
+		m.currentDiff = msg.diff
+		m.detailVP.SetContent(renderDiffContent(msg.detail, msg.diff, m.detailVP.Width()))
 		m.detailVP.GotoTop()
 		return m, nil
 	case debounceFireMsg:
@@ -1396,7 +1405,7 @@ func (m model) renderApproveConfirmationPopup() string {
 	return approvePopupStyle.Render(body)
 }
 
-func renderDiffContent(detail pullRequestDetail, diff string) string {
+func renderDiffContent(detail pullRequestDetail, diff string, width int) string {
 	var b strings.Builder
 	b.WriteString(detailTitleStyle.Render(fmt.Sprintf("%s  #%d  %s", detail.Repository, detail.Number, detail.Title)))
 	b.WriteByte('\n')
@@ -1442,13 +1451,38 @@ func renderDiffContent(detail pullRequestDetail, diff string) string {
 	if body == "" {
 		b.WriteString(mutedStyle.Render("No description."))
 	} else {
-		b.WriteString(body)
+		b.WriteString(renderMarkdown(body, width))
 	}
 	b.WriteString("\n\n")
 	b.WriteString(detailRuleStyle.Render(strings.Repeat("─", 80)))
 	b.WriteString("\n\n")
 	b.WriteString(highlightDiff(diff))
 	return b.String()
+}
+
+// renderMarkdown renders a PR description as tokyonight-themed markdown using
+// glamour. The width drives word-wrapping so the output matches the detail
+// viewport. On any renderer error it falls back to the raw body so the
+// description is never lost.
+func renderMarkdown(body string, width int) string {
+	if width < 20 {
+		width = 80
+	}
+	r, err := glamour.NewTermRenderer(
+		glamour.WithStyles(styles.TokyoNightStyleConfig),
+		glamour.WithWordWrap(width),
+		glamour.WithEmoji(),
+	)
+	if err != nil {
+		return body
+	}
+	out, err := r.Render(body)
+	if err != nil {
+		return body
+	}
+	// glamour pads the output with surrounding blank lines; trim them so the
+	// description sits flush against the surrounding metadata and rule.
+	return strings.Trim(out, "\n")
 }
 
 // highlightDiff applies tokyonight colors to a unified diff. The input is
