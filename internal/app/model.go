@@ -4,7 +4,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"image/color"
 	"os/exec"
 	"runtime"
 	"sort"
@@ -103,9 +102,16 @@ type model struct {
 	searchInput    textinput.Model
 	searchActive   bool
 	spinner        spinner.Model
+	activeTab      int
 }
 
 const maxListItems = 10
+
+const (
+	tabAwaiting = iota
+	tabReviewed
+	tabCount
+)
 
 var (
 	tokyoNightFG         = lipgloss.Color("#c0caf5")
@@ -153,14 +159,17 @@ var (
 	detailMetaTextStyle = lipgloss.NewStyle().Foreground(tokyoNightFG)
 	detailRuleStyle     = lipgloss.NewStyle().Foreground(tokyoNightMuted)
 	frameGray           = lipgloss.Color("#414868")
-	meFrameStyle        = lipgloss.NewStyle().Border(lipgloss.RoundedBorder()).BorderForeground(frameGray)
-	teamFrameStyle      = lipgloss.NewStyle().Border(lipgloss.RoundedBorder()).BorderForeground(frameGray)
+	listFrameStyle      = lipgloss.NewStyle().Border(lipgloss.RoundedBorder()).BorderForeground(frameGray)
 	detailFrameStyle    = lipgloss.NewStyle().Border(lipgloss.RoundedBorder()).BorderForeground(frameGray).PaddingLeft(1)
 	updateNoticeStyle   = lipgloss.NewStyle().Border(lipgloss.RoundedBorder()).BorderForeground(tokyoNightYellow).Padding(0, 1)
 	approvePopupStyle   = lipgloss.NewStyle().Border(lipgloss.RoundedBorder()).BorderForeground(tokyoNightGreen).Padding(1, 2)
 	approveButtonStyle  = lipgloss.NewStyle().Bold(true).Foreground(tokyoNightGreen)
 	cancelButtonStyle   = lipgloss.NewStyle().Bold(true).Foreground(tokyoNightRed)
 	markStyle           = lipgloss.NewStyle().Bold(true).Foreground(tokyoNightYellow)
+	activeTabStyle      = lipgloss.NewStyle().Bold(true).Foreground(tokyoNightInk).Background(tokyoNightBlue).Padding(0, 1)
+	inactiveTabStyle    = lipgloss.NewStyle().Foreground(tokyoNightMuted).Background(tokyoNightBarBG).Padding(0, 1)
+	typeMeStyle         = lipgloss.NewStyle().Foreground(tokyoNightCyan)
+	typeTeamStyle       = lipgloss.NewStyle().Foreground(tokyoNightOrange)
 	diffFileHeaderStyle = lipgloss.NewStyle().Bold(true).Foreground(tokyoNightCyan)
 	diffMetaStyle       = lipgloss.NewStyle().Foreground(tokyoNightMuted)
 	diffHunkStyle       = lipgloss.NewStyle().Foreground(tokyoNightMagenta)
@@ -331,6 +340,10 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.err = ""
 		m.approved[msg.pr.URL] = true
 		m.status = "approved " + prLabel(msg.pr)
+		// The PR now moves to the Reviewed tab; keep the cursor on a row that
+		// still belongs to the active tab so the highlight stays valid until the
+		// reload lands.
+		m.ensureCursorVisible()
 		return m, loadPRsCmd()
 	case copyURLMsg:
 		if msg.err != nil {
@@ -376,6 +389,10 @@ func (m model) handleKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 			m.ensureCursorVisible()
 			return m, m.detailAndPrefetchCmds()
 		}
+	case "h":
+		return m.switchTab(-1)
+	case "l":
+		return m.switchTab(+1)
 	case "/":
 		if !m.loading {
 			m.searchActive = true
@@ -473,26 +490,89 @@ func (m model) handleApproveConfirmation(key string) (tea.Model, tea.Cmd) {
 	}
 }
 
-// matchingIndices returns indices into m.prs that pass the active search
-// filter. With no filter, returns every index in order.
+// switchTab moves the active tab by delta and repositions the cursor onto the
+// first PR of the newly selected tab so the detail panel follows the change.
+func (m model) switchTab(delta int) (tea.Model, tea.Cmd) {
+	if m.loading {
+		return m, nil
+	}
+	next := m.activeTab + delta
+	if next < 0 || next >= tabCount {
+		return m, nil
+	}
+	m.activeTab = next
+	m.listOffset = 0
+	matched := m.matchingIndices()
+	if len(matched) == 0 {
+		m.currentDetail = nil
+		m.detailLoading = false
+		m.loadingForURL = ""
+		m.detailErr = ""
+		m.detailVP.SetContent("")
+		m.resizeViewport()
+		return m, nil
+	}
+	m.cursor = matched[0]
+	m.ensureCursorVisible()
+	m.resizeViewport()
+	return m, m.detailAndPrefetchCmds()
+}
+
+// isReviewed reports whether a PR should appear under the Reviewed tab: either
+// it was approved in this session or GitHub already reports an APPROVED
+// decision.
+func (m model) isReviewed(pr pullRequest) bool {
+	return m.approved[pr.URL] || pr.ReviewDecision == "APPROVED"
+}
+
+func (m model) prMatchesTab(pr pullRequest) bool {
+	if m.activeTab == tabReviewed {
+		return m.isReviewed(pr)
+	}
+	return !m.isReviewed(pr)
+}
+
+func prMatchesQuery(pr pullRequest, q string) bool {
+	if q == "" {
+		return true
+	}
+	return strings.Contains(strings.ToLower(pr.Repository), q) ||
+		strings.Contains(strings.ToLower(pr.Title), q) ||
+		strings.Contains(strings.ToLower(pr.Author), q)
+}
+
+// matchingIndices returns indices into m.prs that pass both the active tab and
+// the search filter, preserving list order.
 func (m model) matchingIndices() []int {
 	q := strings.ToLower(strings.TrimSpace(m.searchInput.Value()))
-	if q == "" {
-		out := make([]int, len(m.prs))
-		for i := range m.prs {
-			out[i] = i
-		}
-		return out
-	}
 	out := make([]int, 0, len(m.prs))
 	for i, pr := range m.prs {
-		if strings.Contains(strings.ToLower(pr.Repository), q) ||
-			strings.Contains(strings.ToLower(pr.Title), q) ||
-			strings.Contains(strings.ToLower(pr.Author), q) {
-			out = append(out, i)
+		if !m.prMatchesTab(pr) {
+			continue
 		}
+		if !prMatchesQuery(pr, q) {
+			continue
+		}
+		out = append(out, i)
 	}
 	return out
+}
+
+// tabCounts returns how many search-matching PRs fall into each tab,
+// independent of which tab is active, so the tab bar shows real totals.
+func (m model) tabCounts() (awaiting, reviewed int) {
+	q := strings.ToLower(strings.TrimSpace(m.searchInput.Value()))
+	for _, pr := range m.prs {
+		if !prMatchesQuery(pr, q) {
+			continue
+		}
+		if m.isReviewed(pr) {
+			reviewed++
+		} else {
+			awaiting++
+		}
+	}
+	return
 }
 
 // visiblePRIndices returns the indices into m.prs that should be shown in
@@ -824,18 +904,6 @@ func (m model) renderHeaderStatus(maxW int) string {
 	return barStyle.Render(lead) + style.Render(txt)
 }
 
-func (m model) groupPRs() (me, team []pullRequest) {
-	for _, i := range m.visiblePRIndices() {
-		pr := m.prs[i]
-		if strings.Contains(pr.Request, "@me") {
-			me = append(me, pr)
-		} else {
-			team = append(team, pr)
-		}
-	}
-	return
-}
-
 func (m model) renderGroupedList() string {
 	if m.err != "" && len(m.prs) == 0 {
 		return errorStyle.Render(m.err)
@@ -843,84 +911,59 @@ func (m model) renderGroupedList() string {
 	if len(m.prs) == 0 {
 		return mutedStyle.Render("No open PRs are requesting your review.")
 	}
-	if len(m.matchingIndices()) == 0 {
-		return mutedStyle.Render("No PRs match the current filter.")
-	}
 
 	boxW := m.frameWidth()
-	me, team := m.groupPRsByIndex()
-	meTotal, teamTotal := m.groupCounts()
+	contentW := frameContentWidth(listFrameStyle, boxW)
+	items := m.visiblePRIndices()
 
-	var sections []string
-
-	if len(me) > 0 {
-		contentW := frameContentWidth(meFrameStyle, boxW)
-		var lines []string
-		lines = append(lines, sectionTab("Me", meTotal, tokyoNightCyan))
-		lines = append(lines, m.renderListHeader(contentW))
-		for _, item := range me {
-			lines = append(lines, m.renderPRLine(item.idx, item.pr, contentW))
+	lines := []string{m.renderListHeader(contentW)}
+	if len(items) == 0 {
+		lines = append(lines, " "+mutedStyle.Render(m.emptyListMessage()))
+	} else {
+		for _, idx := range items {
+			lines = append(lines, m.renderPRLine(idx, m.prs[idx], contentW))
 		}
-		inner := 2 + len(me)
-		frameH := inner + 2
-		sections = append(sections, meFrameStyle.Width(boxW).Height(inner).MaxHeight(frameH).Render(strings.Join(lines, "\n")))
 	}
-
-	if len(team) > 0 {
-		contentW := frameContentWidth(teamFrameStyle, boxW)
-		var lines []string
-		lines = append(lines, sectionTab("Team", teamTotal, tokyoNightOrange))
-		lines = append(lines, m.renderListHeader(contentW))
-		for _, item := range team {
-			lines = append(lines, m.renderPRLine(item.idx, item.pr, contentW))
-		}
-		inner := 2 + len(team)
-		frameH := inner + 2
-		sections = append(sections, teamFrameStyle.Width(boxW).Height(inner).MaxHeight(frameH).Render(strings.Join(lines, "\n")))
-	}
-
-	return strings.Join(sections, "\n")
+	inner := len(lines)
+	frameH := inner + 2
+	frame := listFrameStyle.Width(boxW).Height(inner).MaxHeight(frameH).Render(strings.Join(lines, "\n"))
+	return m.renderTabBar() + "\n" + frame
 }
 
-// sectionTab renders a group heading as a colored pill followed by a muted
-// count, e.g. " Me  3", matching the tab-style headers common to polished TUIs.
-func sectionTab(label string, count int, accent color.Color) string {
-	pill := lipgloss.NewStyle().Bold(true).Foreground(tokyoNightInk).Background(accent).Padding(0, 1).Render(label)
-	return pill + mutedStyle.Render(fmt.Sprintf("  %d", count))
+// emptyListMessage explains why the current tab has no rows: an active search
+// filter that matched nothing, or simply an empty tab.
+func (m model) emptyListMessage() string {
+	if strings.TrimSpace(m.searchInput.Value()) != "" {
+		return "No PRs match the current filter."
+	}
+	if m.activeTab == tabReviewed {
+		return "No reviewed PRs."
+	}
+	return "No PRs awaiting your review."
 }
 
-// groupCounts returns the total number of filtered PRs in the Me and Team
-// groups, independent of list pagination, so the section tabs show real totals.
-func (m model) groupCounts() (me, team int) {
-	for _, i := range m.matchingIndices() {
-		if strings.Contains(m.prs[i].Request, "@me") {
-			me++
+// renderTabBar draws the Awaiting Review / Reviewed tabs with per-tab counts,
+// highlighting the active one.
+func (m model) renderTabBar() string {
+	awaiting, reviewed := m.tabCounts()
+	labels := [tabCount]string{
+		fmt.Sprintf("Awaiting Review %d", awaiting),
+		fmt.Sprintf("Reviewed %d", reviewed),
+	}
+	parts := make([]string, tabCount)
+	for i, label := range labels {
+		if i == m.activeTab {
+			parts[i] = activeTabStyle.Render(label)
 		} else {
-			team++
+			parts[i] = inactiveTabStyle.Render(label)
 		}
 	}
-	return
-}
-
-type indexedPR struct {
-	idx int
-	pr  pullRequest
-}
-
-func (m model) groupPRsByIndex() (me, team []indexedPR) {
-	for _, i := range m.visiblePRIndices() {
-		pr := m.prs[i]
-		if strings.Contains(pr.Request, "@me") {
-			me = append(me, indexedPR{i, pr})
-		} else {
-			team = append(team, indexedPR{i, pr})
-		}
-	}
-	return
+	return " " + strings.Join(parts, " ")
 }
 
 const (
 	colMarkW    = 3
+	colTypeW    = 6
 	colRepoW    = 28
 	colNumW     = 6
 	colAuthorW  = 15
@@ -928,15 +971,16 @@ const (
 )
 
 func listTitleWidth(boxW int) int {
-	// budget: leading/trailing space (2) + mark + repo + num + title + author + approve columns and separators.
-	fixed := 2 + colMarkW + 1 + colRepoW + 2 + colNumW + 2 + 2 + 1 + colAuthorW + 2 + colApproveW
+	// budget: leading/trailing space (2) + mark + type + repo + num + title + author + approve columns and separators.
+	fixed := 2 + colMarkW + 1 + colTypeW + 2 + colRepoW + 2 + colNumW + 2 + 2 + 1 + colAuthorW + 2 + colApproveW
 	return max(10, boxW-fixed)
 }
 
 func (m model) renderListHeader(boxW int) string {
 	titleW := listTitleWidth(boxW)
-	line := fmt.Sprintf("%s %s  %s  %s   %s  %s",
+	line := fmt.Sprintf("%s %s  %s  %s  %s   %s  %s",
 		padRight("", colMarkW),
+		padRight("Type", colTypeW),
 		padRight("Repository", colRepoW),
 		padRight("#", colNumW),
 		padRight("Title", titleW),
@@ -958,6 +1002,7 @@ func (m model) renderPRLine(idx int, pr pullRequest, boxW int) string {
 	}
 
 	line := m.markCell(pr, selected) + sp1 +
+		m.typeCell(pr, selected) + sp2 +
 		m.listRepoStyle(selected).Render(padRight(pr.Repository, colRepoW)) + sp2 +
 		m.listNumStyle(selected).Render(padRight(fmt.Sprintf("#%d", pr.Number), colNumW)) + sp2 +
 		m.listTitleStyle(selected).Render(padRight(pr.Title, titleW)) + sp2 +
@@ -983,6 +1028,21 @@ func (m model) markCell(pr pullRequest, selected bool) string {
 		return selectedStyle.Render(cell)
 	}
 	return cell
+}
+
+// typeCell renders a small [me]/[team] badge showing whether the review was
+// requested directly (review-requested:@me) or via a team.
+func (m model) typeCell(pr pullRequest, selected bool) string {
+	style := typeTeamStyle
+	label := "[team]"
+	if strings.Contains(pr.Request, "@me") {
+		style = typeMeStyle
+		label = "[me]"
+	}
+	if selected {
+		style = style.Background(tokyoNightSelected)
+	}
+	return style.Render(padRight(label, colTypeW))
 }
 
 func (m model) approveLabel(pr pullRequest) string {
@@ -1078,6 +1138,7 @@ func frameContentWidth(style lipgloss.Style, width int) int {
 
 func (m model) renderFooter() string {
 	bindings := [][2]string{
+		{"h/l", "tabs"},
 		{"ctrl+n/p", "list"},
 		{"j/k", "scroll"},
 		{"pgup/dn", "page"},
@@ -1126,21 +1187,13 @@ func (m *model) resizeViewport() {
 }
 
 func (m model) computeListSectionHeight() int {
-	me, team := m.groupPRs()
-	h := 0
-	if len(me) > 0 {
-		h += 2 + 2 + len(me) // top border + bottom border + title line + header line + items
+	items := len(m.visiblePRIndices())
+	if items == 0 {
+		items = 1 // empty-state message line
 	}
-	if len(team) > 0 {
-		if h > 0 {
-			h++ // gap between frames
-		}
-		h += 2 + 2 + len(team)
-	}
-	if h == 0 {
-		h = 1
-	}
-	return h
+	inner := 1 + items // header line + item rows
+	// tab bar (1) + frame top/bottom borders (2) + inner content
+	return 1 + 2 + inner
 }
 
 func loadPRsCmd() tea.Cmd {

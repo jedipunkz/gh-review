@@ -880,3 +880,72 @@ func modelWithPRsForSearch() model {
 	}
 	return m
 }
+
+func modelWithMixedReviewState() model {
+	m := newModel()
+	m.width = 120
+	m.height = 40
+	m.loading = false
+	m.prs = []pullRequest{
+		{Repository: "owner/api", Number: 1, Title: "awaiting one", URL: "https://example.test/pr/1", Author: "alice", Request: "@me", ReviewDecision: "REVIEW_REQUIRED"},
+		{Repository: "owner/web", Number: 2, Title: "already approved", URL: "https://example.test/pr/2", Author: "bob", Request: "org/team", ReviewDecision: "APPROVED"},
+		{Repository: "owner/cli", Number: 3, Title: "awaiting two", URL: "https://example.test/pr/3", Author: "carol", Request: "@me", ReviewDecision: "CHANGES_REQUESTED"},
+	}
+	return m
+}
+
+func TestMatchingIndicesRespectsActiveTab(t *testing.T) {
+	m := modelWithMixedReviewState()
+
+	m.activeTab = tabAwaiting
+	if got := m.matchingIndices(); !reflect.DeepEqual(got, []int{0, 2}) {
+		t.Fatalf("awaiting matchingIndices() = %#v, want [0 2]", got)
+	}
+
+	m.activeTab = tabReviewed
+	if got := m.matchingIndices(); !reflect.DeepEqual(got, []int{1}) {
+		t.Fatalf("reviewed matchingIndices() = %#v, want [1]", got)
+	}
+}
+
+func TestLocalApproveMovesPRToReviewedTab(t *testing.T) {
+	m := modelWithMixedReviewState()
+	m.approved[m.prs[0].URL] = true // approve the first awaiting PR locally
+
+	m.activeTab = tabAwaiting
+	if got := m.matchingIndices(); !reflect.DeepEqual(got, []int{2}) {
+		t.Fatalf("awaiting after approve = %#v, want [2]", got)
+	}
+	m.activeTab = tabReviewed
+	if got := m.matchingIndices(); !reflect.DeepEqual(got, []int{0, 1}) {
+		t.Fatalf("reviewed after approve = %#v, want [0 1]", got)
+	}
+}
+
+func TestTabCountsAreIndependentOfActiveTab(t *testing.T) {
+	m := modelWithMixedReviewState()
+	awaiting, reviewed := m.tabCounts()
+	if awaiting != 2 || reviewed != 1 {
+		t.Fatalf("tabCounts() = (%d, %d), want (2, 1)", awaiting, reviewed)
+	}
+}
+
+func TestSwitchTabMovesCursorIntoNewTab(t *testing.T) {
+	m := modelWithMixedReviewState()
+	m.cursor = 0 // on first awaiting PR
+
+	next, _ := m.switchTab(+1)
+	got := next.(model)
+	if got.activeTab != tabReviewed {
+		t.Fatalf("activeTab = %d, want tabReviewed", got.activeTab)
+	}
+	if got.cursor != 1 {
+		t.Fatalf("cursor = %d, want 1 (first reviewed PR)", got.cursor)
+	}
+
+	// Cannot move past the rightmost tab.
+	again, _ := got.switchTab(+1)
+	if again.(model).activeTab != tabReviewed {
+		t.Fatalf("activeTab should clamp at tabReviewed")
+	}
+}
