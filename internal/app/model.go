@@ -131,7 +131,6 @@ var (
 	// Top / bottom bars share a single background so the UI reads as one
 	// framed app rather than loose lines of text.
 	barStyle       = lipgloss.NewStyle().Background(tokyoNightBarBG)
-	badgeStyle     = lipgloss.NewStyle().Bold(true).Foreground(tokyoNightInk).Background(tokyoNightBlue)
 	barStatusStyle = lipgloss.NewStyle().Foreground(tokyoNightFG).Background(tokyoNightBarBG)
 	barMutedStyle  = lipgloss.NewStyle().Foreground(tokyoNightMuted).Background(tokyoNightBarBG)
 	barErrorStyle  = lipgloss.NewStyle().Foreground(tokyoNightRed).Background(tokyoNightBarBG)
@@ -852,7 +851,7 @@ func (m *model) triggerDetailLoad() tea.Cmd {
 }
 
 func (m model) View() tea.View {
-	parts := []string{m.renderHeader()}
+	var parts []string
 	if m.searchVisible() {
 		parts = append(parts, m.renderSearchLine())
 	}
@@ -880,30 +879,6 @@ func (m model) renderSearchLine() string {
 		return mutedStyle.Render("/ ") + m.searchInput.View()
 	}
 	return mutedStyle.Render(fmt.Sprintf("filter: %s  (/ to edit, esc to clear)", m.searchInput.Value()))
-}
-
-func (m model) renderHeader() string {
-	w := m.frameWidth()
-	badge := badgeStyle.Render(" gh review ")
-	right := m.renderHeaderStatus(max(1, w-lipgloss.Width(badge)-1))
-	gap := max(1, w-lipgloss.Width(badge)-lipgloss.Width(right))
-	return badge + barStyle.Render(strings.Repeat(" ", gap)) + right
-}
-
-// renderHeaderStatus builds the right-aligned status segment of the top bar,
-// truncating the status text so the whole bar stays on a single line.
-func (m model) renderHeaderStatus(maxW int) string {
-	var lead string
-	if m.loading || m.detailLoading {
-		lead = m.spinner.View() + " "
-	}
-	style := barMutedStyle
-	if m.err != "" {
-		style = barErrorStyle
-	}
-	avail := max(1, maxW-lipgloss.Width(lead))
-	txt := runewidth.Truncate(m.status, avail, "…")
-	return barStyle.Render(lead) + style.Render(txt)
 }
 
 func (m model) renderGroupedList() string {
@@ -1138,7 +1113,38 @@ func frameContentWidth(style lipgloss.Style, width int) int {
 	return max(1, width-style.GetHorizontalFrameSize())
 }
 
+// renderFooter renders the bottom status bar. The status segment is always
+// shown on the left; the key-binding hints fill the right side and are dropped
+// when the status leaves no room for them.
 func (m model) renderFooter() string {
+	w := m.frameWidth()
+	status := m.renderFooterStatus()
+	help := m.renderHelp()
+	statusW := lipgloss.Width(status)
+	helpW := lipgloss.Width(help)
+	if statusW+1+helpW > w {
+		return renderBar(status, w)
+	}
+	gap := max(1, w-statusW-helpW)
+	return status + barStyle.Render(strings.Repeat(" ", gap)) + help
+}
+
+// renderFooterStatus builds the left-aligned status segment of the bottom bar,
+// including the spinner while loading and error styling on failure.
+func (m model) renderFooterStatus() string {
+	var lead string
+	if m.loading || m.detailLoading {
+		lead = m.spinner.View() + " "
+	}
+	style := barMutedStyle
+	if m.err != "" {
+		style = barErrorStyle
+	}
+	return barStyle.Render(" "+lead) + style.Render(m.status)
+}
+
+// renderHelp builds the key-binding hints shown on the right of the bottom bar.
+func (m model) renderHelp() string {
 	bindings := [][2]string{
 		{"h/l", "tabs"},
 		{"ctrl+n/p", "list"},
@@ -1155,7 +1161,7 @@ func (m model) renderFooter() string {
 	for i, b := range bindings {
 		parts[i] = helpKeyStyle.Render(b[0]) + " " + helpDescStyle.Render(b[1])
 	}
-	return renderBar(" "+strings.Join(parts, sep), m.frameWidth())
+	return strings.Join(parts, sep) + barStyle.Render(" ")
 }
 
 // renderBar pads or truncates content to exactly w columns on a single line,
@@ -1180,8 +1186,8 @@ func (m *model) resizeViewport() {
 	if m.searchVisible() {
 		searchH = 1
 	}
-	// layout: header(1) + search?(searchH) + list(listH) + detailBorder(2) + vpH + footer(1)
-	vpH := max(3, m.height-4-listH-searchH)
+	// layout: search?(searchH) + list(listH) + detailBorder(2) + vpH + footer(1)
+	vpH := max(3, m.height-3-listH-searchH)
 	vpW := max(20, frameContentWidth(detailFrameStyle, m.frameWidth()))
 	m.detailVP.SetHeight(vpH)
 	m.detailVP.SetWidth(vpW)
