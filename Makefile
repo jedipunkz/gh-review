@@ -6,7 +6,9 @@ GH_EXTENSION_PATH := $(GH_EXTENSIONS_DIR)/$(GH_EXTENSION_NAME)
 .PHONY: build install reinstall install-dev test
 
 build:
-	go build -o gh-review ./cmd/gh-review
+	cargo build --release
+	cp target/release/gh-review gh-review
+	chmod +x gh-review
 
 install: build
 	mkdir -p "$(GH_EXTENSIONS_DIR)"
@@ -26,4 +28,4 @@ reinstall:
 install-dev: install
 
 test:
-	go test ./...
+	cargo test
