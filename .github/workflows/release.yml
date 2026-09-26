@@ -1,0 +1,70 @@
+name: release
+on:
+  push:
+    tags:
+      - "v*"
+permissions:
+  contents: write
+jobs:
+  build:
+    strategy:
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            asset-os: linux
+            asset-arch: amd64
+          - os: ubuntu-latest
+            target: aarch64-unknown-linux-gnu
+            asset-os: linux
+            asset-arch: arm64
+            cross: true
+          - os: macos-13
+            target: x86_64-apple-darwin
+            asset-os: macos
+            asset-arch: amd64
+          - os: macos-14
+            target: aarch64-apple-darwin
+            asset-os: macos
+            asset-arch: arm64
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            asset-os: windows
+            asset-arch: amd64
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - name: Install cross
+        if: matrix.cross
+        run: cargo install cross --locked
+      - name: Build
+        working-directory: ${{ github.workspace }}
+        env:
+          CARGO_TARGET: ${{ matrix.target }}
+        run: |
+          if [ "$RUNNER_OS" = "Windows" ]; then
+            cargo build --release --target "$CARGO_TARGET"
+            cp "target/$CARGO_TARGET/release/gh-review.exe" "gh-review-${{ matrix.asset-os }}-${{ matrix.asset-arch }}.exe"
+          else
+            if [ "${{ matrix.cross }}" = "true" ]; then
+              cross build --release --target "$CARGO_TARGET"
+            else
+              cargo build --release --target "$CARGO_TARGET"
+            fi
+            cp "target/$CARGO_TARGET/release/gh-review" "gh-review-${{ matrix.asset-os }}-${{ matrix.asset-arch }}"
+          fi
+        shell: bash
+      - name: Upload release asset
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          if [ "$RUNNER_OS" = "Windows" ]; then
+            gh release upload "$TAG" "gh-review-${{ matrix.asset-os }}-${{ matrix.asset-arch }}.exe" --clobber
+          else
+            gh release upload "$TAG" "gh-review-${{ matrix.asset-os }}-${{ matrix.asset-arch }}" --clobber
+          fi
+        shell: bash

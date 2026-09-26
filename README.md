@@ -2,7 +2,11 @@
 
 `gh review` lists open pull requests that request review from you or your teams, shows the PR diff in a TUI, and approves from the keyboard.
 
+This extension is written in Rust.
+
 ## Install
+
+Prerequisites: [Rust](https://rustup.rs) 1.75 or later.
 
 ```bash
 make build
@@ -38,3 +42,10 @@ are not `gh-review`.
 
 This extension shells out to `gh`, so it uses the same authentication, host, and GitHub Enterprise configuration as GitHub CLI.
 While running, it checks for review request updates every minute.
+
+## Development
+
+```bash
+cargo test      # unit tests
+cargo clippy    # lints
+```
