@@ -1180,11 +1180,38 @@ fn review_decision_style(decision: &str) -> Style {
     }
 }
 
+// Drops ANSI CSI sequences (ESC [ ... final byte). Diffs cached before the
+// switch to plain-text `gh pr diff` still carry them, and ratatui renders
+// escape bytes as garbage instead of interpreting them.
+fn strip_ansi(s: &str) -> String {
+    if !s.contains('\x1b') {
+        return s.to_string();
+    }
+    let mut out = String::with_capacity(s.len());
+    let mut chars = s.chars().peekable();
+    while let Some(ch) = chars.next() {
+        if ch != '\x1b' {
+            out.push(ch);
+            continue;
+        }
+        if chars.peek() == Some(&'[') {
+            chars.next();
+            for c in chars.by_ref() {
+                if ('\x40'..='\x7e').contains(&c) {
+                    break;
+                }
+            }
+        }
+    }
+    out
+}
+
 fn highlight_diff(diff: &str) -> Vec<Line<'static>> {
     if diff.is_empty() {
         return Vec::new();
     }
     diff.lines()
+        .map(strip_ansi)
         .map(|line| {
             let style = if line.starts_with("diff --git") {
                 Style::new()
@@ -1212,7 +1239,7 @@ fn highlight_diff(diff: &str) -> Vec<Line<'static>> {
             } else {
                 Style::new()
             };
-            Line::from(Span::styled(line.to_string(), style))
+            Line::from(Span::styled(line, style))
         })
         .collect()
 }
@@ -2597,5 +2624,27 @@ mod tests {
         ] {
             assert!(joined.contains(want), "rendered detail missing {want}");
         }
+    }
+
+    #[test]
+    fn test_highlight_diff_strips_ansi_and_styles_lines() {
+        // Cached entries from the --color=always era carry ANSI escapes.
+        let diff = "\x1b[1mdiff --git a/f b/f\x1b[m\n\x1b[32m+added\x1b[m\n\x1b[31m-removed\x1b[m\n context";
+        let lines = highlight_diff(diff);
+        let texts: Vec<String> = lines
+            .iter()
+            .map(|l| {
+                l.spans
+                    .iter()
+                    .map(|s| s.content.to_string())
+                    .collect::<String>()
+            })
+            .collect();
+        assert_eq!(
+            texts,
+            vec!["diff --git a/f b/f", "+added", "-removed", " context"]
+        );
+        assert_eq!(lines[1].spans[0].style.fg, Some(c(colors::GREEN)));
+        assert_eq!(lines[2].spans[0].style.fg, Some(c(colors::RED)));
     }
 }
