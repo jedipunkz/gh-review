@@ -672,12 +672,9 @@ pub async fn load_pr_detail(g: &Gh, pr: &PullRequest) -> Result<PullRequestDetai
 }
 
 pub async fn load_diff(g: &Gh, pr: &PullRequest) -> Result<String> {
-    let args = vec![
-        "pr".to_string(),
-        "diff".to_string(),
-        pr.url.clone(),
-        "--color=always".to_string(),
-    ];
+    // Plain text on purpose: ratatui does not interpret ANSI escapes, and
+    // highlight_diff applies its own colors.
+    let args = vec!["pr".to_string(), "diff".to_string(), pr.url.clone()];
     let out = g.run(&args).await?;
     Ok(String::from_utf8_lossy(&out).into_owned())
 }
