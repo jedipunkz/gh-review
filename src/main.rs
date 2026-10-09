@@ -28,6 +28,15 @@ impl Runtime {
                     let _ = tx.send(Msg::PRList(result));
                 });
             }
+            Effect::LoadHistory => {
+                let g2 = g.clone();
+                tokio::spawn(async move {
+                    let result = gh_review::gh::load_history(&g2)
+                        .await
+                        .map_err(|e| e.to_string());
+                    let _ = tx.send(Msg::HistoryList(result));
+                });
+            }
             Effect::CheckUpdates {
                 prev_sig,
                 prev_count,
@@ -213,7 +222,9 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
 
         let size = terminal.size().map_err(|e| e.to_string())?;
         let _ = tx.send(Msg::Resize(size.width, size.height));
-        runtime.execute(Gh::new(), Effect::LoadPRs);
+        for effect in model.initial_effects() {
+            runtime.execute(g.clone(), effect);
+        }
 
         let run_result: Result<(), String> = async {
             loop {

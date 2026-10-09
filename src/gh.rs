@@ -106,6 +106,9 @@ pub struct PullRequest {
     pub updated_at: SystemTime,
     pub request: String,
     pub review_decision: String,
+    /// OPEN / MERGED / CLOSED. Empty (old cache entries) is treated as open.
+    #[serde(default)]
+    pub state: String,
 }
 
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
@@ -140,6 +143,7 @@ impl Default for PullRequest {
             updated_at: SystemTime::UNIX_EPOCH,
             request: String::new(),
             review_decision: String::new(),
+            state: String::new(),
         }
     }
 }
@@ -182,6 +186,7 @@ query($q: String!, $after: String) {
         url
         updatedAt
         reviewDecision
+        state
         repository {
           nameWithOwner
         }
@@ -228,6 +233,7 @@ struct SearchNode {
     updated_at: Option<String>,
     #[serde(rename = "reviewDecision")]
     review_decision: Option<String>,
+    state: Option<String>,
     repository: Option<SearchRepo>,
     author: Option<SearchAuthor>,
 }
@@ -267,6 +273,7 @@ pub fn parse_search_prs_response(out: &[u8], label: &str) -> Result<SearchPRsPag
             updated_at: parse_gh_time(item.updated_at),
             request: label.to_string(),
             review_decision: item.review_decision.unwrap_or_default(),
+            state: item.state.unwrap_or_default(),
         });
     }
     Ok(SearchPRsPage {
@@ -484,11 +491,7 @@ pub async fn load_review_requests(g: &Gh) -> Result<Vec<PullRequest>> {
     )];
 
     if let Ok(teams) = load_teams(g).await {
-        for t in teams {
-            if t.organization.is_empty() || t.slug.is_empty() {
-                continue;
-            }
-            let name = format!("{}/{}", t.organization, t.slug);
+        for name in team_names(&teams) {
             queries.push((
                 name.clone(),
                 format!("is:pr is:open archived:false team-review-requested:{name}"),
@@ -496,6 +499,58 @@ pub async fn load_review_requests(g: &Gh) -> Result<Vec<PullRequest>> {
         }
     }
 
+    search_prs_merged(g, queries, None).await
+}
+
+/// Max search result pages fetched per query for merged / closed PRs.
+/// One page = the 100 most recently updated PRs.
+pub const HISTORY_MAX_PAGES: usize = 1;
+
+/// Merged and closed (unmerged) PRs that you reviewed, or that requested
+/// review from you or your teams.
+pub async fn load_history(g: &Gh) -> Result<Vec<PullRequest>> {
+    let mut who: Vec<(String, String)> = vec![
+        ("@me".to_string(), "reviewed-by:@me".to_string()),
+        ("@me".to_string(), "review-requested:@me".to_string()),
+    ];
+    if let Ok(teams) = load_teams(g).await {
+        for name in team_names(&teams) {
+            who.push((name.clone(), format!("team-review-requested:{name}")));
+        }
+    }
+
+    let mut queries: Vec<(String, String)> = Vec::new();
+    for state in history_state_qualifiers() {
+        for (label, qualifier) in &who {
+            queries.push((
+                label.clone(),
+                format!("is:pr {state} archived:false {qualifier} sort:updated-desc"),
+            ));
+        }
+    }
+
+    search_prs_merged(g, queries, Some(HISTORY_MAX_PAGES)).await
+}
+
+pub fn history_state_qualifiers() -> [&'static str; 2] {
+    ["is:merged", "is:closed is:unmerged"]
+}
+
+fn team_names(teams: &[Team]) -> Vec<String> {
+    teams
+        .iter()
+        .filter(|t| !t.organization.is_empty() && !t.slug.is_empty())
+        .map(|t| format!("{}/{}", t.organization, t.slug))
+        .collect()
+}
+
+/// Runs the (label, query) searches concurrently and merges the results by
+/// URL, joining the labels of PRs that matched several queries.
+async fn search_prs_merged(
+    g: &Gh,
+    queries: Vec<(String, String)>,
+    max_pages: Option<usize>,
+) -> Result<Vec<PullRequest>> {
     let sem = std::sync::Arc::new(tokio::sync::Semaphore::new(8));
     let mut handles = Vec::new();
     for (label, q) in queries {
@@ -503,7 +558,7 @@ pub async fn load_review_requests(g: &Gh) -> Result<Vec<PullRequest>> {
         let g = g.clone();
         handles.push(tokio::spawn(async move {
             let _permit = sem.acquire().await;
-            let res = search_prs(&g, &q, &label).await;
+            let res = search_prs(&g, &q, &label, max_pages).await;
             (label, res)
         }));
     }
@@ -513,22 +568,7 @@ pub async fn load_review_requests(g: &Gh) -> Result<Vec<PullRequest>> {
     for handle in handles {
         if let Ok((label, res)) = handle.await {
             match res {
-                Ok(prs) => {
-                    for pr in prs {
-                        match by_url.entry(pr.url.clone()) {
-                            std::collections::hash_map::Entry::Occupied(mut e) => {
-                                let existing = e.get_mut();
-                                if !existing.request.contains(&pr.request) {
-                                    existing.request =
-                                        format!("{}, {}", existing.request, pr.request);
-                                }
-                            }
-                            std::collections::hash_map::Entry::Vacant(e) => {
-                                e.insert(pr);
-                            }
-                        }
-                    }
-                }
+                Ok(prs) => merge_by_url(&mut by_url, prs),
                 Err(e) => errs.push(format!("{label}: {e}")),
             }
         }
@@ -541,6 +581,22 @@ pub async fn load_review_requests(g: &Gh) -> Result<Vec<PullRequest>> {
     let mut prs: Vec<PullRequest> = by_url.into_values().collect();
     prs.sort_by_key(|a| std::cmp::Reverse(a.updated_at));
     Ok(prs)
+}
+
+fn merge_by_url(by_url: &mut HashMap<String, PullRequest>, prs: Vec<PullRequest>) {
+    for pr in prs {
+        match by_url.entry(pr.url.clone()) {
+            std::collections::hash_map::Entry::Occupied(mut e) => {
+                let existing = e.get_mut();
+                if !existing.request.contains(&pr.request) {
+                    existing.request = format!("{}, {}", existing.request, pr.request);
+                }
+            }
+            std::collections::hash_map::Entry::Vacant(e) => {
+                e.insert(pr);
+            }
+        }
+    }
 }
 
 const TEAMS_CACHE_TTL: Duration = Duration::from_secs(600);
@@ -582,9 +638,15 @@ pub async fn load_teams(g: &Gh) -> Result<Vec<Team>> {
     Ok(teams)
 }
 
-pub async fn search_prs(g: &Gh, query: &str, label: &str) -> Result<Vec<PullRequest>> {
+pub async fn search_prs(
+    g: &Gh,
+    query: &str,
+    label: &str,
+    max_pages: Option<usize>,
+) -> Result<Vec<PullRequest>> {
     let mut prs: Vec<PullRequest> = Vec::new();
     let mut after: Option<String> = None;
+    let mut pages = 0usize;
     loop {
         let mut args = vec![
             "api".to_string(),
@@ -601,6 +663,10 @@ pub async fn search_prs(g: &Gh, query: &str, label: &str) -> Result<Vec<PullRequ
         let out = g.run(&args).await?;
         let page = parse_search_prs_response(&out, label)?;
         prs.extend(page.prs);
+        pages += 1;
+        if max_pages.is_some_and(|m| pages >= m) {
+            break;
+        }
         if !page.has_next_page || page.end_cursor.is_empty() {
             break;
         }
@@ -744,6 +810,7 @@ mod tests {
                             "url": "https://github.com/owner/repo/pull/42",
                             "updatedAt": "2026-05-13T01:02:03Z",
                             "reviewDecision": "APPROVED",
+                            "state": "MERGED",
                             "repository": {"nameWithOwner": "owner/repo"},
                             "author": {"login": "octocat"}
                         }
@@ -760,8 +827,18 @@ mod tests {
         let pr = &page.prs[0];
         assert_eq!(pr.repository, "owner/repo");
         assert_eq!(pr.review_decision, "APPROVED");
+        assert_eq!(pr.state, "MERGED");
         let want = SystemTime::UNIX_EPOCH + Duration::from_secs(1778634123);
         assert_eq!(pr.updated_at, want);
+    }
+
+    #[test]
+    fn test_pull_request_deserializes_without_state() {
+        let old = r#"{"repository":"o/r","number":1,"title":"t","url":"u","author":"a",
+            "updated_at":{"secs_since_epoch":0,"nanos_since_epoch":0},
+            "request":"@me","review_decision":""}"#;
+        let pr: PullRequest = serde_json::from_str(old).unwrap();
+        assert_eq!(pr.state, "");
     }
 
     #[test]
