@@ -94,6 +94,16 @@ impl Runtime {
                     let _ = tx.send(Msg::ApproveDone { pr, err });
                 });
             }
+            Effect::Comment { pr, body } => {
+                let g2 = g.clone();
+                tokio::spawn(async move {
+                    let err = gh_review::gh::comment_pr(&g2, &pr, &body)
+                        .await
+                        .err()
+                        .map(|e| e.to_string());
+                    let _ = tx.send(Msg::CommentDone { pr, body, err });
+                });
+            }
             Effect::CopyURL { pr } => {
                 tokio::spawn(async move {
                     let err = copy_url(&pr.url).await.err().map(|e| e.to_string());
@@ -182,9 +192,21 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         .build()?;
 
     let mut terminal = ratatui::init();
+    let keyboard_enhancement =
+        crossterm::terminal::supports_keyboard_enhancement().unwrap_or(false);
 
     let result = rt.block_on(async {
         crossterm::terminal::enable_raw_mode().map_err(|e| e.to_string())?;
+        // Lets the comment popup tell ctrl+enter from enter on terminals
+        // that support the kitty keyboard protocol.
+        if keyboard_enhancement {
+            let _ = crossterm::execute!(
+                std::io::stdout(),
+                crossterm::event::PushKeyboardEnhancementFlags(
+                    crossterm::event::KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES
+                )
+            );
+        }
 
         let g = Gh::new();
         let cache = Arc::new(DetailCache::new());
@@ -253,6 +275,12 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         run_result
     });
 
+    if keyboard_enhancement {
+        let _ = crossterm::execute!(
+            std::io::stdout(),
+            crossterm::event::PopKeyboardEnhancementFlags
+        );
+    }
     ratatui::restore();
     crossterm::terminal::disable_raw_mode()?;
     result.map_err(|e| e.into())

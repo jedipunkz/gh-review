@@ -1,5 +1,5 @@
 use std::cell::RefCell;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use ratatui::layout::Rect;
@@ -13,6 +13,7 @@ use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 #[allow(unused_imports)]
 use crate::cache::CacheEntry;
 use crate::cache::DetailCache;
+use crate::editor::TextArea;
 use crate::gh::{self, HistoryState, PullRequest, PullRequestDetail};
 use crate::prefetch::{neighbor_prs, top_n, Prefetcher};
 use crate::theme;
@@ -73,6 +74,11 @@ pub struct UpdateNotice {
     pub id: u64,
 }
 
+pub struct CommentEditor {
+    pub pr: PullRequest,
+    pub area: TextArea,
+}
+
 pub struct DetailViewCache {
     pub content_width: usize,
     pub total: u16,
@@ -97,6 +103,7 @@ pub enum Effect {
     LoadDiff { pr: PullRequest },
     Debounce { seq: u64, url: String },
     Approve { pr: PullRequest },
+    Comment { pr: PullRequest, body: String },
     CopyURL { pr: PullRequest },
     PlaySound,
     DismissPopup { id: u64 },
@@ -114,6 +121,11 @@ pub enum Msg {
     DiffDone(Box<DiffDoneMsg>),
     ApproveDone {
         pr: PullRequest,
+        err: Option<String>,
+    },
+    CommentDone {
+        pr: PullRequest,
+        body: String,
         err: Option<String>,
     },
     CopyDone {
@@ -161,6 +173,9 @@ pub struct Model {
     pub height: u16,
     pub approved: HashSet<String>,
     pub pending_approve: Option<PullRequest>,
+    pub comment_editor: Option<CommentEditor>,
+    /// Unsent comment text per PR URL, kept on cancel or send failure.
+    pub comment_drafts: HashMap<String, String>,
     pub update_notice: Option<UpdateNotice>,
     pub marked_prs: HashSet<String>,
     pub popup_seq: u64,
@@ -206,6 +221,8 @@ impl Model {
             height: 0,
             approved: HashSet::new(),
             pending_approve: None,
+            comment_editor: None,
+            comment_drafts: HashMap::new(),
             update_notice: None,
             marked_prs: HashSet::new(),
             popup_seq: 0,
@@ -693,6 +710,19 @@ impl Model {
                     None => Vec::new(),
                 }
             }
+            Msg::CommentDone { pr, body, err } => {
+                self.loading = false;
+                if let Some(e) = err {
+                    self.err = e;
+                    self.comment_drafts.insert(pr.url.clone(), body);
+                    self.status = "failed to comment (draft kept; press c to retry)".to_string();
+                    return Vec::new();
+                }
+                self.err = String::new();
+                self.comment_drafts.remove(&pr.url);
+                self.status = format!("commented on {}", pr_label(&pr));
+                Vec::new()
+            }
             Msg::CopyDone { pr, err } => {
                 if let Some(e) = err {
                     self.err = e;
@@ -814,6 +844,9 @@ impl Model {
         if self.pending_approve.is_some() {
             return self.handle_approve_confirmation(key);
         }
+        if self.comment_editor.is_some() {
+            return self.handle_comment_key(key);
+        }
         self.clear_mark_on_selected();
 
         let ctrl = key
@@ -913,6 +946,30 @@ impl Model {
                     self.err = String::new();
                     self.pending_approve = Some(pr);
                     self.status = "approval confirmation open".to_string();
+                }
+                Vec::new()
+            }
+            crossterm::event::KeyCode::Char('c') if !ctrl => {
+                if self.current_detail.is_some() && !self.loading && !self.detail_loading {
+                    let pr = match self.current_detail.as_ref() {
+                        Some(d) => d.base.clone(),
+                        None => return Vec::new(),
+                    };
+                    if is_history(&pr) {
+                        self.status = "cannot comment on a merged or closed PR".to_string();
+                        return Vec::new();
+                    }
+                    let draft = self
+                        .comment_drafts
+                        .get(&pr.url)
+                        .cloned()
+                        .unwrap_or_default();
+                    self.err = String::new();
+                    self.comment_editor = Some(CommentEditor {
+                        pr,
+                        area: TextArea::new(&draft),
+                    });
+                    self.status = "ctrl+enter (or ctrl+s) to send, esc to cancel".to_string();
                 }
                 Vec::new()
             }
@@ -1054,6 +1111,96 @@ impl Model {
             .nth(char_idx)
             .map(|(b, _)| b)
             .unwrap_or(self.search_value.len())
+    }
+
+    fn handle_comment_key(&mut self, key: crossterm::event::KeyEvent) -> Vec<Effect> {
+        use crossterm::event::{KeyCode, KeyModifiers};
+        let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+        let alt = key.modifiers.contains(KeyModifiers::ALT);
+        let editor = match self.comment_editor.as_mut() {
+            Some(e) => e,
+            None => return Vec::new(),
+        };
+        match key.code {
+            KeyCode::Enter if ctrl => self.submit_comment(),
+            KeyCode::Char('s') if ctrl => self.submit_comment(),
+            KeyCode::Char('c') if ctrl => {
+                self.quit = true;
+                Vec::new()
+            }
+            KeyCode::Esc => {
+                if let Some(e) = self.comment_editor.take() {
+                    if e.area.text().trim().is_empty() {
+                        self.comment_drafts.remove(&e.pr.url);
+                    } else {
+                        self.comment_drafts
+                            .insert(e.pr.url.clone(), e.area.text().to_string());
+                    }
+                }
+                self.status = "comment canceled (draft kept)".to_string();
+                Vec::new()
+            }
+            KeyCode::Enter => {
+                editor.area.insert('\n');
+                Vec::new()
+            }
+            KeyCode::Backspace => {
+                editor.area.backspace();
+                Vec::new()
+            }
+            KeyCode::Delete => {
+                editor.area.delete();
+                Vec::new()
+            }
+            KeyCode::Left => {
+                editor.area.left();
+                Vec::new()
+            }
+            KeyCode::Right => {
+                editor.area.right();
+                Vec::new()
+            }
+            KeyCode::Up => {
+                editor.area.up();
+                Vec::new()
+            }
+            KeyCode::Down => {
+                editor.area.down();
+                Vec::new()
+            }
+            KeyCode::Home => {
+                editor.area.home();
+                Vec::new()
+            }
+            KeyCode::End => {
+                editor.area.end();
+                Vec::new()
+            }
+            KeyCode::Char(ch) if !ctrl && !alt => {
+                editor.area.insert(ch);
+                Vec::new()
+            }
+            _ => Vec::new(),
+        }
+    }
+
+    fn submit_comment(&mut self) -> Vec<Effect> {
+        let body = match self.comment_editor.as_ref() {
+            Some(e) => e.area.text().to_string(),
+            None => return Vec::new(),
+        };
+        if body.trim().is_empty() {
+            self.status = "comment is empty".to_string();
+            return Vec::new();
+        }
+        let pr = match self.comment_editor.take() {
+            Some(e) => e.pr,
+            None => return Vec::new(),
+        };
+        self.loading = true;
+        self.status = "sending comment...".to_string();
+        self.err = String::new();
+        vec![Effect::Comment { pr, body }]
     }
 
     fn handle_approve_confirmation(&mut self, key: crossterm::event::KeyEvent) -> Vec<Effect> {
@@ -1832,6 +1979,9 @@ pub fn render(m: &mut Model, f: &mut Frame<'_>) {
     if m.pending_approve.is_some() {
         render_approve_popup(m, f, area);
     }
+    if m.comment_editor.is_some() {
+        render_comment_popup(m, f, area);
+    }
 }
 
 fn render_search_line(m: &Model) -> Paragraph<'static> {
@@ -2305,7 +2455,7 @@ fn render_footer_status(m: &Model) -> Vec<Span<'static>> {
 }
 
 fn render_help() -> Vec<Span<'static>> {
-    let bindings: [(&str, &str); 9] = [
+    let bindings: [(&str, &str); 10] = [
         ("h/l", "tabs"),
         ("ctrl+n/p", "list"),
         ("j/k", "scroll"),
@@ -2313,6 +2463,7 @@ fn render_help() -> Vec<Span<'static>> {
         ("/", "filter"),
         ("y", "copy"),
         ("a", "approve"),
+        ("c", "comment"),
         ("r", "refresh"),
         ("q", "quit"),
     ];
@@ -2419,6 +2570,67 @@ fn render_approve_popup(m: &Model, f: &mut Frame<'_>, area: Rect) {
     f.render_widget(Paragraph::new(lines), inner);
 }
 
+fn render_comment_popup(m: &Model, f: &mut Frame<'_>, area: Rect) {
+    let editor = match &m.comment_editor {
+        Some(e) => e,
+        None => return,
+    };
+    // Box: up to 80 columns wide, up to 16 rows tall; borders + 1 col padding.
+    let pw = (area.width.saturating_sub(4)).min(80);
+    let ph = (area.height.saturating_sub(2)).min(16);
+    if pw < 10 || ph < 6 {
+        return;
+    }
+    let rect = Rect::new(
+        area.x + (area.width - pw) / 2,
+        area.y + (area.height - ph) / 2,
+        pw,
+        ph,
+    );
+    let block = Block::bordered()
+        .border_set(border::ROUNDED)
+        .border_style(fg(colors::BLUE))
+        .title(Span::styled(
+            format!(" Comment on {} ", pr_label(&editor.pr)),
+            Style::new()
+                .fg(c(colors::BLUE))
+                .add_modifier(Modifier::BOLD),
+        ))
+        .title_bottom(Line::from(vec![
+            Span::styled(" ctrl+enter".to_string(), fg(colors::YELLOW)),
+            Span::styled("/".to_string(), fg(colors::MUTED)),
+            Span::styled("ctrl+s".to_string(), fg(colors::YELLOW)),
+            Span::styled(" send · ".to_string(), fg(colors::MUTED)),
+            Span::styled("enter".to_string(), fg(colors::YELLOW)),
+            Span::styled(" newline · ".to_string(), fg(colors::MUTED)),
+            Span::styled("esc".to_string(), fg(colors::YELLOW)),
+            Span::styled(" cancel ".to_string(), fg(colors::MUTED)),
+        ]))
+        .padding(Padding::horizontal(1));
+    let inner = block.inner(rect);
+    f.render_widget(Clear, rect);
+    f.render_widget(block, rect);
+    if inner.width == 0 || inner.height == 0 {
+        return;
+    }
+
+    let (rows, (cur_row, cur_col)) = editor.area.layout(inner.width as usize);
+    let vp = inner.height as usize;
+    let offset = (cur_row + 1).saturating_sub(vp);
+    let lines: Vec<Line<'static>> = rows
+        .into_iter()
+        .skip(offset)
+        .take(vp)
+        .map(|r| Line::from(Span::styled(r, fg(colors::FG))))
+        .collect();
+    f.render_widget(Paragraph::new(lines), inner);
+    // Place the real terminal cursor so the IME preedit appears in place.
+    f.set_cursor_position((
+        inner.x + cur_col as u16,
+        inner.y + (cur_row - offset) as u16,
+    ));
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2496,6 +2708,116 @@ mod tests {
         assert!(effects.is_empty());
         assert!(m.pending_approve.is_none());
         assert!(!m.loading);
+    }
+
+    #[test]
+    fn test_comment_key_opens_editor_and_types_japanese() {
+        let mut m = model_with_loaded_detail();
+        let effects = m.update(key(crossterm::event::KeyCode::Char('c')));
+        assert!(effects.is_empty());
+        assert!(m.comment_editor.is_some());
+        for ch in "了解です".chars() {
+            m.update(key(crossterm::event::KeyCode::Char(ch)));
+        }
+        m.update(key(crossterm::event::KeyCode::Enter));
+        m.update(key(crossterm::event::KeyCode::Char('q')));
+        let e = m.comment_editor.as_ref().unwrap();
+        assert_eq!(e.area.text(), "了解です\nq");
+        assert!(!m.quit, "q must be typed, not quit");
+    }
+
+    #[test]
+    fn test_comment_ctrl_enter_and_ctrl_s_submit() {
+        for code in [
+            crossterm::event::KeyCode::Enter,
+            crossterm::event::KeyCode::Char('s'),
+        ] {
+            let mut m = model_with_loaded_detail();
+            m.update(key(crossterm::event::KeyCode::Char('c')));
+            m.update(key(crossterm::event::KeyCode::Char('o')));
+            let effects = m.update(ctrl_key(code));
+            match effects.first() {
+                Some(Effect::Comment { pr, body }) => {
+                    assert_eq!(pr.number, 123);
+                    assert_eq!(body, "o");
+                }
+                _ => panic!("expected Comment effect"),
+            }
+            assert!(m.comment_editor.is_none());
+            assert!(m.loading);
+        }
+    }
+
+    #[test]
+    fn test_comment_empty_is_not_sent() {
+        let mut m = model_with_loaded_detail();
+        m.update(key(crossterm::event::KeyCode::Char('c')));
+        m.update(key(crossterm::event::KeyCode::Char(' ')));
+        let effects = m.update(ctrl_key(crossterm::event::KeyCode::Enter));
+        assert!(effects.is_empty());
+        assert!(m.comment_editor.is_some());
+    }
+
+    #[test]
+    fn test_comment_esc_keeps_draft_for_next_open() {
+        let mut m = model_with_loaded_detail();
+        m.update(key(crossterm::event::KeyCode::Char('c')));
+        m.update(key(crossterm::event::KeyCode::Char('あ')));
+        m.update(key(crossterm::event::KeyCode::Esc));
+        assert!(m.comment_editor.is_none());
+        m.update(key(crossterm::event::KeyCode::Char('c')));
+        assert_eq!(m.comment_editor.as_ref().unwrap().area.text(), "あ");
+    }
+
+    #[test]
+    fn test_comment_failure_keeps_draft_success_clears_it() {
+        let mut m = model_with_loaded_detail();
+        let pr = m.prs[0].clone();
+        m.loading = true;
+        m.update(Msg::CommentDone {
+            pr: pr.clone(),
+            body: "body".into(),
+            err: Some("boom".into()),
+        });
+        assert_eq!(
+            m.comment_drafts.get(&pr.url).map(String::as_str),
+            Some("body")
+        );
+        assert!(!m.loading);
+        m.update(Msg::CommentDone {
+            pr: pr.clone(),
+            body: "body".into(),
+            err: None,
+        });
+        assert!(!m.comment_drafts.contains_key(&pr.url));
+    }
+
+    #[test]
+    fn test_comment_popup_renders_and_places_cursor() {
+        for (w, h) in [(100u16, 30u16), (20, 8), (5, 3)] {
+            let mut m = model_with_loaded_detail();
+            m.update(Msg::Resize(w, h));
+            m.update(key(crossterm::event::KeyCode::Char('c')));
+            for ch in "日本語のコメントです。折り返しを確認する長めの文章。".chars()
+            {
+                m.update(key(crossterm::event::KeyCode::Char(ch)));
+            }
+            let backend = ratatui::backend::TestBackend::new(w, h);
+            let mut terminal = ratatui::Terminal::new(backend).unwrap();
+            terminal.draw(|f| render(&mut m, f)).unwrap();
+            let pos = terminal.get_cursor_position().unwrap();
+            assert!(pos.x < w && pos.y < h, "cursor {pos:?} outside {w}x{h}");
+        }
+    }
+
+    #[test]
+    fn test_comment_is_blocked_for_history_pr() {
+        let mut m = model_with_loaded_detail();
+        if let Some(d) = m.current_detail.as_mut() {
+            d.base.state = "MERGED".into();
+        }
+        m.update(key(crossterm::event::KeyCode::Char('c')));
+        assert!(m.comment_editor.is_none());
     }
 
     #[test]
