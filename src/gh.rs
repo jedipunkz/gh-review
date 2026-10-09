@@ -795,10 +795,46 @@ pub async fn approve_pr(g: &Gh, pr: &PullRequest) -> Result<()> {
     Ok(())
 }
 
+/// Submits a review with the COMMENT event. `--body=` keeps a body that
+/// starts with `-` from being parsed as a flag.
+pub async fn comment_pr(g: &Gh, pr: &PullRequest, body: &str) -> Result<()> {
+    let args = comment_args(pr, body);
+    g.run(&args).await?;
+    Ok(())
+}
+
+fn comment_args(pr: &PullRequest, body: &str) -> Vec<String> {
+    vec![
+        "pr".to_string(),
+        "review".to_string(),
+        pr.url.clone(),
+        "--comment".to_string(),
+        format!("--body={body}"),
+    ]
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::error::GhiError;
+
+    #[test]
+    fn test_comment_args() {
+        let pr = PullRequest {
+            url: "https://github.com/o/r/pull/1".into(),
+            ..Default::default()
+        };
+        assert_eq!(
+            comment_args(&pr, "-日本語\n2行目"),
+            vec![
+                "pr",
+                "review",
+                "https://github.com/o/r/pull/1",
+                "--comment",
+                "--body=-日本語\n2行目",
+            ]
+        );
+    }
 
     #[test]
     fn test_is_pr_diff_too_large_error() {

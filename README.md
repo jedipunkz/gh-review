@@ -70,6 +70,7 @@ author (case-insensitive substring). While editing:
 - `/`: edit the filter (see above)
 - `y`: copy the selected PR URL to the clipboard
 - `a`: open the approve confirmation popup; `y` approves, `c` or `esc` cancels
+- `c`: open the review comment popup (see below)
 - `r`: refresh the review list (and the `Merged` / `Closed` tab, see above)
 - `q` or `ctrl+c`: quit
 
@@ -82,6 +83,21 @@ headline diff, and the latest reviews.
 
 - `j` / `k`: scroll the detail
 - `pgup` / `pgdn`: page-scroll the detail
+
+## Review comment
+
+`c` opens a popup to write a review comment on the selected open PR. The text
+is sent with `gh pr review --comment`.
+
+- Type freely, including Japanese via your IME; `enter` inserts a newline
+- `ctrl+enter` or `ctrl+s` sends the comment
+- `esc` closes the popup; the unsent text is kept as a draft for that PR and
+  restored the next time you press `c` (a failed send also keeps the draft)
+
+`ctrl+enter` needs a terminal that supports the kitty keyboard protocol
+(kitty, WezTerm, Ghostty, foot, Alacritty, recent iTerm2 with the CSI u
+setting). On other terminals, such as macOS Terminal.app, `ctrl+enter` is
+indistinguishable from `enter`; use `ctrl+s` instead.
 
 ## Auto refresh
 
