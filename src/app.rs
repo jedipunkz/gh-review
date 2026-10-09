@@ -1,10 +1,11 @@
+use std::cell::RefCell;
 use std::collections::HashSet;
 use std::sync::Arc;
 
 use ratatui::layout::Rect;
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::symbols::border;
-use ratatui::text::{Line, Span};
+use ratatui::text::{Line, Span, Text};
 use ratatui::widgets::{Block, Clear, Padding, Paragraph, Wrap};
 use ratatui::Frame;
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
@@ -65,6 +66,22 @@ fn c(name: &str) -> Color {
 pub struct UpdateNotice {
     pub count: usize,
     pub id: u64,
+}
+
+pub struct DetailViewCache {
+    pub content_width: usize,
+    pub total: u16,
+    pub lines: Vec<Line<'static>>,
+    pub detail: PullRequestDetail,
+    pub diff: String,
+}
+
+pub struct MatchesCache {
+    pub search_value: String,
+    pub prs_version: u64,
+    pub approved_generation: u64,
+    pub indices: Vec<usize>,
+    pub counts: [usize; 2],
 }
 
 #[derive(Debug, Clone)]
@@ -146,6 +163,10 @@ pub struct Model {
     pub spinner_frame: usize,
     pub active_tab: usize,
     pub quit: bool,
+    pub prs_version: u64,
+    pub approved_generation: u64,
+    pub detail_view_cache: Option<DetailViewCache>,
+    pub matches_cache: RefCell<Option<MatchesCache>>,
 }
 
 impl Model {
@@ -182,6 +203,10 @@ impl Model {
             spinner_frame: 0,
             active_tab: TAB_AWAITING,
             quit: false,
+            prs_version: 0,
+            approved_generation: 0,
+            detail_view_cache: None,
+            matches_cache: RefCell::new(None),
         }
     }
 
@@ -214,35 +239,55 @@ impl Model {
     }
 
     pub fn matching_indices(&self) -> Vec<usize> {
-        let q = self.search_query();
-        let mut out = Vec::with_capacity(self.prs.len());
-        for (i, pr) in self.prs.iter().enumerate() {
-            if !self.pr_matches_tab(pr) {
-                continue;
-            }
-            if !pr_matches_query(pr, &q) {
-                continue;
-            }
-            out.push(i);
-        }
-        out
+        let (indices, _) = self.match_summary();
+        indices
+            .into_iter()
+            .filter(|&i| self.pr_matches_tab(&self.prs[i]))
+            .collect()
     }
 
     pub fn tab_counts(&self) -> (usize, usize) {
+        let (_, counts) = self.match_summary();
+        (counts[0], counts[1])
+    }
+
+    /// Query-matching PR indices (all tabs) plus [awaiting, reviewed] counts.
+    /// Memoized; invalidated by search value, PR list, or approve-state changes.
+    fn match_summary(&self) -> (Vec<usize>, [usize; 2]) {
+        {
+            let guard = self.matches_cache.borrow();
+            if let Some(c) = guard.as_ref() {
+                if c.search_value == self.search_value
+                    && c.prs_version == self.prs_version
+                    && c.approved_generation == self.approved_generation
+                {
+                    return (c.indices.clone(), c.counts);
+                }
+            }
+        }
         let q = self.search_query();
-        let mut awaiting = 0;
-        let mut reviewed = 0;
-        for pr in &self.prs {
+        let mut indices = Vec::with_capacity(self.prs.len());
+        let mut counts = [0usize; 2];
+        for (i, pr) in self.prs.iter().enumerate() {
             if !pr_matches_query(pr, &q) {
                 continue;
             }
             if self.is_reviewed(pr) {
-                reviewed += 1;
+                counts[1] += 1;
             } else {
-                awaiting += 1;
+                counts[0] += 1;
             }
+            indices.push(i);
         }
-        (awaiting, reviewed)
+        let out = (indices.clone(), counts);
+        *self.matches_cache.borrow_mut() = Some(MatchesCache {
+            search_value: self.search_value.clone(),
+            prs_version: self.prs_version,
+            approved_generation: self.approved_generation,
+            indices,
+            counts,
+        });
+        out
     }
 
     pub fn visible_pr_indices(&self) -> Vec<usize> {
@@ -436,6 +481,7 @@ impl Model {
         let prev_prs = std::mem::take(&mut self.prs);
         let prev_cursor = self.cursor;
         self.prs = prs;
+        self.prs_version += 1;
         self.pr_signature = pr_list_signature(&self.prs);
         self.pr_list_loaded = true;
         self.update_notice = None;
@@ -507,6 +553,7 @@ impl Model {
                 }
                 self.err = String::new();
                 self.approved.insert(pr.url.clone());
+                self.approved_generation += 1;
                 self.status = format!("approved {}", pr_label(&pr));
                 self.ensure_cursor_visible();
                 match self.refresh_detail_if_needed() {
@@ -597,6 +644,7 @@ impl Model {
         let prev_prs = std::mem::take(&mut self.prs);
         let prev_cursor = self.cursor;
         self.prs = prs;
+        self.prs_version += 1;
         self.pr_signature = current_sig;
         self.reconcile_cursor(&prev_prs, prev_cursor);
         self.ensure_cursor_visible();
@@ -1727,59 +1775,85 @@ fn render_detail_section(m: &mut Model, f: &mut Frame<'_>, rect: Rect, vp_h: u16
 
     let content_width = rect.width.saturating_sub(3).max(1) as usize;
 
-    let built = if m.detail_loading || !m.detail_err.is_empty() {
-        None
-    } else {
-        m.current_detail.as_ref().map(|detail| {
-            let lines = render_diff_content(detail, &m.current_diff, content_width);
-            let total: usize = lines
-                .iter()
-                .map(|l| {
-                    let lw = l.width();
-                    if lw == 0 {
-                        1
-                    } else {
-                        lw.div_ceil(content_width)
-                    }
-                })
-                .sum();
-            (lines, total.min(u16::MAX as usize) as u16)
-        })
-    };
+    let detail_ready = !m.detail_loading && m.detail_err.is_empty();
+    if detail_ready {
+        if let Some(detail) = m.current_detail.as_ref() {
+            // Rebuild the rendered detail only when its inputs changed; the
+            // per-frame cost is then just cloning the cached lines (the slow
+            // markdown parse / ANSI strip / style build runs once per change).
+            let fresh = m.detail_view_cache.as_ref().is_some_and(|c| {
+                c.content_width == content_width && c.detail == *detail && c.diff == m.current_diff
+            });
+            if !fresh {
+                let lines = render_diff_content(detail, &m.current_diff, content_width);
+                let total: usize = lines
+                    .iter()
+                    .map(|l| {
+                        let lw = l.width();
+                        if lw == 0 {
+                            1
+                        } else {
+                            lw.div_ceil(content_width)
+                        }
+                    })
+                    .sum();
+                m.detail_view_cache = Some(DetailViewCache {
+                    content_width,
+                    total: total.min(u16::MAX as usize) as u16,
+                    lines,
+                    detail: detail.clone(),
+                    diff: m.current_diff.clone(),
+                });
+            }
+        }
+    }
 
     let inner = block.inner(rect);
     f.render_widget(block, rect);
 
-    if let Some((lines, total)) = built {
+    if !detail_ready {
+        let lines: Vec<Line<'static>> = if m.detail_loading {
+            vec![Line::from(vec![
+                Span::styled(format!("{} ", m.spinner()), fg(colors::CYAN)),
+                Span::styled("loading detail...".to_string(), fg(colors::MUTED)),
+            ])]
+        } else if !m.detail_err.is_empty() {
+            vec![Line::from(Span::styled(
+                m.detail_err.clone(),
+                fg(colors::RED),
+            ))]
+        } else {
+            vec![Line::from(Span::styled(
+                "No detail loaded.".to_string(),
+                fg(colors::MUTED),
+            ))]
+        };
+        f.render_widget(Paragraph::new(lines), inner);
+        return;
+    }
+
+    let total = m.detail_view_cache.as_ref().map(|c| c.total);
+    let Some(cache) = m.detail_view_cache.as_ref() else {
+        f.render_widget(
+            Paragraph::new(vec![Line::from(Span::styled(
+                "No detail loaded.".to_string(),
+                fg(colors::MUTED),
+            ))]),
+            inner,
+        );
+        return;
+    };
+    if let Some(total) = total {
         m.detail_total = total;
         let max_scroll = total.saturating_sub(vp_h);
         if m.detail_scroll > max_scroll {
             m.detail_scroll = max_scroll;
         }
-        let para = Paragraph::new(lines)
-            .wrap(Wrap { trim: false })
-            .scroll((m.detail_scroll, 0));
-        f.render_widget(para, inner);
-        return;
     }
-
-    let lines: Vec<Line<'static>> = if m.detail_loading {
-        vec![Line::from(vec![
-            Span::styled(format!("{} ", m.spinner()), fg(colors::CYAN)),
-            Span::styled("loading detail...".to_string(), fg(colors::MUTED)),
-        ])]
-    } else if !m.detail_err.is_empty() {
-        vec![Line::from(Span::styled(
-            m.detail_err.clone(),
-            fg(colors::RED),
-        ))]
-    } else {
-        vec![Line::from(Span::styled(
-            "No detail loaded.".to_string(),
-            fg(colors::MUTED),
-        ))]
-    };
-    f.render_widget(Paragraph::new(lines), inner);
+    let para = Paragraph::new(Text::from(cache.lines.clone()))
+        .wrap(Wrap { trim: false })
+        .scroll((m.detail_scroll, 0));
+    f.render_widget(para, inner);
 }
 
 fn render_footer(m: &Model, w: usize) -> Paragraph<'static> {
@@ -2636,6 +2710,32 @@ mod tests {
             texts,
             vec!["hello", "waaaaaaaaa", "aaaaaytool", "ongword", "trailing"]
         );
+    }
+
+    #[test]
+    fn test_match_summary_recomputed_after_pr_list_update() {
+        let mut m = new_model();
+        m.prs = vec![pr("https://example.test/pr/1")];
+        assert_eq!(m.tab_counts(), (1, 0));
+
+        let mut updated = pr("https://example.test/pr/2");
+        updated.review_decision = "APPROVED".into();
+        m.update(Msg::PRList(Ok(vec![updated])));
+        assert_eq!(m.tab_counts(), (0, 1), "cached counts must be invalidated");
+        m.active_tab = TAB_REVIEWED;
+        assert_eq!(m.matching_indices(), vec![0]);
+    }
+
+    #[test]
+    fn test_match_summary_recomputed_after_approve() {
+        let mut m = model_with_mixed_review_state();
+        assert_eq!(m.tab_counts(), (2, 1));
+
+        m.update(Msg::ApproveDone {
+            pr: m.prs[0].clone(),
+            err: None,
+        });
+        assert_eq!(m.tab_counts(), (1, 2), "approve must refresh tab counts");
     }
 
     #[test]
