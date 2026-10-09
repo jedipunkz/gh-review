@@ -1275,6 +1275,7 @@ fn wrap_line_to_width(text: &str, width: usize) -> Vec<String> {
                 }
                 cur = chunk;
                 used = chunk_used;
+                continue;
             }
             if used == 0 {
                 cur.push_str(word);
@@ -2624,6 +2625,24 @@ mod tests {
         ] {
             assert!(joined.contains(want), "rendered detail missing {want}");
         }
+    }
+
+    #[test]
+    fn test_wrap_long_word_not_duplicated() {
+        let lines = render_markdown("hello waaaaaaaaaaaaaaytoolongword trailing", 10);
+        let texts: Vec<String> = lines
+            .iter()
+            .map(|l| {
+                l.spans
+                    .iter()
+                    .map(|s| s.content.to_string())
+                    .collect::<String>()
+            })
+            .collect();
+        assert_eq!(
+            texts,
+            vec!["hello", "waaaaaaaaa", "aaaaaytool", "ongword", "trailing"]
+        );
     }
 
     #[test]
