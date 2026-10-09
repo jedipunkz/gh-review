@@ -28,6 +28,15 @@ impl Runtime {
                     let _ = tx.send(Msg::PRList(result));
                 });
             }
+            Effect::LoadHistory { state } => {
+                let g2 = g.clone();
+                tokio::spawn(async move {
+                    let result = gh_review::gh::load_history(&g2, state)
+                        .await
+                        .map_err(|e| e.to_string());
+                    let _ = tx.send(Msg::HistoryList { state, result });
+                });
+            }
             Effect::CheckUpdates {
                 prev_sig,
                 prev_count,
