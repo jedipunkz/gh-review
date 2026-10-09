@@ -1179,7 +1179,16 @@ pub fn render_diff_content(
     lines.push(Line::from(""));
 
     lines.extend(highlight_diff(diff));
+
+    // Wrap every logical line to the content width up front. Paragraph would
+    // otherwise word-wrap long lines (diff hunks, code fences, long headers)
+    // with its own layout, whose row count the scroll-total estimate below
+    // cannot reproduce exactly; pre-wrapped lines are never re-wrapped, so
+    // one pre-wrapped line == one rendered row and the estimate stays exact.
     lines
+        .into_iter()
+        .flat_map(|line| wrap_line_spans(line, width))
+        .collect()
 }
 
 fn meta_pair(label: &str, value: &str) -> Vec<Span<'static>> {
@@ -1187,6 +1196,67 @@ fn meta_pair(label: &str, value: &str) -> Vec<Span<'static>> {
         Span::styled(format!("{label}:"), fg(colors::YELLOW)),
         Span::raw(format!(" {value}")),
     ]
+}
+
+/// Wraps a styled line to `width`, preserving span styles, so that every
+/// produced line is at most `width` columns wide. ratatui's `Paragraph` never
+/// re-wraps lines at or below the area width, which keeps the scroll-total
+/// estimate in render_detail_section exact.
+fn wrap_line_spans(line: Line<'static>, width: usize) -> Vec<Line<'static>> {
+    if width == 0 || line.width() <= width {
+        return vec![line];
+    }
+    let flat: Vec<(Style, char)> = line
+        .spans
+        .iter()
+        .flat_map(|s| s.content.chars().map(move |ch| (s.style, ch)))
+        .collect();
+    let mut out: Vec<Line<'static>> = Vec::new();
+    let mut idx = 0usize;
+    while idx < flat.len() {
+        let mut used = 0usize;
+        let mut last_space: Option<usize> = None;
+        let mut end = idx;
+        while end < flat.len() {
+            let cw = flat[end].1.width().unwrap_or(0);
+            if used + cw > width {
+                break;
+            }
+            if flat[end].1 == ' ' && end > idx {
+                last_space = Some(end);
+            }
+            used += cw;
+            end += 1;
+        }
+        let cut = if end >= flat.len() {
+            flat.len()
+        } else if end > idx {
+            match last_space {
+                Some(sp) if sp > idx => sp,
+                _ => end,
+            }
+        } else {
+            idx + 1
+        };
+        let mut spans: Vec<Span<'static>> = Vec::new();
+        let mut run_style: Option<Style> = None;
+        let mut run = String::new();
+        for (st, ch) in &flat[idx..cut] {
+            if run_style != Some(*st) {
+                if !run.is_empty() {
+                    spans.push(Span::styled(std::mem::take(&mut run), run_style.unwrap()));
+                }
+                run_style = Some(*st);
+            }
+            run.push(*ch);
+        }
+        if !run.is_empty() {
+            spans.push(Span::styled(run, run_style.unwrap()));
+        }
+        out.push(Line::from(spans));
+        idx = cut;
+    }
+    out
 }
 
 fn non_empty(s: &str, fallback: &str) -> String {
@@ -2736,6 +2806,97 @@ mod tests {
             err: None,
         });
         assert_eq!(m.tab_counts(), (1, 2), "approve must refresh tab counts");
+    }
+
+    #[test]
+    fn test_detail_scroll_estimate_matches_wrapped_rows() {
+        use ratatui::buffer::Buffer;
+        use ratatui::layout::Rect;
+        use ratatui::prelude::Widget;
+
+        fn wrapped_rows(text: &str, w: usize) -> usize {
+            let mut buf = Buffer::empty(Rect::new(0, 0, w as u16, 500));
+            Paragraph::new(text.to_string())
+                .wrap(Wrap { trim: false })
+                .render(Rect::new(0, 0, w as u16, 500), &mut buf);
+            let mut last = 1;
+            for y in 0..500 {
+                for x in 0..w {
+                    if buf[(x as u16, y as u16)].symbol() != " " {
+                        last = y + 1;
+                        break;
+                    }
+                }
+            }
+            last
+        }
+
+        let detail = PullRequestDetail {
+            base: pr("https://example.test/pr/1"),
+            ..Default::default()
+        };
+        // Prose-like removed lines are the worst case for word wrapping.
+        let diff = ["aaaaaa aaaaaa aaaaaa aaaaaa aaaaaa aaaaaa aaaaaa aaaaaaa"; 4].join("\n");
+        let width = 40usize;
+        let lines = render_diff_content(&detail, &diff, width);
+
+        let estimate: usize = lines
+            .iter()
+            .map(|l| {
+                let lw = l.width();
+                if lw == 0 {
+                    1
+                } else {
+                    lw.div_ceil(width)
+                }
+            })
+            .sum();
+
+        let actual: usize = lines
+            .iter()
+            .map(|l| {
+                let text: String = l
+                    .spans
+                    .iter()
+                    .map(|s| s.content.to_string())
+                    .collect::<String>();
+                if text.is_empty() {
+                    1
+                } else {
+                    wrapped_rows(&text, width)
+                }
+            })
+            .sum();
+
+        assert_eq!(estimate, actual, "scroll estimate must equal rendered rows");
+        // Also ensure every produced line fits the content width so Paragraph
+        // cannot re-wrap any of it.
+        for l in &lines {
+            assert!(l.width() <= width);
+        }
+    }
+
+    #[test]
+    fn test_wrap_line_spans_preserves_styles() {
+        let line = Line::from(vec![
+            Span::styled("Author:", fg(colors::YELLOW)),
+            Span::styled(" aaaaaaaa aaaaaaaa aaaaaaaa aaaaaaaa", fg(colors::FG)),
+        ]);
+        let width = 20usize;
+        let out = wrap_line_spans(line, width);
+        assert!(out.len() > 1);
+        for l in &out {
+            assert!(l.width() <= width);
+        }
+        let joined: String = out
+            .iter()
+            .flat_map(|l| {
+                l.spans
+                    .iter()
+                    .flat_map(|s| s.content.chars().collect::<Vec<char>>())
+            })
+            .collect();
+        assert!(joined.contains("Author:"));
     }
 
     #[test]
