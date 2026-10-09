@@ -10,7 +10,6 @@ waiting for your review, shows the diff in a TUI, and approves from the keyboard
 <p>
   <a href="https://github.com/jedipunkz/gh-review/actions/workflows/ci.yml"><img src="https://img.shields.io/github/actions/workflow/status/jedipunkz/gh-review/ci.yml?branch=main&label=ci&style=flat-square" alt="CI status"></a>
   <a href="https://github.com/jedipunkz/gh-review/releases/latest"><img src="https://img.shields.io/github/v/release/jedipunkz/gh-review?style=flat-square" alt="Latest release"></a>
-  <a href="https://github.com/jedipunkz/gh-review/releases"><img src="https://img.shields.io/github/downloads/jedipunkz/gh-review/total?style=flat-square" alt="Downloads"></a>
   <img src="https://img.shields.io/badge/built_with-Rust-dea584?style=flat-square&logo=rust" alt="Built with Rust">
 </p>
 
