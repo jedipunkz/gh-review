@@ -1,12 +1,65 @@
 name: release
 on:
+  workflow_dispatch:
+    inputs:
+      bump:
+        description: Version part to increment from the latest vX.Y.Z tag
+        type: choice
+        options:
+          - patch
+          - minor
+          - major
+        default: patch
   push:
     tags:
       - "v*"
 permissions:
   contents: write
+concurrency:
+  group: release
+  cancel-in-progress: false
 jobs:
+  prepare:
+    runs-on: ubuntu-latest
+    outputs:
+      tag: ${{ steps.tag.outputs.tag }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Determine tag
+        id: tag
+        env:
+          BUMP: ${{ inputs.bump }}
+        run: |
+          if [ "$GITHUB_EVENT_NAME" = "push" ]; then
+            tag="$GITHUB_REF_NAME"
+          else
+            if [ "$GITHUB_REF" != "refs/heads/main" ]; then
+              echo "release must be run from main (got $GITHUB_REF)" >&2
+              exit 1
+            fi
+            latest="$(git tag --list 'v*' --sort=-v:refname | awk '/^v[0-9]+\.[0-9]+\.[0-9]+$/ && !found { print; found = 1 }')"
+            tag="$(.github/scripts/next-version.sh "$latest" "$BUMP")"
+            echo "latest: ${latest:-<none>}, bump: $BUMP, next: $tag"
+          fi
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+        shell: bash
+      - name: Create release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ steps.tag.outputs.tag }}
+        run: |
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            echo "release $TAG already exists"
+          elif [ "$GITHUB_EVENT_NAME" = "push" ]; then
+            gh release create "$TAG" --verify-tag --generate-notes
+          else
+            gh release create "$TAG" --target "$GITHUB_SHA" --generate-notes
+          fi
+        shell: bash
   build:
+    needs: prepare
     strategy:
       matrix:
         include:
@@ -34,6 +87,8 @@ jobs:
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.prepare.outputs.tag }}
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: ${{ matrix.target }}
@@ -60,7 +115,7 @@ jobs:
       - name: Upload release asset
         env:
           GH_TOKEN: ${{ github.token }}
-          TAG: ${{ github.ref_name }}
+          TAG: ${{ needs.prepare.outputs.tag }}
         run: |
           if [ "$RUNNER_OS" = "Windows" ]; then
             gh release upload "$TAG" "gh-review-${{ matrix.asset-os }}-${{ matrix.asset-arch }}.exe" --clobber

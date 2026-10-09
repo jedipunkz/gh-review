@@ -111,3 +111,17 @@ While running, the extension re-checks your review requests every minute.
 cargo test      # unit tests
 cargo clippy    # lints
 ```
+
+## Release
+
+Run the `release` workflow from the Actions tab (or
+`gh workflow run release.yml -f bump=minor`) on `main` and pick `bump`:
+
+- `patch` (default): `v1.2.3` → `v1.2.4`
+- `minor`: `v1.2.3` → `v1.3.0`
+- `major`: `v1.2.3` → `v2.0.0`
+
+The next version is computed from the latest `vX.Y.Z` tag (`v0.0.0` when none
+exists). The workflow creates the tag and a GitHub release with generated
+notes, then attaches the built binaries. Pushing a `v*` tag by hand still
+works too.
