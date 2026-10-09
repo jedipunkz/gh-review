@@ -1423,6 +1423,14 @@ pub fn render_markdown(body: &str, width: usize) -> Vec<Line<'static>> {
     let mut in_code = false;
     let mut paragraph: Vec<String> = Vec::new();
 
+    // Structural context for lazy continuation lines (a non-blank, unmarked
+    // line following a list item or blockquote continues it, per markdown).
+    enum OpenBlock {
+        Item { prefix_w: usize, avail: usize },
+        Quote { marker: String },
+    }
+    let mut open: Option<OpenBlock> = None;
+
     let flush_paragraph = |lines: &mut Vec<Line<'static>>, para: &mut Vec<String>| {
         if para.is_empty() {
             return;
@@ -1434,10 +1442,15 @@ pub fn render_markdown(body: &str, width: usize) -> Vec<Line<'static>> {
         para.clear();
     };
 
+    // Leading whitespace width of the raw line (never negative when trailing
+    // whitespace is already trimmed away).
+    let leading_width = |raw: &str, t: &str| -> usize { raw.width().saturating_sub(t.width()) };
+
     for raw in body.lines() {
         let trimmed = raw.trim_end();
         if trimmed.trim_start().starts_with("```") || trimmed.trim_start().starts_with("~~~") {
             flush_paragraph(&mut lines, &mut paragraph);
+            open = None;
             in_code = !in_code;
             continue;
         }
@@ -1446,14 +1459,17 @@ pub fn render_markdown(body: &str, width: usize) -> Vec<Line<'static>> {
             continue;
         }
         let t = trimmed.trim_start();
+        let indent = leading_width(raw, t) / 2;
         if t.is_empty() {
             flush_paragraph(&mut lines, &mut paragraph);
+            open = None;
             continue;
         }
         if let Some(rest) = t.strip_prefix('#') {
             let level = rest.chars().take_while(|c| *c == '#').count();
             if (1..=6).contains(&level) {
                 flush_paragraph(&mut lines, &mut paragraph);
+                open = None;
                 let heading = rest[level..].trim();
                 let style = Style::new()
                     .fg(c(colors::BLUE))
@@ -1466,43 +1482,114 @@ pub fn render_markdown(body: &str, width: usize) -> Vec<Line<'static>> {
         }
         if t == "---" || t == "***" || t == "___" {
             flush_paragraph(&mut lines, &mut paragraph);
+            open = None;
             lines.push(Line::from(Span::styled(
                 "─".repeat(width.min(80)),
                 fg(colors::MUTED),
             )));
             continue;
         }
-        if t.starts_with("- ") || t.starts_with("* ") {
-            flush_paragraph(&mut lines, &mut paragraph);
-            let content = t
-                .strip_prefix("- ")
-                .or_else(|| t.strip_prefix("* "))
-                .unwrap_or(t);
-            let indent = width.min(2);
-            let avail = width.saturating_sub(indent + 2);
+
+        // Ordered list items: "1. ", "12) ", ...
+        let item = |lines: &mut Vec<Line<'static>>,
+                    marker: &str,
+                    content: &str,
+                    prefix_w: usize,
+                    avail: usize|
+         -> () {
             let mut first = true;
-            for l in wrap_line_to_width(content, avail.max(10)) {
-                let bullet = if first { "• " } else { "  " };
-                let pad = repeat_space(indent);
+            for l in wrap_line_to_width(content, avail) {
+                let prefix = if first {
+                    format!("{}{marker} ", repeat_space(indent * 2))
+                } else {
+                    repeat_space(prefix_w)
+                };
                 lines.push(Line::from(vec![
-                    Span::styled(format!("{pad}{bullet}"), fg(colors::CYAN)),
+                    Span::styled(prefix, fg(colors::CYAN)),
                     Span::styled(l, fg(colors::FG)),
                 ]));
                 first = false;
             }
+        };
+
+        let digits = t.chars().take_while(|c| c.is_ascii_digit()).count();
+        let ordered = if (1..=4).contains(&digits)
+            && t[digits..].starts_with(['.', ')'])
+            && t[digits + 1..].starts_with(' ')
+        {
+            Some(&t[..digits + 1])
+        } else {
+            None
+        };
+        if let Some(marker) = ordered {
+            flush_paragraph(&mut lines, &mut paragraph);
+            let content = t[digits + 2..].to_string();
+            let prefix_w = indent * 2 + marker.width() + 1;
+            let avail = width.saturating_sub(prefix_w).max(10);
+            item(&mut lines, marker, &content, prefix_w, avail);
+            open = Some(OpenBlock::Item { prefix_w, avail });
             continue;
         }
-        if t.starts_with("> ") {
+
+        if t.starts_with("- ") || t.starts_with("* ") || t.starts_with("+ ") {
             flush_paragraph(&mut lines, &mut paragraph);
-            let content = t.strip_prefix("> ").unwrap_or(t);
-            for l in wrap_line_to_width(content, width.saturating_sub(2).max(10)) {
+            let content = t[2..].to_string();
+            let prefix_w = indent * 2 + 2;
+            let avail = width.saturating_sub(prefix_w).max(10);
+            item(&mut lines, "•", &content, prefix_w, avail);
+            open = Some(OpenBlock::Item { prefix_w, avail });
+            continue;
+        }
+
+        // Blockquotes; repeated "> " markers nest.
+        if t.starts_with('>') {
+            flush_paragraph(&mut lines, &mut paragraph);
+            let mut level = 0usize;
+            let mut rest = t;
+            while let Some(r) = rest.strip_prefix('>') {
+                level += 1;
+                rest = r.strip_prefix(' ').unwrap_or(r);
+            }
+            let marker = "│ ".repeat(level);
+            let prefix_w = marker.width();
+            let avail = width.saturating_sub(prefix_w).max(10);
+            for l in wrap_line_to_width(rest, avail) {
                 lines.push(Line::from(vec![
-                    Span::styled("│ ".to_string(), fg(colors::MUTED)),
+                    Span::styled(marker.clone(), fg(colors::MUTED)),
                     Span::styled(l, fg(colors::MUTED)),
                 ]));
             }
+            open = Some(OpenBlock::Quote {
+                marker: marker.clone(),
+            });
             continue;
         }
+
+        // Lazy continuation of an open list item or blockquote.
+        match &open {
+            Some(OpenBlock::Item { prefix_w, avail }) => {
+                let (prefix_w, avail) = (*prefix_w, *avail);
+                for l in wrap_line_to_width(t, avail) {
+                    lines.push(Line::from(vec![
+                        Span::styled(repeat_space(prefix_w), Style::new()),
+                        Span::styled(l, fg(colors::FG)),
+                    ]));
+                }
+                continue;
+            }
+            Some(OpenBlock::Quote { marker }) => {
+                let avail = width.saturating_sub(marker.width()).max(10);
+                for l in wrap_line_to_width(t, avail) {
+                    lines.push(Line::from(vec![
+                        Span::styled(marker.clone(), fg(colors::MUTED)),
+                        Span::styled(l, fg(colors::MUTED)),
+                    ]));
+                }
+                continue;
+            }
+            None => {}
+        }
+
         paragraph.push(t.to_string());
     }
     if in_code {
@@ -2977,6 +3064,66 @@ mod tests {
                 );
             }
         }
+    }
+
+    fn flatten(l: &Line<'static>) -> String {
+        l.spans.iter().map(|s| s.content.to_string()).collect()
+    }
+
+    #[test]
+    fn test_render_markdown_ordered_list_items() {
+        let lines = render_markdown("1. first\n2. second\n10) third", 40);
+        let text: Vec<String> = lines.iter().map(flatten).collect();
+        assert!(text.iter().any(|t| t.contains("first")), "{text:?}");
+        assert!(text
+            .iter()
+            .any(|t| t.starts_with("2. ") && t.contains("second")));
+        assert!(text
+            .iter()
+            .any(|t| t.starts_with("10) ") && t.contains("third")));
+        // Items stay on separate lines instead of merging into one paragraph.
+        assert!(
+            !text
+                .iter()
+                .any(|t| t.contains("first") && t.contains("second")),
+            "items must not join: {text:?}"
+        );
+    }
+
+    #[test]
+    fn test_render_markdown_list_continuation_indents_under_item() {
+        // Indented item: bullet at 2 cols, content at 4; continuation aligns.
+        let lines = render_markdown("  - item\n  indented tail\n- next", 40);
+        let text: Vec<String> = lines.iter().map(flatten).collect();
+        assert!(text
+            .iter()
+            .any(|t| t.starts_with("  • ") && t.contains("item")));
+        let cont = text.iter().find(|t| t.contains("indented tail")).unwrap();
+        assert!(
+            cont.starts_with("    "),
+            "continuation must align under item content: {cont:?}"
+        );
+    }
+
+    #[test]
+    fn test_render_markdown_nested_quote_and_bullet() {
+        let lines = render_markdown("> outer\n> > inner\n  - inner bullet", 40);
+        let text: Vec<String> = lines.iter().map(flatten).collect();
+        assert!(
+            text.iter()
+                .any(|t| t.starts_with("│ │ ") && t.contains("inner")),
+            "nested quote must repeat the marker: {text:?}"
+        );
+        assert!(
+            text.iter()
+                .any(|t| t.starts_with("│ ") && !t.starts_with("│ │ ")),
+            "outer quote must render a single marker: {text:?}"
+        );
+        assert!(
+            text.iter()
+                .any(|t| t.starts_with("  • ") && t.contains("inner bullet")),
+            "nested bullet must indent one level: {text:?}"
+        );
     }
 
     #[test]
