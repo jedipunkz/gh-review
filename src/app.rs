@@ -13,7 +13,7 @@ use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 #[allow(unused_imports)]
 use crate::cache::CacheEntry;
 use crate::cache::DetailCache;
-use crate::gh::{self, PullRequest, PullRequestDetail};
+use crate::gh::{self, HistoryState, PullRequest, PullRequestDetail};
 use crate::prefetch::{neighbor_prs, top_n, Prefetcher};
 
 pub const MAX_LIST_ITEMS: usize = 10;
@@ -89,7 +89,7 @@ pub struct MatchesCache {
 #[derive(Debug, Clone)]
 pub enum Effect {
     LoadPRs,
-    LoadHistory,
+    LoadHistory { state: HistoryState },
     CheckUpdates { prev_sig: String, prev_count: usize },
     LoadDiff { pr: PullRequest },
     Debounce { seq: u64, url: String },
@@ -104,7 +104,10 @@ pub enum Msg {
     Key(crossterm::event::KeyEvent),
     Resize(u16, u16),
     PRList(Result<Vec<PullRequest>, String>),
-    HistoryList(Result<Vec<PullRequest>, String>),
+    HistoryList {
+        state: HistoryState,
+        result: Result<Vec<PullRequest>, String>,
+    },
     DiffDone(Box<DiffDoneMsg>),
     ApproveDone {
         pr: PullRequest,
@@ -166,8 +169,11 @@ pub struct Model {
     pub search_cursor: usize,
     pub spinner_frame: usize,
     pub active_tab: usize,
-    pub history_loading: bool,
-    pub history_loaded: bool,
+    /// Per-tab fetch state of the Merged / Closed tabs, indexed by TAB_*.
+    /// These tabs are fetched on first visit, and again on visit after `r`.
+    pub history_loading: [bool; TAB_COUNT],
+    pub history_loaded: [bool; TAB_COUNT],
+    pub history_stale: [bool; TAB_COUNT],
     pub quit: bool,
     pub prs_version: u64,
     pub approved_generation: u64,
@@ -208,8 +214,9 @@ impl Model {
             search_cursor: 0,
             spinner_frame: 0,
             active_tab: TAB_AWAITING,
-            history_loading: false,
-            history_loaded: false,
+            history_loading: [false; TAB_COUNT],
+            history_loaded: [false; TAB_COUNT],
+            history_stale: [false; TAB_COUNT],
             quit: false,
             prs_version: 0,
             approved_generation: 0,
@@ -218,10 +225,20 @@ impl Model {
         }
     }
 
-    /// Effects to run once at startup.
-    pub fn initial_effects(&mut self) -> Vec<Effect> {
-        self.history_loading = true;
-        vec![Effect::LoadPRs, Effect::LoadHistory]
+    pub fn any_history_loading(&self) -> bool {
+        self.history_loading.iter().any(|&b| b)
+    }
+
+    /// Starts fetching the active tab when it is a Merged / Closed tab that
+    /// has not been fetched yet (or was marked stale by `r`).
+    fn load_active_history_tab(&mut self) -> Option<Effect> {
+        let tab = self.active_tab;
+        let state = history_state_of_tab(tab)?;
+        if self.history_loading[tab] || (self.history_loaded[tab] && !self.history_stale[tab]) {
+            return None;
+        }
+        self.history_loading[tab] = true;
+        Some(Effect::LoadHistory { state })
     }
 
     pub fn spinner(&self) -> &'static str {
@@ -509,14 +526,19 @@ impl Model {
         effects
     }
 
-    /// Moves the cursor to the first PR of the active tab when it points into
-    /// the other list (open vs merged/closed), e.g. after the first load.
+    /// Moves the cursor to the first PR of the active tab when it points
+    /// outside the tab, unless both are open-PR tabs (awaiting / reviewed),
+    /// where ensure_cursor_visible keeps the nearest position instead.
     fn snap_cursor_into_tab_group(&mut self) {
         if self.cursor >= self.prs.len() {
             return;
         }
-        let tab_is_history = self.active_tab == TAB_MERGED || self.active_tab == TAB_CLOSED;
-        if is_history(&self.prs[self.cursor]) == tab_is_history {
+        let pr = &self.prs[self.cursor];
+        if self.tab_of(pr) == self.active_tab {
+            return;
+        }
+        let tab_is_history = history_state_of_tab(self.active_tab).is_some();
+        if !is_history(pr) && !tab_is_history {
             return;
         }
         if let Some(&first) = self.matching_indices().first() {
@@ -553,9 +575,15 @@ impl Model {
         effects
     }
 
-    pub fn apply_history_list(&mut self, history: Vec<PullRequest>) -> Vec<Effect> {
-        self.history_loading = false;
-        self.history_loaded = true;
+    pub fn apply_history_list(
+        &mut self,
+        state: HistoryState,
+        fetched: Vec<PullRequest>,
+    ) -> Vec<Effect> {
+        let tab = tab_of_history_state(state);
+        self.history_loading[tab] = false;
+        self.history_loaded[tab] = true;
+        self.history_stale[tab] = false;
         let prev_prs = std::mem::take(&mut self.prs);
         let prev_cursor = self.cursor;
         let open: Vec<PullRequest> = prev_prs
@@ -563,7 +591,13 @@ impl Model {
             .filter(|p| !is_history(p))
             .cloned()
             .collect();
-        let history: Vec<PullRequest> = history.into_iter().filter(is_history).collect();
+        // Keep the other history tab's PRs; replace only this state's.
+        let mut history: Vec<PullRequest> = prev_prs
+            .iter()
+            .filter(|p| is_history(p) && p.state != state.pr_state())
+            .cloned()
+            .collect();
+        history.extend(fetched.into_iter().filter(|p| p.state == state.pr_state()));
         self.prs = combine_pr_lists(open, history);
         self.prs_version += 1;
         self.prune_marked_prs();
@@ -609,14 +643,14 @@ impl Model {
                 }
                 Ok(prs) => self.apply_pr_list(prs),
             },
-            Msg::HistoryList(result) => match result {
+            Msg::HistoryList { state, result } => match result {
                 Err(e) => {
-                    self.history_loading = false;
+                    self.history_loading[tab_of_history_state(state)] = false;
                     self.err = e;
-                    self.status = "failed to load merged/closed PRs".to_string();
+                    self.status = format!("failed to load {} PRs", state.pr_state().to_lowercase());
                     Vec::new()
                 }
-                Ok(prs) => self.apply_history_list(prs),
+                Ok(prs) => self.apply_history_list(state, prs),
             },
             Msg::DiffDone(boxed) => {
                 let DiffDoneMsg { pr, result } = *boxed;
@@ -704,7 +738,7 @@ impl Model {
                 vec![Effect::LoadDiff { pr }]
             }
             Msg::SpinnerTick => {
-                if self.loading || self.detail_loading || self.history_loading {
+                if self.loading || self.detail_loading || self.any_history_loading() {
                     self.spinner_frame = self.spinner_frame.wrapping_add(1);
                 }
                 Vec::new()
@@ -798,11 +832,15 @@ impl Model {
                 self.loading = true;
                 self.status = "refreshing...".to_string();
                 self.err = String::new();
-                let mut effects = vec![Effect::LoadPRs];
-                if !self.history_loading {
-                    self.history_loading = true;
-                    effects.push(Effect::LoadHistory);
+                // Merged / Closed refetch on their next visit; the active
+                // one refetches now.
+                for tab in [TAB_MERGED, TAB_CLOSED] {
+                    if self.history_loaded[tab] {
+                        self.history_stale[tab] = true;
+                    }
                 }
+                let mut effects = vec![Effect::LoadPRs];
+                effects.extend(self.load_active_history_tab());
                 effects
             }
             crossterm::event::KeyCode::Char('n') if ctrl => {
@@ -1060,14 +1098,18 @@ impl Model {
         }
         self.active_tab = next as usize;
         self.list_offset = 0;
+        let load = self.load_active_history_tab();
         let matched = self.matching_indices();
-        if matched.is_empty() {
+        let mut effects = if matched.is_empty() {
             self.clear_detail();
-            return Vec::new();
-        }
-        self.cursor = matched[0];
-        self.ensure_cursor_visible();
-        self.detail_and_prefetch_effects()
+            Vec::new()
+        } else {
+            self.cursor = matched[0];
+            self.ensure_cursor_visible();
+            self.detail_and_prefetch_effects()
+        };
+        effects.extend(load);
+        effects
     }
 
     pub fn approve_label(&self, pr: &PullRequest) -> &'static str {
@@ -1087,9 +1129,8 @@ impl Model {
         }
         match self.active_tab {
             TAB_REVIEWED => "No reviewed PRs.",
-            TAB_MERGED | TAB_CLOSED if self.history_loading && !self.history_loaded => {
-                "Loading merged / closed PRs..."
-            }
+            TAB_MERGED if !self.history_loaded[TAB_MERGED] => "Loading merged PRs...",
+            TAB_CLOSED if !self.history_loaded[TAB_CLOSED] => "Loading closed PRs...",
             TAB_MERGED => "No merged PRs.",
             TAB_CLOSED => "No closed PRs.",
             _ => "No PRs awaiting your review.",
@@ -1104,6 +1145,21 @@ impl Model {
 
     pub fn search_visible(&self) -> bool {
         self.search_active || !self.search_value.is_empty()
+    }
+}
+
+fn history_state_of_tab(tab: usize) -> Option<HistoryState> {
+    match tab {
+        TAB_MERGED => Some(HistoryState::Merged),
+        TAB_CLOSED => Some(HistoryState::Closed),
+        _ => None,
+    }
+}
+
+fn tab_of_history_state(state: HistoryState) -> usize {
+    match state {
+        HistoryState::Merged => TAB_MERGED,
+        HistoryState::Closed => TAB_CLOSED,
     }
 }
 
@@ -1810,18 +1866,21 @@ fn render_search_line(m: &Model) -> Paragraph<'static> {
 
 fn render_tab_bar(m: &Model) -> Paragraph<'static> {
     let counts = m.tab_counts();
-    let history_count = |n: usize| {
-        if m.history_loading && !m.history_loaded {
-            "…".to_string()
+    // Merged / Closed: no count until first visit, "…" while fetching.
+    let history_label = |name: &str, tab: usize| {
+        if m.history_loading[tab] {
+            format!("{name} …")
+        } else if m.history_loaded[tab] {
+            format!("{name} {}", counts[tab])
         } else {
-            n.to_string()
+            name.to_string()
         }
     };
     let labels = [
         format!("Awaiting Review {}", counts[TAB_AWAITING]),
         format!("Reviewed {}", counts[TAB_REVIEWED]),
-        format!("Merged {}", history_count(counts[TAB_MERGED])),
-        format!("Closed {}", history_count(counts[TAB_CLOSED])),
+        history_label("Merged", TAB_MERGED),
+        history_label("Closed", TAB_CLOSED),
     ];
     let mut spans = vec![Span::raw(" ")];
     for (i, label) in labels.iter().enumerate() {
@@ -2227,7 +2286,7 @@ fn render_footer_status(m: &Model) -> Vec<Span<'static>> {
         " ".to_string(),
         Style::new().bg(c(colors::BAR_BG)),
     )];
-    if m.loading || m.detail_loading || m.history_loading {
+    if m.loading || m.detail_loading || m.any_history_loading() {
         spans.push(Span::styled(
             format!("{} ", m.spinner()),
             Style::new().fg(c(colors::CYAN)).bg(c(colors::BAR_BG)),
@@ -2908,40 +2967,136 @@ mod tests {
         }
     }
 
+    fn history_msg(state: HistoryState, prs: Vec<PullRequest>) -> Msg {
+        Msg::HistoryList {
+            state,
+            result: Ok(prs),
+        }
+    }
+
+    fn has_load_history(effects: &[Effect], want: HistoryState) -> bool {
+        effects
+            .iter()
+            .any(|e| matches!(e, Effect::LoadHistory { state } if *state == want))
+    }
+
     #[test]
     fn test_history_prs_go_to_merged_and_closed_tabs() {
         let mut m = model_with_mixed_review_state();
-        m.update(Msg::HistoryList(Ok(vec![
-            history_pr("https://example.test/pr/10", "MERGED"),
-            history_pr("https://example.test/pr/11", "CLOSED"),
-            history_pr("https://example.test/pr/12", "MERGED"),
-        ])));
-        assert!(m.history_loaded);
+        m.update(history_msg(
+            HistoryState::Merged,
+            vec![
+                history_pr("https://example.test/pr/10", "MERGED"),
+                history_pr("https://example.test/pr/12", "MERGED"),
+            ],
+        ));
+        m.update(history_msg(
+            HistoryState::Closed,
+            vec![history_pr("https://example.test/pr/11", "CLOSED")],
+        ));
+        assert!(m.history_loaded[TAB_MERGED] && m.history_loaded[TAB_CLOSED]);
         assert_eq!(m.tab_counts(), [2, 1, 2, 1]);
         m.active_tab = TAB_MERGED;
-        assert_eq!(m.matching_indices(), vec![3, 5]);
+        assert_eq!(m.matching_indices(), vec![3, 4]);
         m.active_tab = TAB_CLOSED;
-        assert_eq!(m.matching_indices(), vec![4]);
+        assert_eq!(m.matching_indices(), vec![5]);
+    }
+
+    #[test]
+    fn test_history_list_replaces_only_its_state() {
+        let mut m = model_with_mixed_review_state();
+        m.update(history_msg(
+            HistoryState::Closed,
+            vec![history_pr("https://example.test/pr/11", "CLOSED")],
+        ));
+        m.update(history_msg(
+            HistoryState::Merged,
+            vec![history_pr("https://example.test/pr/10", "MERGED")],
+        ));
+        m.update(history_msg(
+            HistoryState::Merged,
+            vec![
+                history_pr("https://example.test/pr/12", "MERGED"),
+                history_pr("https://example.test/pr/13", "CLOSED"),
+            ],
+        ));
+        assert_eq!(m.tab_counts(), [2, 1, 1, 1]);
+        assert!(index_of_pr_url(&m.prs, "https://example.test/pr/10").is_none());
+        assert!(index_of_pr_url(&m.prs, "https://example.test/pr/13").is_none());
     }
 
     #[test]
     fn test_history_list_ignores_open_prs_and_duplicates() {
         let mut m = model_with_mixed_review_state();
-        m.update(Msg::HistoryList(Ok(vec![
-            history_pr("https://example.test/pr/10", "OPEN"),
-            history_pr("https://example.test/pr/1", "MERGED"),
-        ])));
+        m.update(history_msg(
+            HistoryState::Merged,
+            vec![
+                history_pr("https://example.test/pr/10", "OPEN"),
+                history_pr("https://example.test/pr/1", "MERGED"),
+            ],
+        ));
         assert_eq!(m.prs.len(), 3, "open PRs win over stale history entries");
         assert_eq!(m.tab_counts(), [2, 1, 0, 0]);
     }
 
     #[test]
+    fn test_history_is_not_loaded_until_tab_is_visited() {
+        let mut m = model_with_mixed_review_state();
+        let effects = m.switch_tab(1);
+        assert!(!effects
+            .iter()
+            .any(|e| matches!(e, Effect::LoadHistory { .. })));
+
+        let effects = m.switch_tab(1);
+        assert_eq!(m.active_tab, TAB_MERGED);
+        assert!(has_load_history(&effects, HistoryState::Merged));
+        assert!(!has_load_history(&effects, HistoryState::Closed));
+        assert!(m.history_loading[TAB_MERGED]);
+        assert_eq!(m.empty_list_message(), "Loading merged PRs...");
+
+        let effects = m.switch_tab(1);
+        assert_eq!(m.active_tab, TAB_CLOSED);
+        assert!(has_load_history(&effects, HistoryState::Closed));
+    }
+
+    #[test]
+    fn test_history_tab_is_fetched_once() {
+        let mut m = model_with_mixed_review_state();
+        m.active_tab = TAB_REVIEWED;
+        m.switch_tab(1);
+        m.update(history_msg(
+            HistoryState::Merged,
+            vec![history_pr("https://example.test/pr/10", "MERGED")],
+        ));
+        assert_eq!(m.cursor, 3, "cursor = first merged PR after load");
+        m.switch_tab(-1);
+        let effects = m.switch_tab(1);
+        assert!(!has_load_history(&effects, HistoryState::Merged));
+    }
+
+    #[test]
+    fn test_history_tab_retries_after_error() {
+        let mut m = model_with_mixed_review_state();
+        m.active_tab = TAB_REVIEWED;
+        m.switch_tab(1);
+        m.update(Msg::HistoryList {
+            state: HistoryState::Merged,
+            result: Err("boom".into()),
+        });
+        assert!(!m.history_loading[TAB_MERGED]);
+        assert_eq!(m.status, "failed to load merged PRs");
+        m.switch_tab(-1);
+        let effects = m.switch_tab(1);
+        assert!(has_load_history(&effects, HistoryState::Merged));
+    }
+
+    #[test]
     fn test_pr_list_reload_keeps_history() {
         let mut m = model_with_mixed_review_state();
-        m.update(Msg::HistoryList(Ok(vec![history_pr(
-            "https://example.test/pr/10",
-            "MERGED",
-        )])));
+        m.update(history_msg(
+            HistoryState::Merged,
+            vec![history_pr("https://example.test/pr/10", "MERGED")],
+        ));
         m.update(Msg::PRList(Ok(vec![pr("https://example.test/pr/1")])));
         assert_eq!(m.tab_counts(), [1, 0, 1, 0]);
         assert_eq!(m.status, "1 review request(s)");
@@ -2954,10 +3109,10 @@ mod tests {
         let prs = sig_prs(&[("https://example.test/pr/1", 1747200000)]);
         m.prs = prs.clone();
         m.pr_signature = pr_list_signature(&prs);
-        m.update(Msg::HistoryList(Ok(vec![history_pr(
-            "https://example.test/pr/10",
-            "MERGED",
-        )])));
+        m.update(history_msg(
+            HistoryState::Merged,
+            vec![history_pr("https://example.test/pr/10", "MERGED")],
+        ));
 
         let mut new_prs = prs.clone();
         new_prs.push(pr("https://example.test/pr/2"));
@@ -2975,10 +3130,10 @@ mod tests {
     fn test_first_history_load_does_not_move_cursor_off_open_tab() {
         let mut m = new_model();
         m.loading = false;
-        m.update(Msg::HistoryList(Ok(vec![history_pr(
-            "https://example.test/pr/10",
-            "MERGED",
-        )])));
+        m.update(history_msg(
+            HistoryState::Merged,
+            vec![history_pr("https://example.test/pr/10", "MERGED")],
+        ));
         m.update(Msg::PRList(Ok(vec![
             pr("https://example.test/pr/1"),
             pr("https://example.test/pr/2"),
@@ -3000,7 +3155,6 @@ mod tests {
     #[test]
     fn test_tab_bar_shows_merged_and_closed() {
         let mut m = model_with_mixed_review_state();
-        m.history_loading = true;
         let text = |m: &Model| -> String {
             let backend = ratatui::backend::TestBackend::new(80, 1);
             let mut term = ratatui::Terminal::new(backend).unwrap();
@@ -3009,26 +3163,48 @@ mod tests {
             let buf = term.backend().buffer().clone();
             buf.content().iter().map(|c| c.symbol()).collect()
         };
+        let got = text(&m);
+        assert!(got.contains(" Merged   Closed "), "{got}");
+        m.history_loading[TAB_MERGED] = true;
         assert!(text(&m).contains(" Merged … "));
-        m.update(Msg::HistoryList(Ok(vec![history_pr(
-            "https://example.test/pr/10",
-            "CLOSED",
-        )])));
+        m.update(history_msg(
+            HistoryState::Closed,
+            vec![history_pr("https://example.test/pr/10", "CLOSED")],
+        ));
         let got = text(&m);
         assert!(got.contains(" Awaiting Review 2 "), "{got}");
         assert!(got.contains(" Reviewed 1 "), "{got}");
-        assert!(got.contains(" Merged 0 "), "{got}");
+        assert!(got.contains(" Merged … "), "{got}");
         assert!(got.contains(" Closed 1 "), "{got}");
     }
 
     #[test]
-    fn test_refresh_reloads_history() {
+    fn test_refresh_reloads_active_history_tab_and_marks_other_stale() {
+        let mut m = model_with_mixed_review_state();
+        m.update(history_msg(HistoryState::Merged, Vec::new()));
+        m.update(history_msg(HistoryState::Closed, Vec::new()));
+        m.active_tab = TAB_MERGED;
+
+        let effects = m.update(key(crossterm::event::KeyCode::Char('r')));
+        assert!(effects.iter().any(|e| matches!(e, Effect::LoadPRs)));
+        assert!(has_load_history(&effects, HistoryState::Merged));
+        assert!(!has_load_history(&effects, HistoryState::Closed));
+        assert!(m.history_stale[TAB_CLOSED]);
+
+        m.update(Msg::PRList(Ok(m.open_prs())));
+        let effects = m.switch_tab(1);
+        assert!(has_load_history(&effects, HistoryState::Closed));
+    }
+
+    #[test]
+    fn test_refresh_on_open_tab_does_not_fetch_history() {
         let mut m = new_model();
         m.loading = false;
         let effects = m.update(key(crossterm::event::KeyCode::Char('r')));
         assert!(effects.iter().any(|e| matches!(e, Effect::LoadPRs)));
-        assert!(effects.iter().any(|e| matches!(e, Effect::LoadHistory)));
-        assert!(m.history_loading);
+        assert!(!effects
+            .iter()
+            .any(|e| matches!(e, Effect::LoadHistory { .. })));
     }
 
     #[test]

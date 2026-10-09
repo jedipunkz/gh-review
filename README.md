@@ -47,9 +47,11 @@ or after you approve it from this TUI during the current session.
 
 `Merged` and `Closed` list merged PRs and closed-but-unmerged PRs that you
 reviewed (`reviewed-by:@me`) or that request review from you or your teams.
-Each search fetches only the 100 most recently updated PRs. These tabs load at
-startup and on `r`; the per-minute auto refresh does not re-check them. Merged
-and closed PRs cannot be approved.
+Each search fetches only the 100 most recently updated PRs. Each of these tabs
+is fetched the first time you switch to it (the tab label shows no count until
+then). `r` refetches the active one and makes the other refetch on its next
+visit; the per-minute auto refresh does not re-check them. Merged and closed
+PRs cannot be approved.
 
 Press `/` to edit a filter. The filter matches repository name, PR title, and
 author (case-insensitive substring). While editing:
@@ -68,7 +70,7 @@ author (case-insensitive substring). While editing:
 - `/`: edit the filter (see above)
 - `y`: copy the selected PR URL to the clipboard
 - `a`: open the approve confirmation popup; `y` approves, `c` or `esc` cancels
-- `r`: refresh the review list and the merged / closed PRs
+- `r`: refresh the review list (and the `Merged` / `Closed` tab, see above)
 - `q` or `ctrl+c`: quit
 
 Key presses also dismiss the update notice popup when it is shown.

@@ -506,9 +506,34 @@ pub async fn load_review_requests(g: &Gh) -> Result<Vec<PullRequest>> {
 /// One page = the 100 most recently updated PRs.
 pub const HISTORY_MAX_PAGES: usize = 1;
 
-/// Merged and closed (unmerged) PRs that you reviewed, or that requested
+/// PR state shown in a history tab.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HistoryState {
+    Merged,
+    Closed,
+}
+
+impl HistoryState {
+    /// Search qualifier selecting PRs in this state.
+    pub fn qualifier(self) -> &'static str {
+        match self {
+            HistoryState::Merged => "is:merged",
+            HistoryState::Closed => "is:closed is:unmerged",
+        }
+    }
+
+    /// Value of `PullRequest::state` for PRs in this state.
+    pub fn pr_state(self) -> &'static str {
+        match self {
+            HistoryState::Merged => "MERGED",
+            HistoryState::Closed => "CLOSED",
+        }
+    }
+}
+
+/// Merged or closed (unmerged) PRs that you reviewed, or that requested
 /// review from you or your teams.
-pub async fn load_history(g: &Gh) -> Result<Vec<PullRequest>> {
+pub async fn load_history(g: &Gh, state: HistoryState) -> Result<Vec<PullRequest>> {
     let mut who: Vec<(String, String)> = vec![
         ("@me".to_string(), "reviewed-by:@me".to_string()),
         ("@me".to_string(), "review-requested:@me".to_string()),
@@ -519,21 +544,20 @@ pub async fn load_history(g: &Gh) -> Result<Vec<PullRequest>> {
         }
     }
 
-    let mut queries: Vec<(String, String)> = Vec::new();
-    for state in history_state_qualifiers() {
-        for (label, qualifier) in &who {
-            queries.push((
-                label.clone(),
-                format!("is:pr {state} archived:false {qualifier} sort:updated-desc"),
-            ));
-        }
-    }
+    let queries: Vec<(String, String)> = who
+        .into_iter()
+        .map(|(label, qualifier)| {
+            (
+                label,
+                format!(
+                    "is:pr {} archived:false {qualifier} sort:updated-desc",
+                    state.qualifier()
+                ),
+            )
+        })
+        .collect();
 
     search_prs_merged(g, queries, Some(HISTORY_MAX_PAGES)).await
-}
-
-pub fn history_state_qualifiers() -> [&'static str; 2] {
-    ["is:merged", "is:closed is:unmerged"]
 }
 
 fn team_names(teams: &[Team]) -> Vec<String> {
