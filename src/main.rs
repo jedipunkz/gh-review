@@ -173,6 +173,10 @@ fn spawn_key_reader(tx: mpsc::UnboundedSender<Msg>) {
 }
 
 fn run() -> Result<(), Box<dyn std::error::Error>> {
+    if let Some(path) = gh_review::theme::config_path() {
+        gh_review::theme::set_active(gh_review::theme::load_from(&path)?);
+    }
+
     let rt = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()?;

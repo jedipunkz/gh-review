@@ -15,6 +15,7 @@ use crate::cache::CacheEntry;
 use crate::cache::DetailCache;
 use crate::gh::{self, HistoryState, PullRequest, PullRequestDetail};
 use crate::prefetch::{neighbor_prs, top_n, Prefetcher};
+use crate::theme;
 
 pub const MAX_LIST_ITEMS: usize = 10;
 pub const TAB_AWAITING: usize = 0;
@@ -44,24 +45,26 @@ fn color(hex: &str) -> Color {
 }
 
 pub mod colors {
-    pub const FG: &str = "c0caf5";
-    pub const MUTED: &str = "565f89";
-    pub const BLUE: &str = "7aa2f7";
-    pub const CYAN: &str = "7dcfff";
-    pub const GREEN: &str = "9ece6a";
-    pub const MAGENTA: &str = "bb9af7";
-    pub const ORANGE: &str = "ff9e64";
-    pub const RED: &str = "f7768e";
-    pub const YELLOW: &str = "e0af68";
-    pub const SELECTED: &str = "3d59a1";
-    pub const SELECTED_FG: &str = "ffffff";
-    pub const BAR_BG: &str = "1f2335";
-    pub const INK: &str = "1a1b26";
-    pub const FRAME: &str = "414868";
+    use crate::theme::Slot;
+
+    pub const FG: Slot = Slot::Fg;
+    pub const MUTED: Slot = Slot::Muted;
+    pub const BLUE: Slot = Slot::Blue;
+    pub const CYAN: Slot = Slot::Cyan;
+    pub const GREEN: Slot = Slot::Green;
+    pub const MAGENTA: Slot = Slot::Magenta;
+    pub const ORANGE: Slot = Slot::Orange;
+    pub const RED: Slot = Slot::Red;
+    pub const YELLOW: Slot = Slot::Yellow;
+    pub const SELECTED: Slot = Slot::Selected;
+    pub const SELECTED_FG: Slot = Slot::SelectedFg;
+    pub const BAR_BG: Slot = Slot::BarBg;
+    pub const INK: Slot = Slot::Ink;
+    pub const FRAME: Slot = Slot::Frame;
 }
 
-fn c(name: &str) -> Color {
-    color(name)
+fn c(slot: theme::Slot) -> Color {
+    color(theme::active().hex(slot))
 }
 
 #[derive(Debug, Clone)]
@@ -1258,8 +1261,8 @@ fn repeat_space(n: usize) -> String {
 
 // ---- rendering ----
 
-fn fg(name: &str) -> Style {
-    Style::new().fg(c(name))
+fn fg(slot: theme::Slot) -> Style {
+    Style::new().fg(c(slot))
 }
 
 pub fn render_diff_content(

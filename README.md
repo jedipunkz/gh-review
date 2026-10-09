@@ -93,6 +93,19 @@ While running, the extension re-checks your review requests every minute.
   your teams, a sound plays too (macOS only). The popup closes on any key press
   or after a few seconds on its own.
 
+## Color theme
+
+Pick a color theme in `~/.config/gh-review/gh-review.yaml`:
+
+```yaml
+theme: kanagawa-wave
+```
+
+Available themes: `tokyonight` (default), `kanagawa-wave`, `solarized`,
+`gruvbox`, `catppuccin-mocha`. If the file is missing or has no `theme` key,
+`tokyonight` is used. An unknown theme name or invalid YAML makes
+`gh review` exit with an error.
+
 ## Notes
 
 - This extension shells out to `gh`, so it uses the same authentication, host,
