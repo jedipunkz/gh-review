@@ -773,9 +773,13 @@ impl Model {
     }
 
     fn scroll_detail(&mut self, delta: i32) {
-        let max = self
-            .detail_total
-            .saturating_sub(self.detail_viewport_height());
+        let vp = self.detail_viewport_height();
+        if vp == 0 {
+            // Detail section is not visible (no room); keep content anchored.
+            self.detail_scroll = 0;
+            return;
+        }
+        let max = self.detail_total.saturating_sub(vp);
         let cur = self.detail_scroll as i64;
         let next = (cur + delta as i64).clamp(0, max as i64);
         self.detail_scroll = next as u16;
@@ -785,9 +789,17 @@ impl Model {
         if self.width == 0 || self.height == 0 {
             return 3;
         }
-        let list_h = self.compute_list_section_height() as i32;
-        let search_h = if self.search_visible() { 1 } else { 0 };
-        (self.height as i32 - 3 - list_h - search_h).max(3) as u16
+        let h = self.height as i32;
+        let search_h = if self.search_visible() { 1i32 } else { 0 };
+        // Mirror render(): the list takes at most the rows left above the footer.
+        let list_full = self.compute_list_section_height();
+        let list_cap = (h.max(0) as usize).saturating_sub((search_h + 1) as usize);
+        let list_h = list_full.min(list_cap) as i32;
+        let avail = h - 1 - search_h - list_h;
+        if avail <= 2 {
+            return 0;
+        }
+        (avail - 2) as u16
     }
 
     fn handle_search_key(&mut self, key: crossterm::event::KeyEvent) -> Vec<Effect> {
@@ -1533,8 +1545,12 @@ pub fn render(m: &mut Model, f: &mut Frame<'_>) {
     let footer_y = h.saturating_sub(1);
     if y < footer_y {
         let detail_rect_h = detail_h.min(footer_y - y);
-        let rect = Rect::new(0, y, area.width, detail_rect_h);
-        render_detail_section(m, f, rect, vp_h);
+        // With fewer than 3 rows there is no room for content; skip instead of
+        // drawing border-only noise.
+        if detail_rect_h > 2 {
+            let rect = Rect::new(0, y, area.width, detail_rect_h);
+            render_detail_section(m, f, rect, vp_h);
+        }
     }
 
     // footer
@@ -2897,6 +2913,70 @@ mod tests {
             })
             .collect();
         assert!(joined.contains("Author:"));
+    }
+
+    #[test]
+    fn test_detail_viewport_zero_when_list_fills_screen() {
+        let mut m = new_model();
+        m.width = 80;
+        m.height = 10;
+        m.loading = false;
+        for i in 0..12 {
+            m.prs.push(pr(&format!("https://example.test/pr/{i}")));
+        }
+        assert_eq!(m.compute_list_section_height(), 4 + MAX_LIST_ITEMS);
+        assert_eq!(
+            m.detail_viewport_height(),
+            0,
+            "no viewport when the list consumes the screen"
+        );
+        m.detail_total = 50;
+        m.scroll_detail(10);
+        m.scroll_detail(-10);
+        assert_eq!(
+            m.detail_scroll, 0,
+            "j/k must not scroll while the detail is not visible"
+        );
+    }
+
+    #[test]
+    fn test_detail_viewport_matches_render_allocation() {
+        // Mirror the layout arithmetic of render() exactly.
+        fn render_detail_rows(m: &Model) -> u16 {
+            let h = m.height;
+            let search_h = if m.search_visible() { 1u16 } else { 0 };
+            let list_h = m.compute_list_section_height() as u16;
+            let y0 = search_h;
+            let list_used = list_h.min(h.saturating_sub(y0 + 1));
+            let y = y0 + list_used;
+            let footer_y = h.saturating_sub(1);
+            if y < footer_y {
+                let detail_rect_h = (m.detail_viewport_height() + 2).min(footer_y - y);
+                if detail_rect_h > 2 {
+                    return detail_rect_h - 2;
+                }
+            }
+            0
+        }
+
+        let sizes = [5u16, 6, 8, 10, 12, 14, 17, 18, 19, 20, 40];
+        let counts = [0usize, 3, 30];
+        for count in counts {
+            for h in sizes {
+                let mut m = new_model();
+                m.width = 80;
+                m.height = h;
+                m.loading = false;
+                for i in 0..count {
+                    m.prs.push(pr(&format!("https://example.test/pr/{i}")));
+                }
+                assert_eq!(
+                    m.detail_viewport_height(),
+                    render_detail_rows(&m),
+                    "viewport mismatch for h={h} prs={count}"
+                );
+            }
+        }
     }
 
     #[test]
