@@ -399,32 +399,25 @@ impl Model {
         self.detail_scroll = 0;
 
         let key = gh::cache_key_of(&pr);
-        if let Some(entry) = self.cache.get_mem(&key) {
-            self.inflight_cancel();
+        let cached = match self.cache.get_mem(&key) {
+            Some(entry) => Some((entry, None)),
+            None => self
+                .cache
+                .get_disk(&key)
+                .map(|entry| (entry, Some(Effect::LoadDiff { pr: pr.clone() }))),
+        };
+        if let Some((entry, effect)) = cached {
             self.debounce_seq += 1;
             self.current_detail = Some(entry.detail);
             self.current_diff = entry.diff;
             self.detail_loading = false;
-            return None;
-        }
-        if let Some(entry) = self.cache.get_disk(&key) {
-            self.inflight_cancel();
-            self.debounce_seq += 1;
-            self.current_detail = Some(entry.detail);
-            self.current_diff = entry.diff;
-            self.detail_loading = false;
-            return Some(Effect::LoadDiff { pr });
+            return effect;
         }
         self.debounce_seq += 1;
         Some(Effect::Debounce {
             seq: self.debounce_seq,
             url: pr.url,
         })
-    }
-
-    fn inflight_cancel(&mut self) {
-        // The main loop aborts the in-flight load task before spawning a new
-        // one; nothing to do here beyond bumping the debounce sequence.
     }
 
     pub fn detail_and_prefetch_effects(&mut self) -> Vec<Effect> {

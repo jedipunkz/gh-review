@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::process::Stdio;
 use std::time::{Duration, Instant, SystemTime};
 
@@ -507,20 +508,24 @@ pub async fn load_review_requests(g: &Gh) -> Result<Vec<PullRequest>> {
         }));
     }
 
-    let mut by_url: Vec<(String, PullRequest)> = Vec::new();
+    let mut by_url: HashMap<String, PullRequest> = HashMap::new();
     let mut errs: Vec<String> = Vec::new();
     for handle in handles {
         if let Ok((label, res)) = handle.await {
             match res {
                 Ok(prs) => {
                     for pr in prs {
-                        if let Some(existing) = by_url.iter_mut().find(|(_, e)| e.url == pr.url) {
-                            if !existing.1.request.contains(&pr.request) {
-                                existing.1.request =
-                                    format!("{}, {}", existing.1.request, pr.request);
+                        match by_url.entry(pr.url.clone()) {
+                            std::collections::hash_map::Entry::Occupied(mut e) => {
+                                let existing = e.get_mut();
+                                if !existing.request.contains(&pr.request) {
+                                    existing.request =
+                                        format!("{}, {}", existing.request, pr.request);
+                                }
                             }
-                        } else {
-                            by_url.push((pr.url.clone(), pr));
+                            std::collections::hash_map::Entry::Vacant(e) => {
+                                e.insert(pr);
+                            }
                         }
                     }
                 }
@@ -533,7 +538,7 @@ pub async fn load_review_requests(g: &Gh) -> Result<Vec<PullRequest>> {
         return Err(crate::error::GhiError::Other(errs.join("; ")));
     }
 
-    let mut prs: Vec<PullRequest> = by_url.into_iter().map(|(_, pr)| pr).collect();
+    let mut prs: Vec<PullRequest> = by_url.into_values().collect();
     prs.sort_by_key(|a| std::cmp::Reverse(a.updated_at));
     Ok(prs)
 }

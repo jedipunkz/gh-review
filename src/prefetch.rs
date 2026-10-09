@@ -2,7 +2,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use crate::cache::{CacheEntry, DetailCache};
-use crate::gh::{self, Gh, PullRequest, PullRequestDetail};
+use crate::gh::{self, Gh, PullRequest};
 
 pub const PREFETCH_TIMEOUT: Duration = Duration::from_secs(60);
 pub const PREFETCH_CONCURRENCY: usize = 3;
@@ -70,28 +70,8 @@ impl Prefetcher {
             }
         };
 
-        let result = tokio::time::timeout(PREFETCH_TIMEOUT, async {
-            let p1 = pr.clone();
-            let g2 = g.clone();
-            let (detail_res, diff_res) =
-                tokio::join!(async move { gh::load_pr_detail(&g2, &p1).await }, async {
-                    gh::load_diff(&g, &pr).await
-                });
-            let diff = match diff_res {
-                Ok(d) => d,
-                Err(e) => {
-                    if gh::is_pr_diff_too_large_error(&e) {
-                        "Diff omitted because GitHub reports this PR diff is too large to display."
-                            .to_string()
-                    } else {
-                        return Err(e);
-                    }
-                }
-            };
-            let detail = detail_res?;
-            Ok::<(PullRequestDetail, String), crate::error::GhiError>((detail, diff))
-        })
-        .await;
+        let result =
+            tokio::time::timeout(PREFETCH_TIMEOUT, gh::load_detail_and_diff(&g, &pr)).await;
 
         if let Ok(Ok((detail, diff))) = result {
             let key = gh::cache_key_of_updated(&url, detail.base.updated_at);
