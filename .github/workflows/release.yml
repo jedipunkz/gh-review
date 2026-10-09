@@ -72,7 +72,10 @@ jobs:
             asset-os: linux
             asset-arch: arm64
             cross: true
-          - os: macos-13
+          # The macos-13 (x86_64) hosted runners were retired by GitHub;
+          # macOS runners are Intel-less now, so build the x86_64 target by
+          # cross-compiling on an arm64 macOS host (Xcode handles -arch).
+          - os: macos-15
             target: x86_64-apple-darwin
             asset-os: macos
             asset-arch: amd64
