@@ -1420,7 +1420,9 @@ pub fn render_diff_content(
     let mut lines: Vec<Line<'static>> = Vec::new();
     let title = format!(
         "{}  #{}  {}",
-        detail.base.repository, detail.base.number, detail.base.title
+        detail.base.repository,
+        detail.base.number,
+        sanitize_text(&detail.base.title)
     );
     lines.push(Line::from(Span::styled(
         title,
@@ -1498,13 +1500,14 @@ pub fn render_diff_content(
     }
 
     if !detail.labels.is_empty() {
-        let spans = meta_pair("Labels", &detail.labels.join(", "));
+        let spans = meta_pair("Labels", &sanitize_text(&detail.labels.join(", ")));
         lines.push(Line::from(spans));
     }
 
     lines.push(Line::from(""));
 
-    let body = detail.body.trim();
+    let body = sanitize_text(detail.body.trim());
+    let body = body.trim();
     if body.is_empty() {
         lines.push(Line::from(Span::styled(
             "No description.".to_string(),
@@ -1631,6 +1634,37 @@ fn review_decision_style(decision: &str) -> Style {
     }
 }
 
+// Normalizes externally sourced text (titles, bodies, labels, diffs) for
+// terminal rendering. Tabs become spaces (ratatui silently drops them,
+// losing diff indentation), remaining control characters are removed, and
+// zero-width / variation-selector code points are stripped: unicode-width,
+// ratatui and the terminal disagree on their widths (e.g. "♻️" = base char
+// plus U+FE0F), and one disagreement desyncs the physical cursor from
+// ratatui's buffer, leaving stale glyphs from earlier frames on screen.
+fn sanitize_text(s: &str) -> String {
+    fn drop_or_expand(ch: char) -> bool {
+        matches!(ch,
+            '\t'
+            | '\u{FE00}'..='\u{FE0F}' // variation selectors
+            | '\u{200B}'..='\u{200F}' // zero-width space/joiners, bidi marks
+            | '\u{2060}' // word joiner
+            | '\u{FEFF}' // BOM
+        ) || (ch.is_control() && ch != '\n')
+    }
+    if !s.chars().any(drop_or_expand) {
+        return s.to_string();
+    }
+    let mut out = String::with_capacity(s.len());
+    for ch in s.chars() {
+        if ch == '\t' {
+            out.push_str("    ");
+        } else if !drop_or_expand(ch) {
+            out.push(ch);
+        }
+    }
+    out
+}
+
 // Drops ANSI CSI sequences (ESC [ ... final byte). Diffs cached before the
 // switch to plain-text `gh pr diff` still carry them, and ratatui renders
 // escape bytes as garbage instead of interpreting them.
@@ -1662,7 +1696,7 @@ fn highlight_diff(diff: &str) -> Vec<Line<'static>> {
         return Vec::new();
     }
     diff.lines()
-        .map(strip_ansi)
+        .map(|line| sanitize_text(&strip_ansi(line)))
         .map(|line| {
             let style = if line.starts_with("diff --git") {
                 Style::new()
@@ -2225,7 +2259,10 @@ fn render_pr_line(m: &Model, idx: usize, pr: &PullRequest, box_w: usize) -> Line
     } else {
         fg(colors::FG)
     };
-    spans.push(Span::styled(pad_right(&pr.title, title_w), title_style));
+    spans.push(Span::styled(
+        pad_right(&sanitize_text(&pr.title), title_w),
+        title_style,
+    ));
     spans.push(Span::styled(
         "  ".to_string(),
         if selected {
@@ -2634,6 +2671,18 @@ fn render_comment_popup(m: &Model, f: &mut Frame<'_>, area: Rect) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn sanitize_text_normalizes_problem_chars() {
+        // tab -> spaces, newline kept
+        assert_eq!(sanitize_text("a\tb\nc"), "a    b\nc");
+        // variation selector (emoji presentation) stripped
+        assert_eq!(sanitize_text("\u{267b}\u{fe0f} title"), "\u{267b} title");
+        // zero-width space / joiner, CR and ESC dropped
+        assert_eq!(sanitize_text("a\u{200b}b\u{200d}c\rd\u{1b}"), "abcd");
+        // plain text (CJK included) passes through untouched
+        assert_eq!(sanitize_text("日本語 plain"), "日本語 plain");
+    }
 
     fn pr(url: &str) -> PullRequest {
         PullRequest {
