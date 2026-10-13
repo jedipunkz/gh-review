@@ -261,6 +261,19 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                     None => break,
                 };
 
+                // ctrl+l repaints the whole screen. Recovers from stale
+                // glyphs left behind when the terminal and ratatui disagree
+                // on a character's width (emoji, ambiguous-width chars).
+                if let Msg::Key(key) = &msg {
+                    if key.code == crossterm::event::KeyCode::Char('l')
+                        && key
+                            .modifiers
+                            .contains(crossterm::event::KeyModifiers::CONTROL)
+                    {
+                        terminal.clear().map_err(|e| e.to_string())?;
+                    }
+                }
+
                 for effect in model.update(msg) {
                     runtime.execute(g.clone(), effect);
                 }
