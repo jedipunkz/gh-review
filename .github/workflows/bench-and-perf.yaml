@@ -1,0 +1,237 @@
+# Benches gh-review's hot paths: on every code-touching pull request the
+# head commit races the merge-base with main on the same runner, and the
+# table lands as one sticky comment. A ±10% delta is a WARN there, never a
+# failed job — the gate is the human reading it. A weekly run records the
+# trend on main alone in a second sticky comment on a locked tracking issue.
+name: bench-and-perf
+
+on:
+  pull_request:
+    paths:
+      - "src/**"
+      - Cargo.toml
+      - Cargo.lock
+      - benches/**
+      - .github/workflows/bench-and-perf.yaml
+  # Between CodeQL's 03:17 and deny.yaml's 12:00 Monday so the crons
+  # never overlap.
+  schedule:
+    - cron: "0 6 * * 1"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+# A new push makes the previous run's answer irrelevant.
+concurrency:
+  group: bench-and-perf-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # Budget ~15 minutes: two optimized (lto) cargo builds dominate the wall
+  # time; the sampling itself is ~1 second end to end, so divan's knobs stay
+  # at their defaults and only this timeout echoes the hard cap.
+  compare:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
+      pull-requests: write
+    steps:
+      # Full history so the base commit can be materialized as a second
+      # checkout of the same clone.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - uses: dtolnay/rust-toolchain@686976e191b89faba57d3206551f0f330d8cb249 # stable
+
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+
+      - name: materialize the base commit
+        env:
+          # A SHA, not a template expansion inside the shell: the expression
+          # is resolved once into an environment variable the step reads.
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+        run: git worktree add /tmp/grv-base "${BASE_SHA}"
+
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+        with:
+          workspaces: /tmp/grv-base
+
+      # Both trees build and sample on this same runner back to back, which
+      # is what makes the delta meaningful: one CPU, one OS, one noise floor.
+      - name: bench head
+        run: cargo bench --locked --bench perf 2>&1 | tee divan-head.txt
+
+      - name: bench base
+        run: cargo bench --locked --bench perf --manifest-path /tmp/grv-base/Cargo.toml 2>&1 | tee divan-base.txt
+
+      # divan prints a table whose 4th column is the mean; read both files,
+      # convert every mean to µs, and emit the markdown table plus a WARN
+      # line for anything that moved 10% or more.
+      - name: summarize
+        run: |
+          python3 - <<'EOF' > bench.md
+          import re
+
+          def parse(path):
+              rows = {}
+              for line in open(path, encoding="utf-8"):
+                  m = re.match(r"^[├╰]─\s*([\w:]+)\s+(.*)$", line)
+                  if not m:
+                      continue
+                  cols = [c.strip() for c in m.group(2).split("│")]
+                  if len(cols) < 4:
+                      continue
+                  val, unit = cols[3].split()
+                  mult = {"ns": 0.001, "µs": 1.0, "ms": 1000.0, "s": 1e6}[unit]
+                  rows[m.group(1)] = float(val) * mult
+              return rows
+
+          base = parse("divan-base.txt")
+          head = parse("divan-head.txt")
+          rows = "<!-- gh-review-bench -->\n\n## Benchmarks (head vs base)\n\n" \
+              "| bench | base (µs) | head (µs) | delta | WARN (±10%) |\n| --- | --- | --- | --- | --- |\n"
+          for name in sorted(set(base) | set(head)):
+              b, h = base.get(name), head.get(name)
+              if b is None or h is None:
+                  rows += f"| {name} | {b or '—'} | {h or '—'} | n/a | — |\n"
+                  continue
+              delta = (h - b) / b * 100.0
+              warn = "WARN" if abs(delta) >= 10.0 else ""
+              rows += f"| {name} | {b:.2f} | {h:.2f} | {delta:+.1f}% | {warn} |\n"
+          rows += "\n[run](" + "${{ github.server_url }}/${{ github.repository }}" \
+              "/actions/runs/${{ github.run_id }})\n"
+          print(rows)
+          EOF
+
+      # One comment, updated in place — same marker/patch-or-create scheme
+      # the coverage job uses.
+      - uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
+        with:
+          script: |
+            const body = await require('fs').promises.readFile('bench.md', 'utf8');
+            const comments = await github.paginate(
+                github.rest.issues.listComments, {
+                  owner: context.repo.owner,
+                  repo: context.repo.repo,
+                  issue_number: context.issue.number,
+                });
+              const previous = comments.find((c) => (c.body || "").startsWith("<!-- gh-review-bench -->"));
+              if (previous) {
+                await github.rest.issues.updateComment({
+                  owner: context.repo.owner,
+                  repo: context.repo.repo,
+                  comment_id: previous.id,
+                  body,
+                });
+              } else {
+                await github.rest.issues.createComment({
+                  owner: context.repo.owner,
+                  repo: context.repo.repo,
+                  issue_number: context.issue.number,
+                  body,
+                });
+              }
+
+  # Weekly single-run trend on main: one sampled pass, appended as one
+  # sticky comment it fully rewrites on a locked tracking issue.
+  trend:
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
+      issues: write
+    concurrency:
+      group: bench-and-perf-trend
+      cancel-in-progress: true
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+
+      - uses: dtolnay/rust-toolchain@686976e191b89faba57d3206551f0f330d8cb249 # stable
+
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+
+      - name: bench main
+        run: cargo bench --locked --bench perf 2>&1 | tee divan-main.txt
+
+      - name: summarize
+        env:
+          COMMIT_SHA: ${{ github.sha }}
+          REF: ${{ github.ref }}
+        run: |
+          python3 - <<'EOF' > bench-trend.md
+          import os
+          import re
+
+          rows = "<!-- gh-review-bench-trend -->\n\n## Bench trend on main\n\n" \
+                 "commit: `" + os.environ["COMMIT_SHA"] + "` on `" + os.environ["REF"] + "`\n\n" \
+                 "| bench | mean (µs) |\n| --- | --- |\n"
+          for line in open("divan-main.txt", encoding="utf-8"):
+              m = re.match(r"^[├╰]─\s*([\w:]+)\s+(.*)$", line)
+              if not m:
+                  continue
+              cols = [c.strip() for c in m.group(2).split("│")]
+              if len(cols) < 4:
+                  continue
+              val, unit = cols[3].split()
+              mult = {"ns": 0.001, "µs": 1.0, "ms": 1000.0, "s": 1e6}[unit]
+              rows += f"| {m.group(1)} | {float(val) * mult:.2f} |\n"
+          rows += "\n[run](" + "${{ github.server_url }}/${{ github.repository }}" \
+              "/actions/runs/${{ github.run_id }})\n"
+          print(rows)
+          EOF
+
+      # Find or create the tracking issue, then patch (or create) the single
+      # marker comment on it; the issue stays locked so it is only ever read.
+      - uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
+        with:
+          script: |
+            const body = await require('fs').promises.readFile('bench-trend.md', 'utf8');
+            const title = "[tracking] bench trend";
+            const issues = await github.paginate(github.rest.issues.listForRepo, {
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              state: "open",
+            });
+            let issue = issues.find((i) => (i.title || "") === title && !i.pull_request);
+            if (!issue) {
+              issue = (await github.rest.issues.create({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                title,
+                body: "Weekly bench trend on main, one sticky comment, rewritten in place.",
+              })).data;
+            }
+            await github.rest.issues.lock({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: issue.number,
+              lock_reason: "resolved",
+            });
+            const comments = await github.paginate(github.rest.issues.listComments, {
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: issue.number,
+            });
+            const previous = comments.find((c) => (c.body || "").startsWith("<!-- gh-review-bench-trend -->"));
+            if (previous) {
+              await github.rest.issues.updateComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                comment_id: previous.id,
+                body,
+              });
+            } else {
+              await github.rest.issues.createComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: issue.number,
+                body,
+              });
+            }

@@ -1,0 +1,18 @@
+# Mutation testing over the paths where gh-review acts on the world: the
+# disk cache (src/cache.rs) deletes and prunes files, and src/gh.rs builds
+# the gh command lines and parses everything gh answers with. A survivor
+# there is a testing gap, not a build failure, so the sweep is a weekly
+# report through a tracking issue instead of a gate: artifacts carry the
+# full output, the issue carries a short summary.
+
+examine_globs = [
+  "src/cache.rs",
+  "src/gh.rs",
+]
+
+# The package's tests are fast, but each mutant pays a full rebuild of the
+# crate, so the autoset per-mutant timeout is floored at a minute and a
+# couple of multipliers bound the stragglers instead of one hard second count.
+minimum_test_timeout = 60
+timeout_multiplier = 2.0
+build_timeout_multiplier = 2.0

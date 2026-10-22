@@ -1,0 +1,42 @@
+# Keep the crates and the workflow actions current without turning the
+# repository into a stream of one-line pull requests: everything that is not a
+# major version arrives grouped, once a week.
+version: 2
+
+updates:
+  - package-ecosystem: cargo
+    directory: /
+    schedule:
+      interval: weekly
+      day: monday
+    open-pull-requests-limit: 5
+    commit-message:
+      prefix: chore
+    # A release's day 0 is the riskiest moment: a compromised crate or action
+    # is usually caught and yanked within days, and cargo-deny only learns of
+    # it once an advisory is published. The cooldown keeps Dependabot from
+    # taking a release until it has survived its first week; a major rides
+    # out a month, and a major is the one a person approves by hand anyway.
+    cooldown:
+      default-days: 7
+      semver-major-days: 30
+    groups:
+      cargo-minor-and-patch:
+        update-types: [minor, patch]
+
+  - package-ecosystem: github-actions
+    # The actions used by every workflow under .github/workflows.
+    directory: /
+    schedule:
+      interval: weekly
+      day: monday
+    open-pull-requests-limit: 5
+    commit-message:
+      prefix: chore
+    # Same reasoning as the cargo entry above.
+    cooldown:
+      default-days: 7
+      semver-major-days: 30
+    groups:
+      actions-minor-and-patch:
+        update-types: [minor, patch]

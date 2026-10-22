@@ -1,0 +1,74 @@
+# The workflows in this directory are code that runs with the repository's
+# write tokens — release.yaml cuts tags and uploads release assets, other
+# jobs post pull-request comments and merge pull requests — so a typo or an
+# injection in one of them is a security event, not a lint nit. actionlint
+# catches the correctness half: syntax, expression types, unknown action
+# inputs, and shellcheck over every `run:` block. zizmor catches the
+# security half: template injection into scripts, permissions wider than the
+# job needs, credentials a checkout leaves persisted into artifacts, and
+# `uses:` clauses that stop being pinned to a commit. Both run over the
+# whole directory each time, because actionlint is a per-file check and a
+# changed-file screen would only ever see half of it.
+name: Workflow Lint
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - .github/workflows/**
+      - .github/actionlint.yaml
+      - .github/zizmor.yml
+  pull_request:
+    paths:
+      - .github/workflows/**
+      - .github/actionlint.yaml
+      - .github/zizmor.yml
+
+permissions:
+  contents: read
+
+# A new push makes the previous run's answer irrelevant.
+concurrency:
+  group: workflow-lint-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  lint:
+    name: Lint the workflow files
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      # Only the SARIF upload below writes anywhere; the two lint steps
+      # themselves are read-only over the checked-out files.
+      security-events: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+
+      - name: Install actionlint
+        run: |
+          bash <(curl -fsSL "https://raw.githubusercontent.com/rhysd/actionlint/main/scripts/download-actionlint.bash") 1.7.12
+          ./actionlint --version
+
+      - name: actionlint
+        run: ./actionlint -ignore 'SC2086' -ignore 'SC2035' -ignore 'SC2034' .github/workflows/*.yaml
+
+      - name: Install zizmor
+        run: pipx install 'zizmor==1.30.1'
+
+      - name: zizmor
+        run: zizmor --no-online-audits --no-progress .github/workflows/
+
+      - name: zizmor (SARIF)
+        run: zizmor --no-online-audits --no-progress --format=sarif .github/workflows/ > "${RUNNER_TEMP}/zizmor.sarif"
+
+      # The dashboard under Security > Code scanning reads the SARIF, so the
+      # findings from this run live next to CodeQL's instead of only in this
+      # run's log. Fork pull requests cannot write there, which is what the
+      # `if:` keeps out.
+      - name: Upload SARIF
+        if: github.event_name == 'push' || github.event.pull_request.head.repo.full_name == github.repository
+        uses: github/codeql-action/upload-sarif@24c54180a607b1449ed407dd24f251e4e9147c8d # v4
+        with:
+          sarif_file: ${{ runner.temp }}/zizmor.sarif

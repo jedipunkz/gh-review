@@ -1,0 +1,71 @@
+# Dependency hygiene is a second gate the tests cannot be: the advisory
+# database grows on its own schedule, so this checks Cargo's answers against
+# RustSec, the license allow-list, and the crate sources on every dependency
+# touching pull request, and once a week so staleness is caught without one.
+#
+# `deny` is a check a branch ruleset requires, so the workflow cannot hide
+# behind a workflow-level `paths:` filter: a filter-kept job never reports,
+# sits pending forever, and blocks every README-only pull request. The scan
+# job skips under `if:` when nothing it guards changed instead - a skipped
+# job reports success to required checks, so a docs-only pull request merges
+# without paying for a scan.
+name: cargo-deny
+
+on:
+  pull_request:
+  schedule:
+    - cron: "0 12 * * 1"
+
+permissions:
+  contents: read
+
+# A new push makes the previous run's answer irrelevant.
+concurrency:
+  group: deny-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  changes:
+    name: Detect changes
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: read
+    outputs:
+      code: ${{ steps.filter.outputs.code }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+
+      - name: Filter dependency changes
+        uses: dorny/paths-filter@ceb8a2b8f2d89434be7ff52d3de7ec3738c5cc9d # v4.0.3
+        id: filter
+        with:
+          filters: |
+            code:
+              - Cargo.toml
+              - Cargo.lock
+              - deny.toml
+              - .github/workflows/deny.yaml
+
+  deny:
+    # Scheduled runs skip change detection and always scan. !cancelled()
+    # keeps this job from being skipped along with that skipped job.
+    needs: changes
+    if: ${{ !cancelled() && (github.event_name == 'schedule' || needs.changes.outputs.code == 'true') }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+
+      - uses: dtolnay/rust-toolchain@686976e191b89faba57d3206551f0f330d8cb249 # stable
+
+      - uses: taiki-e/install-action@ab6895351a88b908e96a4697860d4ffea5e57dbe # v2
+        with:
+          tool: cargo-deny
+
+      - name: cargo deny check
+        run: cargo deny check advisories licenses sources

@@ -3,7 +3,7 @@ GH_EXTENSION_NAME ?= gh-review
 CURRENT_EXTENSION_NAME := $(notdir $(CURDIR))
 GH_EXTENSION_PATH := $(GH_EXTENSIONS_DIR)/$(GH_EXTENSION_NAME)
 
-.PHONY: build install reinstall install-dev test
+.PHONY: build install reinstall install-dev test lint fmt check bench
 
 build:
 	cargo build --release
@@ -29,3 +29,15 @@ install-dev: install
 
 test:
 	cargo test
+
+lint:
+	cargo clippy --all-targets -- -D warnings
+
+fmt:
+	cargo fmt
+
+check: lint test
+	cargo fmt --check
+
+bench:
+	cargo bench --bench perf

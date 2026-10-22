@@ -1,0 +1,41 @@
+# Dependency hygiene is a gate the tests cannot be: the advisory database
+# grows on its own schedule, so this checks Cargo's answers against RustSec,
+# the license allow-list, and the crate sources. See .github/workflows/deny.yaml.
+
+[advisories]
+# The GHSA GitHub advisory database is not in RustSec format, so
+# cargo-deny cannot read it; the RustSec DB carries the same findings, each
+# with its GHSA id as an alias.
+db-urls = ["https://github.com/rustsec/advisory-db"]
+yanked = "warn"
+# workspace, not all: the YAML parser chain (serde_yaml_ng → unsafe-libyaml)
+# ships an unmaintained transitive crate today. Denying every unmaintained
+# transitive would fail this check with no upgrade available, so a known,
+# documented transitive stays a warning while anything the workspace itself
+# depends on directly is still an error.
+unmaintained = "workspace"
+unsound = "workspace"
+
+# The allow-list covers every license Cargo.lock actually resolves to today,
+# plus the few common permissive ones a small transitive bump could
+# introduce. License expressions are OR-compatible, so Apache-2.0 WITH
+# LLVM-exception resolves through plain Apache-2.0.
+[licenses]
+allow = [
+  "Apache-2.0",
+  "BSD-3-Clause",
+  "BSL-1.0",
+  "ISC",
+  "MIT",
+  "MPL-2.0",
+  "Unicode-3.0",
+  "Unlicense",
+  "Zlib",
+]
+
+[bans]
+multiple-versions = "warn"
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
