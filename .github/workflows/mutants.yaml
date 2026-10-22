@@ -1,0 +1,140 @@
+# Mutation testing over src/cache.rs and src/gh.rs, the dangerous-path
+# code: one deletes and prunes cache files, the other builds gh command
+# lines and parses gh's answers. A survivor there is a testing gap, not a
+# build failure, so the sweep is a weekly report through a tracking issue
+# instead of a gate: artifacts carry the full output, the issue carries
+# a short summary.
+name: Mutants
+
+on:
+  schedule:
+    # Thursday 04:13 UTC: clear of the Monday crons (CodeQL 03:17,
+    # cargo-deny 12:00, bench 06:00) and of the PR gate entirely.
+    - cron: "13 4 * * 4"
+
+permissions:
+  contents: read
+
+jobs:
+  sweep:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    permissions:
+      contents: read
+      issues: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+
+      - uses: dtolnay/rust-toolchain@686976e191b89faba57d3206551f0f330d8cb249 # stable
+
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+
+      - uses: taiki-e/install-action@ab6895351a88b908e96a4697860d4ffea5e57dbe # v2
+        with:
+          tool: cargo-mutants
+
+      # Per-mutant and build timeouts live in mutants.toml; the job-level
+      # cap above is the last resort, not the intended stop.
+      - name: cargo mutants
+        run: cargo mutants --config mutants.toml -C --locked --output mutants.out
+
+      # Bounded retention keeps the artifact store from filling up with
+      # weekly snapshots.
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        if: always()
+        with:
+          name: mutants.out
+          path: mutants.out
+          retention-days: 30
+
+      # Missed = survived. The summary file keeps the comment body out of
+      # the step shell and the env-var size limits.
+      - name: summarize
+        run: |
+          python3 - <<'EOF'
+          import json
+          d = json.load(open("mutants.out/outcomes.json"))
+          survivors = [o["scenario"]["Mutant"]["name"]
+                       for o in d["outcomes"] if o["summary"] == "MissedMutant"]
+          timeouts = [o["scenario"]["Mutant"]["name"]
+                      for o in d["outcomes"] if o["summary"] == "Timeout"]
+          json.dump({
+              "date": d["end_time"][:10],
+              "total": d["total_mutants"],
+              "caught": d["caught"],
+              "missed": d["missed"],
+              "timeout": d["timeout"],
+              "unviable": d["unviable"],
+              "survivor_names": survivors,
+              "timeout_names": timeouts,
+          }, open("mutants-summary.json", "w"))
+          EOF
+
+      # One sticky comment on one tracking issue: the marker names ours,
+      # the issue is found by exact title and created when it is absent.
+      # A weekly sweep must be seen to be acted on, but must not open a
+      # new issue every week.
+      - uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
+        with:
+          script: |
+            const fs = require("fs");
+            const s = JSON.parse(fs.readFileSync("mutants-summary.json", "utf8"));
+            const marker = "<!-- gh-review-mutants -->";
+            const run = `${process.env.GITHUB_SERVER_URL}/${process.env.GITHUB_REPOSITORY}/actions/runs/${process.env.GITHUB_RUN_ID}`;
+            const artifact = `${run}/artifacts`;
+            const title = "[tracking] mutant sweep";
+            const lines = [
+              "## Mutant sweep",
+              "",
+              "| date | tested | caught | survivors | timeouts |",
+              "| --- | --- | --- | --- | --- |",
+              `| ${s.date} | ${s.total} | ${s.caught} | ${s.missed} | ${s.timeout} |`,
+              "",
+            ];
+            if (s.survivor_names.length > 0) {
+              lines.push("Survivors:", "", ...s.survivor_names.map((n) => "- `" + n + "`"), "");
+            } else {
+              lines.push("No survivors.", "");
+            }
+            if (s.timeout_names.length > 0) {
+              lines.push("Timed out (inconclusive):", "",
+                ...s.timeout_names.map((n) => "- `" + n + "`"), "");
+            }
+            lines.push("Full output: [artifact](" + artifact + "), [run](" + run + ")");
+            const body = marker + "\n" + lines.join("\n");
+            const q = `repo:${context.repo.owner}/${context.repo.repo} is:issue is:open in:title "${title}"`;
+            const hit = await github.rest.search.issuesAndPullRequests({ q, per_page: 1 });
+            let issue_number = hit.data.items[0] && hit.data.items[0].number;
+            if (!issue_number) {
+              const created = await github.rest.issues.create({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                title,
+                body: "Weekly cargo-mutants sweep over src/cache.rs and src/gh.rs posts here.",
+              });
+              issue_number = created.data.number;
+            }
+            const comments = await github.paginate(
+              github.rest.issues.listComments, {
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number,
+              });
+            const previous = comments.find((c) => (c.body || "").startsWith(marker));
+            if (previous) {
+              await github.rest.issues.updateComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                comment_id: previous.id,
+                body,
+              });
+            } else {
+              await github.rest.issues.createComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number,
+                body,
+              });
+            }
