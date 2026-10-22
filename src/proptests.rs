@@ -8,6 +8,7 @@
 use std::time::{Duration, SystemTime};
 
 use proptest::prelude::*;
+use unicode_width::UnicodeWidthChar;
 
 use crate::app;
 use crate::cache::cache_key;
@@ -87,6 +88,36 @@ proptest! {
                 prop_assert!(text.chars().all(|c| c == '\n' || !c.is_control()),
                     "control character rendered: {text:?}");
             }
+        }
+    }
+
+    // The detail view renders a plain slice of the pre-wrapped cache, so the
+    // wrap pass must never leave a line that ratatui would split across
+    // rows: every line fits the content width, except a single grapheme
+    // wider than the width itself, which nothing can split and every
+    // renderer clips to its own row.
+    #[test]
+    fn render_diff_lines_are_prewrapped(
+        diff in any::<String>(),
+        width in 1usize..200usize,
+    ) {
+        let d = PullRequestDetail {
+            base: PullRequest {
+                repository: "jedipunkz/gh-review".into(),
+                number: 1,
+                title: "title".into(),
+                ..Default::default()
+            },
+            body: "## Why\n\na body `paragraph` with [a link](https://example.com) and a very long prose line that has to wrap.\n\n- item\n\n> quote\n".into(),
+            ..Default::default()
+        };
+        for line in app::render_diff_content(&d, &diff, width) {
+            let text = line.spans.iter().map(|s| s.content.as_ref()).collect::<String>();
+            let unbreakable = text.chars().count() == 1
+                && text.chars().next().and_then(|c| c.width()).is_some_and(|w| w > width);
+            prop_assert!(line.width() <= width || unbreakable,
+                "splittable line of width {} exceeds content width {}: {text:?}",
+                line.width(), width);
         }
     }
 }
