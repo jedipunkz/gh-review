@@ -7,7 +7,7 @@ fn main() {
     divan::main();
 }
 
-use std::sync::OnceLock;
+use std::sync::{Arc, OnceLock};
 use std::time::SystemTime;
 
 use gh_review::app;
@@ -142,4 +142,61 @@ fn pr_list_signature() {
 #[divan::bench]
 fn prefetch_top_n() {
     prefetch::top_n(prs(), 3);
+}
+
+// A model in the steady state a user sees: the list fetched, one pull
+// request selected with its detail and diff loaded, search closed.
+fn frame_model() -> app::Model {
+    let cache = Arc::new(gh_review::cache::DetailCache::with_dir(None));
+    let mut m = app::Model::new(cache.clone(), Arc::new(prefetch::Prefetcher::new(cache)));
+    m.width = 120;
+    m.height = 40;
+    m.prs = prs().clone();
+    m.pr_list_loaded = true;
+    m.cursor = 0;
+    m.current_detail = Some(detail());
+    m.current_diff = diff().to_string();
+    m
+}
+
+// First frame with the model: includes the one-time detail rebuild, the
+// cost paid on every selection change.
+#[divan::bench]
+fn render_frame_120x40() {
+    let mut m = frame_model();
+    let mut term =
+        ratatui::Terminal::new(ratatui::backend::TestBackend::new(120, 40)).expect("test backend");
+    term.draw(|f| app::render(&mut m, f)).expect("draw");
+}
+
+// The fixed cost of Terminal::new + one empty draw on this backend: what
+// every render_frame bench pays before any widget runs.
+#[divan::bench]
+fn render_backend_overhead_120x40() {
+    let mut term =
+        ratatui::Terminal::new(ratatui::backend::TestBackend::new(120, 40)).expect("test backend");
+    term.draw(|_| {}).expect("draw");
+}
+
+// The same model drawn a second time, with the detail view cache warm: this
+// is the cost the spinner tick pays ten times a second, not the one-time
+// detail rebuild. The terminal is kept across iterations so the number is
+// the draw itself, not TestBackend setup.
+#[divan::bench]
+fn render_frame_steady_120x40() {
+    static S: OnceLock<
+        std::sync::Mutex<(ratatui::Terminal<ratatui::backend::TestBackend>, app::Model)>,
+    > = OnceLock::new();
+    let mut g = S
+        .get_or_init(|| {
+            let mut m = frame_model();
+            let mut term = ratatui::Terminal::new(ratatui::backend::TestBackend::new(120, 40))
+                .expect("test backend");
+            term.draw(|f| app::render(&mut m, f)).expect("warm draw");
+            std::sync::Mutex::new((term, m))
+        })
+        .lock()
+        .unwrap();
+    let (term, m) = &mut *g;
+    term.draw(|f| app::render(m, f)).expect("draw");
 }

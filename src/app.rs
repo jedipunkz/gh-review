@@ -1,3 +1,4 @@
+use std::borrow::Cow;
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
@@ -5,7 +6,7 @@ use std::sync::Arc;
 use ratatui::layout::Rect;
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::symbols::border;
-use ratatui::text::{Line, Span, Text};
+use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Clear, Padding, Paragraph, Wrap};
 use ratatui::Frame;
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
@@ -1528,10 +1529,18 @@ pub fn render_diff_content(
     // with its own layout, whose row count the scroll-total estimate below
     // cannot reproduce exactly; pre-wrapped lines are never re-wrapped, so
     // one pre-wrapped line == one rendered row and the estimate stays exact.
-    lines
-        .into_iter()
-        .flat_map(|line| wrap_line_spans(line, width))
-        .collect()
+    // A fitting line is kept as-is: a rebuild walks hundreds of lines and a
+    // typical diff line already fits, so round-tripping each through
+    // wrap_line_spans' per-line Vec is allocation churn.
+    let mut wrapped: Vec<Line<'static>> = Vec::new();
+    for line in lines {
+        if width == 0 || line.width() <= width {
+            wrapped.push(line);
+        } else {
+            wrapped.extend(wrap_line_spans(line, width));
+        }
+    }
+    wrapped
 }
 
 fn meta_pair(label: &str, value: &str) -> Vec<Span<'static>> {
@@ -2403,9 +2412,32 @@ fn render_detail_section(m: &mut Model, f: &mut Frame<'_>, rect: Rect, vp_h: u16
             m.detail_scroll = max_scroll;
         }
     }
-    let para = Paragraph::new(Text::from(cache.lines.clone()))
-        .wrap(Wrap { trim: false })
-        .scroll((m.detail_scroll, 0));
+    // Every cached line is pre-wrapped to the content width, so one cached
+    // line renders as exactly one terminal row — the same invariant the
+    // scroll-total estimate relies on. That makes the visible part of the
+    // view a plain slice of the cache, and the per-frame cost proportional
+    // to the viewport instead of the document: a full-text Paragraph with
+    // .scroll() lays out every line of the diff on every frame and clones
+    // the whole cache into the bargain.
+    let line_count = cache.lines.len();
+    let start = (m.detail_scroll as usize).min(line_count);
+    let end = (start + vp_h as usize).min(line_count);
+    let text: Vec<Line<'_>> = cache.lines[start..end]
+        .iter()
+        .map(|l| Line {
+            style: l.style,
+            alignment: l.alignment,
+            spans: l
+                .spans
+                .iter()
+                .map(|s| Span {
+                    style: s.style,
+                    content: Cow::Borrowed(s.content.as_ref()),
+                })
+                .collect(),
+        })
+        .collect();
+    let para = Paragraph::new(text).wrap(Wrap { trim: false });
     f.render_widget(para, inner);
 }
 
@@ -3798,6 +3830,68 @@ mod tests {
         for l in &lines {
             assert!(l.width() <= width);
         }
+    }
+
+    // The detail view renders a slice of the pre-wrapped cache instead of a
+    // scrolled full-text Paragraph. This pins the equivalence that makes the
+    // slice exact: one cached line is one terminal row, so scrolling the view
+    // by k rows must show cache lines k..k+viewport — i.e. what row y shows
+    // at scroll s is what row y+s showed at scroll 0.
+    #[test]
+    fn test_detail_window_scroll_renders_consecutive_rows() {
+        use ratatui::backend::TestBackend;
+        use ratatui::layout::Rect;
+        use ratatui::Terminal;
+
+        const K: u16 = 3;
+        const RECT: Rect = Rect::new(0, 0, 40, 26);
+        const VP_H: u16 = RECT.height - 2;
+
+        fn draw_at(scroll: u16) -> ratatui::buffer::Buffer {
+            let mut m = new_model();
+            let diff = (0..40)
+                .map(|i| format!("@@ -{i},7 +{i},7 @@\n context {i}\n-removed {i}\n+added {i}"))
+                .collect::<Vec<_>>()
+                .join("\n");
+            m.current_detail = Some(PullRequestDetail {
+                base: pr("https://example.test/pr/1"),
+                body: "## Why\n\nA body paragraph.\n\n```rust\nfn main() {}\n```".into(),
+                ..Default::default()
+            });
+            m.current_diff = diff;
+            m.detail_scroll = scroll;
+            let mut term = Terminal::new(TestBackend::new(RECT.width, RECT.height)).unwrap();
+            term.draw(|f| render_detail_section(&mut m, f, RECT, VP_H))
+                .unwrap();
+            term.backend().buffer().clone()
+        }
+
+        let top = draw_at(0);
+        let scrolled = draw_at(K);
+        // Inside the borders and past the left padding. y+K must stay within
+        // the content rows of the unscrolled draw, so the loop tops out at
+        // VP_H - K.
+        for y in 1..=(VP_H - K) {
+            for x in 2..RECT.width - 2 {
+                let got = scrolled[(x, y)].symbol();
+                let want = top[(x, y + K)].symbol();
+                assert_eq!(
+                    got,
+                    want,
+                    "scroll {K}: row {y} must equal unscrolled row {}",
+                    y + K
+                );
+            }
+        }
+        // And the scrolled view is not just a copy of the top view.
+        assert_ne!(
+            (2..RECT.width - 2)
+                .map(|x| scrolled[(x, 1)].symbol())
+                .collect::<Vec<_>>(),
+            (2..RECT.width - 2)
+                .map(|x| top[(x, 1)].symbol())
+                .collect::<Vec<_>>(),
+        );
     }
 
     #[test]
