@@ -108,6 +108,90 @@ pub fn neighbor_prs(prs: &[PullRequest], i: usize) -> Vec<PullRequest> {
 mod tests {
     use super::*;
 
+    #[tokio::test]
+    async fn test_should_start_rejects_empty_url() {
+        let cache = Arc::new(DetailCache::with_dir(None));
+        let p = Prefetcher::new(cache);
+        assert!(
+            !p.should_start(&PullRequest::default()).await,
+            "an empty url is unfetchable"
+        );
+    }
+
+    // A gh runner answering `pr view` with a fixed JSON and `pr diff` with
+    // fixed text, so Prefetcher::run runs the real fetch path.
+    fn canned_runner() -> Gh {
+        let view = serde_json::json!({
+            "number": 1,
+            "title": "t",
+            "url": "https://github.com/o/r/pull/1",
+            "body": "b",
+            "createdAt": "2026-05-01T00:00:00Z",
+            "updatedAt": "2026-05-02T03:04:05Z",
+            "baseRefName": "main",
+            "headRefName": "feat/x",
+            "reviewDecision": "",
+            "mergeStateStatus": "CLEAN",
+            "additions": 1,
+            "deletions": 0,
+            "changedFiles": 1,
+            "author": {"login": "octocat"},
+            "labels": [],
+            "latestReviews": [],
+        })
+        .to_string()
+        .into_bytes();
+        Gh::with_runner(std::sync::Arc::new(move |args| {
+            if args.len() > 1 && args[1] == "diff" {
+                Ok(b"diff body".to_vec())
+            } else {
+                Ok(view.clone())
+            }
+        }))
+    }
+
+    fn pr_with_fixed_updated_at() -> PullRequest {
+        PullRequest {
+            url: "https://github.com/o/r/pull/1".into(),
+            updated_at: gh::parse_rfc3339("2026-05-02T03:04:05Z"),
+            ..Default::default()
+        }
+    }
+
+    #[tokio::test]
+    async fn test_run_fetches_and_caches() {
+        let cache = Arc::new(DetailCache::with_dir(None));
+        let p = Prefetcher::new(cache.clone());
+        let pr = pr_with_fixed_updated_at();
+
+        p.run(canned_runner(), pr.clone()).await;
+
+        let key = gh::cache_key_of(&pr);
+        let got = cache
+            .get_mem(&key)
+            .unwrap_or_else(|| panic!("the prefetched entry must land in the cache under {key}"));
+        assert_eq!(got.diff, "diff body");
+        assert_eq!(got.detail.body, "b");
+    }
+
+    #[tokio::test]
+    async fn test_spawn_warms_the_cache_in_the_background() {
+        let cache = Arc::new(DetailCache::with_dir(None));
+        let p = Arc::new(Prefetcher::new(cache.clone()));
+        let pr = pr_with_fixed_updated_at();
+        let key = gh::cache_key_of(&pr);
+
+        p.spawn(&canned_runner(), vec![pr]);
+
+        for _ in 0..200 {
+            if cache.get_mem(&key).is_some() {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        panic!("spawn must warm the cache for {key}");
+    }
+
     fn pr(url: &str) -> PullRequest {
         PullRequest {
             url: url.to_string(),

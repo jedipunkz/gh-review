@@ -284,4 +284,30 @@ mod tests {
             }
         }
     }
+
+    #[test]
+    fn test_find_resolves_known_and_rejects_unknown() {
+        assert_eq!(find("tokyonight").unwrap().name, "tokyonight");
+        assert_eq!(find("gruvbox").unwrap().name, "gruvbox");
+        assert!(find("no-such-theme").is_none());
+    }
+
+    #[test]
+    fn test_set_active_switches_the_palette() {
+        let want = find("gruvbox").unwrap();
+        set_active(want);
+        assert_eq!(active(), want, "the active palette must follow set_active");
+        // Restore the default for the other tests.
+        set_active(find("tokyonight").unwrap());
+    }
+
+    #[test]
+    fn test_config_path_is_the_gh_review_config() {
+        let p = config_path().expect("a home dir must exist on this platform");
+        assert!(
+            p.ends_with(".config/gh-review/gh-review.yaml"),
+            "got: {}",
+            p.display()
+        );
+    }
 }

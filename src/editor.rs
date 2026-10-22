@@ -243,4 +243,17 @@ mod tests {
         assert_eq!(rows, vec!["abcd", ""]);
         assert_eq!(cur, (1, 0));
     }
+
+    #[test]
+    fn right_moves_and_clamps() {
+        let mut t = typed("abc");
+        t.left();
+        t.left(); // cursor 1
+        t.right();
+        assert_eq!(t.cursor(), 2);
+        t.right();
+        assert_eq!(t.cursor(), 3);
+        t.right();
+        assert_eq!(t.cursor(), 3, "at the end the cursor stays");
+    }
 }

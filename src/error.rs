@@ -18,3 +18,20 @@ impl fmt::Display for GhiError {
 impl std::error::Error for GhiError {}
 
 pub type Result<T> = std::result::Result<T, GhiError>;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn display_prefixes_gh_errors_only() {
+        assert_eq!(
+            GhiError::Gh("pr diff failed: HTTP 404".into()).to_string(),
+            "gh: pr diff failed: HTTP 404"
+        );
+        assert_eq!(
+            GhiError::Other("parse failed".into()).to_string(),
+            "parse failed"
+        );
+    }
+}
