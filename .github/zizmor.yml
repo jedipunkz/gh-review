@@ -1,0 +1,12 @@
+# zizmor configuration: https://docs.zizmor.sh/configuration/
+# Every relaxation below carries the reason it exists; revisit each entry
+# when the workflow it names changes what it does with the repository.
+rules:
+  # Every `uses:` clause in every workflow here is pinned to a full commit
+  # SHA with the action's version in a trailing comment; this policy keeps
+  # enforcing hash pins so a new workflow cannot regress to a mutable tag
+  # or branch.
+  unpinned-uses:
+    config:
+      policies:
+        "*": hash-pin
