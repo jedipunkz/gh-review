@@ -1,0 +1,211 @@
+# Gate on the three things that can break the build: the tests, the linter,
+# and the formatting. One job, because a small repository spends more time
+# setting a runner up than it does running these. Pull requests are the only
+# gate: every commit on main arrives through one, and CodeQL watches the
+# branch on its own, so a push to main runs nothing here twice.
+#
+# The workflow runs on every pull request, not behind workflow-level `paths:`
+# filters: `check` and `coverage` are the checks a branch ruleset requires,
+# and a job screened out by a workflow-level filter never reports, so it
+# would sit pending forever and block a docs-only pull request. The
+# dorny/paths-filter step decides relevance instead, and the two jobs skip
+# under `if:` when nothing they check changed — a skipped job reports success
+# to the required checks, so docs-only PRs merge without paying for a build.
+name: CI
+
+on:
+  pull_request:
+
+permissions:
+  contents: read
+
+# A new push makes the previous run's answer irrelevant.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # What did this pull request change? Everything it names is what the two
+  # gate jobs exist to test — not the original workflow-level `paths:` list.
+  # Makefile and benches join the list because `check` builds --all-targets.
+  changes:
+    name: Detect changes
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: read
+    outputs:
+      code: ${{ steps.filter.outputs.code }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+
+      - uses: dorny/paths-filter@ceb8a2b8f2d89434be7ff52d3de7ec3738c5cc9d # v4.0.3
+        id: filter
+        with:
+          filters: |
+            code:
+              - src/**
+              - Cargo.toml
+              - Cargo.lock
+              - benches/**
+              - Makefile
+              - deny.toml
+              - .github/coverage-threshold
+              # Every workflow, so Dependabot's action bumps are built before
+              # they merge themselves (see dependabot-merge).
+              - .github/workflows/**
+
+  check:
+    needs: changes
+    if: ${{ !cancelled() && needs.changes.outputs.code == 'true' }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+
+      - uses: dtolnay/rust-toolchain@686976e191b89faba57d3206551f0f330d8cb249 # stable
+        with:
+          components: clippy, rustfmt
+
+      # Caches the registry and the build, keyed on Cargo.lock.
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+
+      - name: cargo fmt
+        run: cargo fmt --check
+
+      - name: cargo clippy
+        run: cargo clippy --locked --all-targets -- -D warnings
+
+      - name: cargo test
+        run: cargo test --locked
+
+  coverage:
+    needs: changes
+    if: ${{ !cancelled() && needs.changes.outputs.code == 'true' }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+
+      - uses: dtolnay/rust-toolchain@686976e191b89faba57d3206551f0f330d8cb249 # stable
+        with:
+          components: llvm-tools-preview
+
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+
+      - uses: taiki-e/install-action@ab6895351a88b908e96a4697860d4ffea5e57dbe # v2
+        with:
+          tool: cargo-llvm-cov
+
+      # lcov over the whole crate is what the totals are read from: one
+      # file, four counters, and no dependence on the summary table's widths.
+      # Branch totals are not collected, so they are not reported.
+      - name: cargo llvm-cov
+        run: cargo llvm-cov --locked --lcov --output-path lcov.info
+
+      - name: summarize
+        run: |
+          python3 - > coverage.env <<'EOF'
+          counters = ("LH:", "LF:", "FNH:", "FNF:")
+          got = dict.fromkeys(counters, 0)
+          for line in open("lcov.info"):
+              for k in counters:
+                  if line.startswith(k):
+                      got[k] += int(line.strip()[len(k):])
+          lh, lf, fnh, fnf = (got[k] for k in counters)
+          def pct(hit, total):
+              return 100.0 * hit / total if total > 0 else 100.0
+          print(f"COVERAGE_LINES={pct(lh, lf):.2f}|{lh}|{lf}")
+          print(f"COVERAGE_FUNCS={pct(fnh, fnf):.2f}|{fnh}|{fnf}")
+          EOF
+          cat coverage.env >> "${GITHUB_ENV}"
+
+      # The floor lives in its own file so lowering it is a deliberate,
+      # reviewable diff rather than a one-character edit in here.
+      - name: check the floor
+        id: floor
+        run: |
+          floor="$(cat .github/coverage-threshold)"
+          echo "floor=${floor}" >> "${GITHUB_OUTPUT}"
+          lines="${COVERAGE_LINES%%|*}"
+          python3 -c "import sys; sys.exit(0 if float('$lines') >= float('$floor') else 1)" \
+            || { echo "line coverage ${lines} is below the floor ${floor} — raise it or lower the floor deliberately in .github/coverage-threshold"; exit 1; }
+
+      # One comment, updated in place: a growing stack of coverage comments
+      # on every push would drown the review it belongs to. The marker names
+      # ours; it is patched when it is there, created when it is not.
+      - uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
+        env:
+          # The floor reaches the script as an environment variable instead
+          # of a template expansion inside the script text: the value is
+          # data, not code.
+          FLOOR: ${{ steps.floor.outputs.floor }}
+        with:
+          script: |
+            const those = (env) => (env || "").split("|");
+            const lines = those(process.env.COVERAGE_LINES);
+            const funcs = those(process.env.COVERAGE_FUNCS);
+            const marker = "<!-- gh-review-coverage -->";
+            const run = `${process.env.GITHUB_SERVER_URL}/${process.env.GITHUB_REPOSITORY}/actions/runs/${process.env.GITHUB_RUN_ID}`;
+            const body = marker + "\n" + [
+              "## Test coverage (cargo-llvm-cov)",
+              "",
+              "| lines | functions |",
+              "| --- | --- |",
+              "| " + lines[0] + "% (" + lines[1] + "/" + lines[2] + ") | "
+                + funcs[0] + "% (" + funcs[1] + "/" + funcs[2] + ") |",
+              "",
+              "Floor: " + process.env.FLOOR + "% — comment-removed if it is absent",
+              "",
+              "[run](" + run + ")",
+            ].join("\n");
+            const comments = await github.paginate(
+              github.rest.issues.listComments, {
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: context.issue.number,
+              });
+            const previous = comments.find((c) => (c.body || "").startsWith(marker));
+            if (previous) {
+              await github.rest.issues.updateComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                comment_id: previous.id,
+                body,
+              });
+            } else {
+              await github.rest.issues.createComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: context.issue.number,
+                body,
+              });
+            }
+
+  # Dependabot's minor and patch bumps merge themselves once the build and
+  # the coverage floor hold; a major bump waits for a person. The author,
+  # not the actor, is checked so a human re-running the job does not change
+  # who it trusts.
+  dependabot-merge:
+    needs: [check, coverage]
+    if: github.event.pull_request.user.login == 'dependabot[bot]'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      pull-requests: write
+    steps:
+      - id: meta
+        uses: dependabot/fetch-metadata@25dd0e34f4fe68f24cc83900b1fe3fe149efef98 # v3.1.0
+
+      - if: steps.meta.outputs.update-type == 'version-update:semver-minor' || steps.meta.outputs.update-type == 'version-update:semver-patch'
+        run: gh pr merge --squash "${PR_URL}"
+        env:
+          PR_URL: ${{ github.event.pull_request.html_url }}
+          GH_TOKEN: ${{ github.token }}

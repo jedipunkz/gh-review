@@ -1,0 +1,77 @@
+# CodeQL's own security analysis. It finds the classes of mistakes a
+# Rust CLI that shells out to `gh` can still make: command injection through
+# gh arguments, path traversal into the cache, resource leaks.
+#
+# A pull request's analysis files itself under refs/pull/N/merge, and only a
+# run against main answers for the default branch - so main is scanned by the
+# weekly cron, which also picks up what arrives through no commit of ours:
+# the query packs and the Rust extractor ride in with the action.
+#
+# `Analyze (rust)` is a check a branch ruleset requires, so the workflow
+# cannot hide behind a workflow-level `paths:` filter: a filter-kept job
+# never reports, sits pending forever, and blocks every README-only pull
+# request. The analysis job skips under `if:` when nothing analyzable changed
+# instead - a skipped job reports success to required checks, so a docs-only
+# pull request merges without paying for an analysis.
+name: CodeQL
+
+on:
+  pull_request:
+  schedule:
+    - cron: "17 3 * * 1"
+
+jobs:
+  changes:
+    name: Detect changes
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: read
+    outputs:
+      code: ${{ steps.filter.outputs.code }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+
+      - name: Filter analyzable changes
+        uses: dorny/paths-filter@ceb8a2b8f2d89434be7ff52d3de7ec3738c5cc9d # v4.0.3
+        id: filter
+        with:
+          filters: |
+            code:
+              - '**.rs'
+              - Cargo.toml
+              - Cargo.lock
+              - .github/workflows/codeql.yaml
+
+  analyze:
+    # Scheduled runs skip change detection and always analyze. !cancelled()
+    # keeps this job from being skipped along with that skipped job.
+    needs: changes
+    if: ${{ !cancelled() && (github.event_name == 'schedule' || needs.changes.outputs.code == 'true') }}
+    name: Analyze (rust)
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      security-events: write
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+
+      - name: Initialize CodeQL
+        uses: github/codeql-action/init@24c54180a607b1449ed407dd24f251e4e9147c8d # v4
+        with:
+          languages: rust
+
+      - name: Autobuild
+        uses: github/codeql-action/autobuild@24c54180a607b1449ed407dd24f251e4e9147c8d # v4
+
+      - name: Perform CodeQL Analysis
+        uses: github/codeql-action/analyze@24c54180a607b1449ed407dd24f251e4e9147c8d # v4
+        with:
+          category: "/language:rust"
