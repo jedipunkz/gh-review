@@ -237,4 +237,13 @@ mod tests {
             .count();
         assert!(count <= DISK_CACHE_MAX_FILE, "prune left {count} files");
     }
+
+    #[test]
+    fn test_default_cache_answers_none_for_unknown_keys() {
+        // Default::default() resolves the user's real cache dir; whatever it
+        // is, an unknown key must simply miss.
+        let c = DetailCache::default();
+        assert!(c.get_disk("no-such-key").is_none());
+        assert!(c.get_mem("no-such-key").is_none());
+    }
 }

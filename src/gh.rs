@@ -915,4 +915,418 @@ mod tests {
         assert_eq!(s, "2026-05-13T01:02:03.123Z");
         assert_eq!(parse_rfc3339(&s), t);
     }
+
+    // ---- the gh command paths, over a fake runner ----
+
+    // Wraps a canned responder so every call's args are recorded too.
+    fn recording_runner<F>(f: F) -> (Gh, std::sync::Arc<std::sync::Mutex<Vec<Vec<String>>>>)
+    where
+        F: Fn(&[String]) -> Result<Vec<u8>> + Send + Sync + 'static,
+    {
+        let calls = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let sink = calls.clone();
+        let g = Gh::with_runner(std::sync::Arc::new(move |args: &[String]| {
+            sink.lock().unwrap().push(args.to_vec());
+            f(args)
+        }));
+        (g, calls)
+    }
+
+    fn search_node(n: u64, title: &str, updated: &str) -> serde_json::Value {
+        serde_json::json!({
+            "number": n,
+            "title": title,
+            "url": format!("https://github.com/jedipunkz/gh-review/pull/{n}"),
+            "updatedAt": updated,
+            "reviewDecision": "REVIEW_REQUIRED",
+            "state": "OPEN",
+            "repository": {"nameWithOwner": "jedipunkz/gh-review"},
+            "author": {"login": "octocat"},
+        })
+    }
+
+    fn search_page_json(nodes: &[serde_json::Value], has_next: bool, cursor: &str) -> Vec<u8> {
+        serde_json::json!({
+            "data": {"search": {
+                "pageInfo": {"hasNextPage": has_next, "endCursor": cursor},
+                "nodes": nodes,
+            }}
+        })
+        .to_string()
+        .into_bytes()
+    }
+
+    fn team_tsv(org: &str, slug: &str) -> Vec<u8> {
+        format!("{org}\t{slug}\n").into_bytes()
+    }
+
+    fn pr_view_json() -> Vec<u8> {
+        serde_json::json!({
+            "number": 56,
+            "title": "fix: sanitize PR text",
+            "url": "https://github.com/o/r/pull/56",
+            "body": "hello body",
+            "createdAt": "2026-05-01T00:00:00Z",
+            "updatedAt": "2026-05-02T03:04:05Z",
+            "baseRefName": "main",
+            "headRefName": "feat/x",
+            "reviewDecision": "REVIEW_REQUIRED",
+            "mergeStateStatus": "BEHIND",
+            "additions": 3,
+            "deletions": 1,
+            "changedFiles": 2,
+            "author": {"login": "octocat"},
+            "labels": [{"name": "ui"}, {"name": ""}],
+            "latestReviews": [
+                {"state": "APPROVED", "author": {"login": "r1"}},
+                {"state": "PENDING", "author": {"login": "r2"}},
+                {"state": "CHANGES_REQUESTED", "author": {"login": ""}},
+            ],
+        })
+        .to_string()
+        .into_bytes()
+    }
+
+    #[tokio::test]
+    async fn test_search_prs_follows_pagination() {
+        let p1 = search_page_json(&[search_node(1, "one", "2026-05-13T01:02:03Z")], true, "c1");
+        let p2 = search_page_json(&[search_node(2, "two", "2026-05-14T01:02:03Z")], false, "");
+        let (g, calls) = recording_runner(move |args| {
+            if args.iter().any(|a| a.contains("after=c1")) {
+                Ok(p2.clone())
+            } else {
+                Ok(p1.clone())
+            }
+        });
+
+        let prs = search_prs(&g, "is:pr is:open", "@me", None).await.unwrap();
+
+        assert_eq!(prs.len(), 2, "both pages must be fetched");
+        let calls = calls.lock().unwrap();
+        assert_eq!(calls.len(), 2);
+        assert!(
+            calls[0].iter().any(|a| a.starts_with("q=is:pr is:open")),
+            "the query rides in as -F q=..."
+        );
+        assert!(
+            !calls[0].iter().any(|a| a.starts_with("after=")),
+            "the first page carries no cursor"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_search_prs_respects_max_pages() {
+        let p1 = search_page_json(&[search_node(1, "one", "2026-05-13T01:02:03Z")], true, "c1");
+        let (g, calls) = recording_runner(move |_| Ok(p1.clone()));
+
+        let prs = search_prs(&g, "is:pr is:open", "@me", Some(1))
+            .await
+            .unwrap();
+
+        assert_eq!(prs.len(), 1);
+        assert_eq!(
+            calls.lock().unwrap().len(),
+            1,
+            "page two must not be fetched"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_load_teams_parses_tsv_and_caches() {
+        let body = team_tsv("org1", "team1");
+        let (g, calls) = recording_runner(move |_| Ok(body.clone()));
+
+        let teams = load_teams(&g).await.unwrap();
+        assert_eq!(
+            teams,
+            vec![Team {
+                organization: "org1".into(),
+                slug: "team1".into()
+            }]
+        );
+
+        let again = load_teams(&g).await.unwrap();
+        assert_eq!(again, teams);
+        assert_eq!(
+            calls.lock().unwrap().len(),
+            1,
+            "the second call must hit the cache"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_load_teams_skips_malformed_lines() {
+        let mut body = team_tsv("org1", "team1");
+        body.extend_from_slice(b"\nbroken-without-tab\n");
+        let (g, _) = recording_runner(move |_| Ok(body.clone()));
+
+        let teams = load_teams(&g).await.unwrap();
+        assert_eq!(teams.len(), 1, "the tab-less line must be skipped");
+    }
+
+    #[tokio::test]
+    async fn test_load_pr_detail_maps_fields_and_skips_pending_reviews() {
+        let body = pr_view_json();
+        let (g, calls) = recording_runner(move |_| Ok(body.clone()));
+        let pr = PullRequest {
+            repository: "o/r".into(),
+            number: 99,
+            title: "stale title".into(),
+            url: "https://github.com/o/r/pull/56".into(),
+            ..Default::default()
+        };
+
+        let d = load_pr_detail(&g, &pr).await.unwrap();
+
+        // The view response wins over the stale list entry.
+        assert_eq!(d.base.number, 56);
+        assert_eq!(d.base.title, "fix: sanitize PR text");
+        assert_eq!(d.base.author, "octocat");
+        assert_eq!(d.base_ref_name, "main");
+        assert_eq!(d.head_ref_name, "feat/x");
+        assert_eq!(d.base.review_decision, "REVIEW_REQUIRED");
+        assert_eq!(d.merge_state_status, "BEHIND");
+        assert_eq!(d.additions, 3);
+        assert_eq!(d.deletions, 1);
+        assert_eq!(d.changed_files, 2);
+        assert_eq!(d.body, "hello body");
+        // Empty labels are dropped.
+        assert_eq!(d.labels, vec!["ui"]);
+        // Pending reviews and anonymous reviewers are skipped.
+        assert_eq!(
+            d.reviewers,
+            vec![ReviewSummary {
+                author: "r1".into(),
+                state: "APPROVED".into()
+            }]
+        );
+        // The command is `gh pr view <url> --json <fields>`.
+        let c = calls.lock().unwrap();
+        assert_eq!(c[0][0], "pr");
+        assert_eq!(c[0][1], "view");
+        assert_eq!(c[0][2], "https://github.com/o/r/pull/56");
+        assert_eq!(c[0][3], "--json");
+        assert!(c[0][4].contains("latestReviews"));
+    }
+
+    #[tokio::test]
+    async fn test_load_diff_returns_plain_text() {
+        let (g, _) = recording_runner(|_| Ok(b"diff --git a/x b/x\n".to_vec()));
+        let pr = PullRequest {
+            url: "https://github.com/o/r/pull/1".into(),
+            ..Default::default()
+        };
+
+        let diff = load_diff(&g, &pr).await.unwrap();
+        assert!(diff.contains("diff --git"));
+    }
+
+    #[tokio::test]
+    async fn test_load_detail_and_diff_ok() {
+        let (g, _) = recording_runner(move |args| {
+            if args.len() > 1 && args[1] == "diff" {
+                Ok(b"diff body".to_vec())
+            } else {
+                Ok(pr_view_json())
+            }
+        });
+        let pr = PullRequest {
+            url: "https://github.com/o/r/pull/56".into(),
+            ..Default::default()
+        };
+
+        let (detail, diff) = load_detail_and_diff(&g, &pr).await.unwrap();
+        assert_eq!(detail.body, "hello body");
+        assert_eq!(diff, "diff body");
+    }
+
+    #[tokio::test]
+    async fn test_load_detail_and_diff_survives_too_large_diff() {
+        let (g, _) = recording_runner(move |args| {
+            if args.len() > 1 && args[1] == "diff" {
+                Err(GhiError::Gh(
+                    "gh pr diff: HTTP 406: PullRequest.diff too_large".into(),
+                ))
+            } else {
+                Ok(pr_view_json())
+            }
+        });
+        let pr = PullRequest {
+            url: "https://github.com/o/r/pull/56".into(),
+            ..Default::default()
+        };
+
+        let (detail, diff) = load_detail_and_diff(&g, &pr).await.unwrap();
+        assert_eq!(detail.body, "hello body");
+        assert!(
+            diff.contains("too large to display"),
+            "the placeholder must stand in for the omitted diff, got: {diff}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_load_review_requests_merges_team_and_personal_results() {
+        let page = search_page_json(
+            &[
+                search_node(1, "one", "2026-05-14T01:02:03Z"),
+                search_node(2, "two", "2026-05-13T01:02:03Z"),
+            ],
+            false,
+            "",
+        );
+        let (g, calls) = recording_runner(move |args| {
+            if args.iter().any(|a| a == "user/teams") {
+                Ok(team_tsv("org1", "team1"))
+            } else {
+                Ok(page.clone())
+            }
+        });
+
+        let prs = load_review_requests(&g).await.unwrap();
+
+        // Two queries (@me and the team) returned the same PRs: they merge
+        // by URL, newest first.
+        assert_eq!(prs.len(), 2);
+        assert_eq!(prs[0].number, 1, "newest first");
+        let labels: Vec<&str> = prs[0].request.split(", ").collect();
+        assert_eq!(labels.len(), 2, "matched by both queries: {labels:?}");
+        assert!(labels.contains(&"@me"));
+        assert!(labels.contains(&"org1/team1"));
+        // One teams call, two graphql calls (one per query).
+        let c = calls.lock().unwrap();
+        assert_eq!(
+            c.iter()
+                .filter(|a| a.iter().any(|x| x == "user/teams"))
+                .count(),
+            1
+        );
+        assert_eq!(
+            c.iter()
+                .filter(|a| a.iter().any(|x| x == "graphql"))
+                .count(),
+            2
+        );
+    }
+
+    #[tokio::test]
+    async fn test_load_history_filters_by_state_qualifier() {
+        let page = search_page_json(
+            &[search_node(7, "seven", "2026-05-13T01:02:03Z")],
+            false,
+            "",
+        );
+        let (g, calls) = recording_runner(move |args| {
+            if args.iter().any(|a| a == "user/teams") {
+                Ok(Vec::new())
+            } else {
+                Ok(page.clone())
+            }
+        });
+
+        let prs = load_history(&g, HistoryState::Merged).await.unwrap();
+
+        assert_eq!(prs.len(), 1);
+        assert_eq!(
+            prs[0].state, "OPEN",
+            "the response's state rides through as-is"
+        );
+        let c = calls.lock().unwrap();
+        let q = c
+            .iter()
+            .flat_map(|args| args.iter())
+            .find(|a| a.starts_with("q="))
+            .unwrap()
+            .clone();
+        assert!(
+            q.contains("is:merged"),
+            "merged tab must search merged PRs: {q}"
+        );
+        assert!(
+            q.contains("sort:updated-desc"),
+            "history must sort by update time"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_approve_pr_runs_gh_pr_review_approve() {
+        let (g, calls) = recording_runner(|_| Ok(Vec::new()));
+        let pr = PullRequest {
+            url: "https://github.com/o/r/pull/1".into(),
+            ..Default::default()
+        };
+
+        approve_pr(&g, &pr).await.unwrap();
+
+        let c = calls.lock().unwrap();
+        assert_eq!(c.len(), 1);
+        assert_eq!(
+            c[0].join(" "),
+            "pr review https://github.com/o/r/pull/1 --approve"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_comment_pr_glues_the_body_to_body_flag() {
+        let (g, calls) = recording_runner(|_| Ok(Vec::new()));
+        let pr = PullRequest {
+            url: "https://github.com/o/r/pull/1".into(),
+            ..Default::default()
+        };
+
+        comment_pr(&g, &pr, "- starts with a dash\nsecond line")
+            .await
+            .unwrap();
+
+        let c = calls.lock().unwrap();
+        assert_eq!(c.len(), 1);
+        assert!(
+            c[0].contains(&"--body=- starts with a dash\nsecond line".to_string()),
+            "the body must stay glued to --body= so a leading dash is not a flag: {:?}",
+            c[0]
+        );
+    }
+
+    #[test]
+    fn test_history_state_qualifiers() {
+        assert_eq!(HistoryState::Merged.qualifier(), "is:merged");
+        assert_eq!(HistoryState::Merged.pr_state(), "MERGED");
+        assert_eq!(HistoryState::Closed.qualifier(), "is:closed is:unmerged");
+        assert_eq!(HistoryState::Closed.pr_state(), "CLOSED");
+    }
+
+    #[test]
+    fn test_format_human_falls_back_to_epoch() {
+        let t = SystemTime::UNIX_EPOCH + Duration::new(1778634123, 0);
+        assert_eq!(format_human(t), "2026-05-13 01:02");
+    }
+
+    // run_gh itself, against the real gh binary present on this machine.
+    #[tokio::test]
+    async fn test_gh_new_runs_the_real_gh() {
+        let out = Gh::new().run(&["--version".to_string()]).await.unwrap();
+        assert!(String::from_utf8_lossy(&out).contains("gh version"));
+    }
+
+    #[tokio::test]
+    async fn test_run_gh_success() {
+        let out = run_gh(&["--version".to_string()]).await.unwrap();
+        assert!(String::from_utf8_lossy(&out).contains("gh version"));
+    }
+
+    #[tokio::test]
+    async fn test_run_gh_surfaces_stderr() {
+        let err = run_gh(&["not-a-real-subcommand".to_string()])
+            .await
+            .unwrap_err();
+        match err {
+            GhiError::Gh(m) => {
+                assert!(m.starts_with("gh not-a-real-subcommand"), "got: {m}");
+                assert!(
+                    !m.ends_with("unknown error"),
+                    "stderr text must ride along: {m}"
+                );
+            }
+            other => panic!("expected GhiError::Gh, got {other:?}"),
+        }
+    }
 }

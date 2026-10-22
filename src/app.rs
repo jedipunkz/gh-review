@@ -2716,6 +2716,216 @@ mod tests {
         assert_eq!(sanitize_text("日本語 plain"), "日本語 plain");
     }
 
+    // ---- search input handling ----
+
+    fn char_key(ch: char) -> Msg {
+        Msg::Key(crossterm::event::KeyEvent::new(
+            crossterm::event::KeyCode::Char(ch),
+            crossterm::event::KeyModifiers::NONE,
+        ))
+    }
+
+    #[test]
+    fn test_search_keys_edit_query_and_clear() {
+        let mut m = model_with_loaded_detail();
+
+        m.update(key(crossterm::event::KeyCode::Char('/')));
+        assert!(m.search_active, "/ must open the search");
+        assert_eq!(m.search_cursor, 0);
+
+        for ch in "abc".chars() {
+            m.update(char_key(ch));
+        }
+        assert_eq!(m.search_value, "abc");
+
+        // Arrow keys move within the query; typing inserts at the cursor.
+        m.update(key(crossterm::event::KeyCode::Left));
+        m.update(char_key('X'));
+        assert_eq!(m.search_value, "abXc");
+        assert_eq!(m.search_cursor, 3);
+
+        // Backspace drops the char left of the cursor.
+        m.update(key(crossterm::event::KeyCode::Backspace));
+        assert_eq!(m.search_value, "abc");
+        assert_eq!(m.search_cursor, 2);
+
+        // Delete drops the char under the cursor.
+        m.update(key(crossterm::event::KeyCode::Delete));
+        assert_eq!(m.search_value, "ab");
+
+        // Home and End jump.
+        m.update(key(crossterm::event::KeyCode::End));
+        assert_eq!(m.search_cursor, 2);
+        m.update(key(crossterm::event::KeyCode::Home));
+        assert_eq!(m.search_cursor, 0);
+
+        // Esc closes the search and forgets the query.
+        m.update(key(crossterm::event::KeyCode::Esc));
+        assert!(!m.search_active);
+        assert!(m.search_value.is_empty());
+
+        // Enter just closes it, keeping the query.
+        m.update(key(crossterm::event::KeyCode::Char('/')));
+        m.update(char_key('q'));
+        m.update(key(crossterm::event::KeyCode::Enter));
+        assert!(!m.search_active);
+        assert_eq!(m.search_value, "q");
+    }
+
+    #[test]
+    fn test_search_ctrl_n_and_p_move_selection() {
+        let mut m = model_with_loaded_detail();
+        let mut prs: Vec<PullRequest> = (0..3)
+            .map(|i| PullRequest {
+                repository: "owner/repo".into(),
+                number: i + 1,
+                url: format!("https://example.test/pr/{}", i + 1),
+                state: "OPEN".into(),
+                ..Default::default()
+            })
+            .collect();
+        prs.sort_by_key(|p| std::cmp::Reverse(p.number)); // newest first, list order
+        m.update(Msg::PRList(Ok(prs)));
+        assert_eq!(m.cursor, 0);
+
+        m.update(key(crossterm::event::KeyCode::Char('/')));
+        m.update(ctrl_key(crossterm::event::KeyCode::Char('n')));
+        assert_eq!(
+            m.cursor, 1,
+            "ctrl+n must move the selection inside the search"
+        );
+        m.update(ctrl_key(crossterm::event::KeyCode::Char('p')));
+        assert_eq!(m.cursor, 0);
+        m.update(ctrl_key(crossterm::event::KeyCode::Char('c')));
+        assert!(m.quit);
+    }
+
+    #[test]
+    fn test_char_to_byte_multibyte() {
+        let mut m = new_model();
+        m.search_value = "日a本".into();
+        assert_eq!(m.char_to_byte(0), 0);
+        assert_eq!(m.char_to_byte(1), 3);
+        assert_eq!(m.char_to_byte(2), 4);
+        assert_eq!(m.char_to_byte(3), 7);
+        assert_eq!(
+            m.char_to_byte(99),
+            7,
+            "past the end clamps to the text length"
+        );
+    }
+
+    #[test]
+    fn test_spinner_cycles() {
+        let mut m = new_model();
+        m.spinner_frame = 0;
+        let first = m.spinner();
+        m.spinner_frame = SPINNER_FRAMES.len();
+        assert_eq!(m.spinner(), first, "the spinner must wrap");
+        m.spinner_frame = 1;
+        assert_ne!(m.spinner(), first);
+    }
+
+    #[test]
+    fn test_history_prs_filters_history_state() {
+        let mut m = new_model();
+        let mk = |n: u64, state: &str| PullRequest {
+            repository: "o/r".into(),
+            number: n,
+            url: format!("https://example.test/pr/{n}"),
+            state: state.into(),
+            ..Default::default()
+        };
+        m.prs = vec![mk(1, "OPEN"), mk(2, "MERGED"), mk(3, "CLOSED")];
+        assert_eq!(m.history_prs().len(), 2);
+        assert_eq!(m.open_count(), 1);
+    }
+
+    // ---- popup rendering ----
+
+    fn buffer_text(buf: &ratatui::buffer::Buffer) -> String {
+        let area = buf.area;
+        let mut out = String::new();
+        for y in 0..area.height {
+            for x in 0..area.width {
+                out.push_str(buf[(x, y)].symbol());
+            }
+            out.push('\n');
+        }
+        out
+    }
+
+    #[test]
+    fn test_update_notice_popup_shows_count() {
+        let mut m = new_model();
+        m.update_notice = Some(UpdateNotice { count: 3, id: 1 });
+        let mut term = ratatui::Terminal::new(ratatui::backend::TestBackend::new(80, 24)).unwrap();
+        term.draw(|f| render(&mut m, f)).unwrap();
+        let text = buffer_text(term.backend().buffer());
+        assert!(
+            text.contains("Review updated"),
+            "popup title missing:\n{text}"
+        );
+        assert!(
+            text.contains("3 review request(s)"),
+            "count missing:\n{text}"
+        );
+    }
+
+    #[test]
+    fn test_approve_popup_names_the_pr_and_asks() {
+        let mut m = model_with_loaded_detail();
+        m.pending_approve = Some(m.prs[0].clone());
+        let mut term = ratatui::Terminal::new(ratatui::backend::TestBackend::new(80, 24)).unwrap();
+        term.draw(|f| render(&mut m, f)).unwrap();
+        let text = buffer_text(term.backend().buffer());
+        assert!(
+            text.contains("Approve pull request?"),
+            "prompt missing:\n{text}"
+        );
+        assert!(text.contains("y Yes"), "the yes key must be named:\n{text}");
+        assert!(
+            text.contains("c Cancel"),
+            "the cancel key must be named:\n{text}"
+        );
+    }
+
+    #[test]
+    fn test_popup_rect_corner_and_centered() {
+        let area = Rect::new(0, 0, 80, 24);
+        // Corner popup (update notice): snug against the bottom-right.
+        // pw = max_width + pad_x*2 + 2 = 18, ph = lines + 2 = 4.
+        let corner = popup_rect(2, 14, 1, area, true);
+        assert_eq!(corner, Rect::new(80 - 18 - 1, 24 - 4 - 1, 18, 4));
+        // Centered popup (approve): the remaining slack split evenly.
+        let centered = popup_rect(5, 30, 2, area, false);
+        assert_eq!(centered.width, 36);
+        assert_eq!(centered.height, 7);
+        assert_eq!(centered.x, (80 - 36) / 2);
+        assert_eq!(centered.y, (24 - 7) / 2);
+        // A popup wider than the terminal clamps to the area.
+        let clamped = popup_rect(9, 200, 2, area, false);
+        assert_eq!(clamped.width, 80);
+        assert_eq!(clamped.height, 11);
+    }
+
+    #[test]
+    fn test_search_line_renders_query() {
+        let mut m = model_with_loaded_detail();
+        m.update(key(crossterm::event::KeyCode::Char('/')));
+        m.update(char_key('f'));
+        m.update(char_key('i'));
+        m.update(char_key('x'));
+        assert!(m.search_visible());
+        let mut term = ratatui::Terminal::new(ratatui::backend::TestBackend::new(80, 24)).unwrap();
+        term.draw(|f| render(&mut m, f)).unwrap();
+        let text = buffer_text(term.backend().buffer());
+        assert!(
+            text.contains("fix"),
+            "the query must be visible in the search line:\n{text}"
+        );
+    }
+
     fn pr(url: &str) -> PullRequest {
         PullRequest {
             url: url.to_string(),
