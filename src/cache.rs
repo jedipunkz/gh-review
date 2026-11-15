@@ -1,5 +1,6 @@
 use std::collections::HashMap;
-use std::fs;
+use std::fs::{self, OpenOptions};
+use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::time::SystemTime;
@@ -80,7 +81,7 @@ impl DetailCache {
             Some(d) => d,
             None => return,
         };
-        if fs::create_dir_all(dir).is_err() {
+        if ensure_cache_dir(dir).is_err() {
             return;
         }
         let data = match serde_json::to_vec(&e) {
@@ -89,7 +90,7 @@ impl DetailCache {
         };
         let path = dir.join(format!("{key}.json"));
         let tmp = dir.join(format!("{key}.{}.tmp", std::process::id()));
-        if fs::write(&tmp, &data).is_err() {
+        if write_cache_file(&tmp, &data).is_err() {
             let _ = fs::remove_file(&tmp);
             return;
         }
@@ -130,6 +131,47 @@ impl DetailCache {
             let _ = fs::remove_file(path);
         }
     }
+}
+
+fn ensure_cache_dir(dir: &Path) -> io::Result<()> {
+    if let Some(parent) = dir.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
+
+        match fs::DirBuilder::new().mode(0o700).create(dir) {
+            Ok(()) => {}
+            Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {}
+            Err(e) => return Err(e),
+        }
+        if !fs::symlink_metadata(dir)?.file_type().is_dir() {
+            return Err(io::Error::other("cache path is not a directory"));
+        }
+        fs::set_permissions(dir, fs::Permissions::from_mode(0o700))
+    }
+    #[cfg(not(unix))]
+    {
+        fs::create_dir_all(dir)
+    }
+}
+
+fn write_cache_file(path: &Path, data: &[u8]) -> io::Result<()> {
+    let mut options = OpenOptions::new();
+    options.write(true).create(true).truncate(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let mut file = options.open(path)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        file.set_permissions(fs::Permissions::from_mode(0o600))?;
+    }
+    file.write_all(data)
 }
 
 #[cfg(test)]
@@ -197,6 +239,36 @@ mod tests {
             c2.get_mem(key).is_some(),
             "getDisk should populate memory cache"
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_cache_directory_and_files_are_private() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let parent = tempfile::tempdir().unwrap();
+        let dir = parent.path().join("gh-review");
+        fs::create_dir(&dir).unwrap();
+        fs::set_permissions(&dir, fs::Permissions::from_mode(0o755)).unwrap();
+        let c = new_test_cache(&dir);
+        let key = "abc1234567890def";
+
+        c.put(
+            key,
+            CacheEntry {
+                detail: Default::default(),
+                diff: "private diff".into(),
+            },
+        );
+
+        let dir_mode = fs::metadata(&dir).unwrap().permissions().mode() & 0o777;
+        let file_mode = fs::metadata(dir.join(format!("{key}.json")))
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(dir_mode, 0o700, "cache directory must be owner-only");
+        assert_eq!(file_mode, 0o600, "cache files must be owner-only");
     }
 
     #[test]
