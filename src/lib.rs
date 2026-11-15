@@ -4,6 +4,7 @@ pub mod editor;
 pub mod error;
 pub mod gh;
 pub mod prefetch;
+pub mod syntax;
 pub mod theme;
 
 #[cfg(test)]

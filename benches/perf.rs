@@ -128,6 +128,27 @@ fn render_diff_120col() {
     app::render_diff_content(&d, diff(), 120);
 }
 
+// The same hunks under a Rust file header, so every code line goes through
+// the syntax highlighter (the plain diff above has no file to detect).
+fn rust_diff() -> &'static str {
+    static D: OnceLock<String> = OnceLock::new();
+    D.get_or_init(|| {
+        let mut s = String::from("diff --git a/src/lib.rs b/src/lib.rs\n");
+        for i in 0..400 {
+            s.push_str(&format!(
+                "@@ -{i},7 +{i},7 @@\n fn f{i}(x: u32) -> u32 {{\n-    x + {i} // old\n+    let s = \"v{i}\"; x * {i}\n"
+            ));
+        }
+        s
+    })
+}
+
+#[divan::bench]
+fn render_diff_rust_120col() {
+    let d = detail();
+    app::render_diff_content(&d, rust_diff(), 120);
+}
+
 #[divan::bench]
 fn combine_pr_lists() {
     let open = prs().clone();

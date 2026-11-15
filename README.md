@@ -26,8 +26,11 @@ waiting for your review, shows the diff in a TUI, and approves from the keyboard
 
 - **Review queue at a glance**: open PRs that request review from you or your
   teams, split into `Awaiting Review`, `Reviewed`, `Merged`, and `Closed` tabs.
-- **Diff in the terminal**: metadata, description, headline diff, and the
-  latest reviews of the selected PR.
+- **Diff in the terminal**: metadata, CI check status, a diffstat bar,
+  description, syntax-highlighted diff, and the latest reviews of the
+  selected PR.
+- **Mouse support**: wheel to move through the list or scroll the detail,
+  click to select a PR.
 - **Approve and comment from the keyboard**: `a` to approve, `c` to write a
   review comment (IME input supported, drafts kept per PR).
 - **Auto refresh**: re-checks every minute and notifies you (with a sound on
@@ -44,7 +47,7 @@ waiting for your review, shows the diff in a TUI, and approves from the keyboard
 ### Prerequisites
 
 - A GitHub CLI (`gh`) installation that is authenticated
-- [Rust](https://rustup.rs) 1.75 or later (only for building from source)
+- [Rust](https://rustup.rs) 1.88 or later (only for building from source)
 
 ### Step 1. Install the extension
 
@@ -100,6 +103,18 @@ headline diff, and the latest reviews.
 |---|---|
 | `j` / `k` | Scroll the detail |
 | `pgup` / `pgdn` | Page-scroll the detail |
+
+### Mouse
+
+| Action | Effect |
+|---|---|
+| Wheel over the list | Move the selection |
+| Wheel over the detail | Scroll the detail |
+| Left click on a list row | Select that PR |
+
+Mouse capture turns off the terminal's own text selection. Most terminals
+let you select text anyway while a modifier key is held during the drag
+(usually `shift`); the key depends on the terminal.
 
 ## 📖 Usage
 

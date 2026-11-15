@@ -3,11 +3,13 @@ use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
-use ratatui::layout::Rect;
+use ratatui::layout::{Constraint, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::symbols::border;
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Clear, Padding, Paragraph, Wrap};
+use ratatui::widgets::{
+    Block, Cell, Clear, HighlightSpacing, Padding, Paragraph, Row, Table, TableState, Wrap,
+};
 use ratatui::Frame;
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
@@ -36,6 +38,8 @@ const COL_REPO_W: usize = 28;
 const COL_NUM_W: usize = 6;
 const COL_AUTHOR_W: usize = 15;
 const COL_APPROVE_W: usize = 11;
+
+const MOUSE_SCROLL_LINES: i32 = 3;
 
 const SPINNER_FRAMES: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
 
@@ -113,6 +117,7 @@ pub enum Effect {
 
 pub enum Msg {
     Key(crossterm::event::KeyEvent),
+    Mouse(crossterm::event::MouseEvent),
     Resize(u16, u16),
     PRList(Result<Vec<PullRequest>, String>),
     HistoryList {
@@ -525,9 +530,20 @@ impl Model {
         };
         if let Some((entry, effect)) = cached {
             self.debounce_seq += 1;
+            // ponytail: CI results land without bumping updatedAt (the cache
+            // key), so a cached pending run is refetched, debounced like a
+            // miss so wheel-scrolling the list does not fan out fetches. A
+            // re-run of a finished check stays stale until the PR updates.
+            let refresh = effect.is_none() && entry.detail.ci.pending > 0;
             self.current_detail = Some(entry.detail);
             self.current_diff = entry.diff;
             self.detail_loading = false;
+            if refresh {
+                return Some(Effect::Debounce {
+                    seq: self.debounce_seq,
+                    url: pr.url,
+                });
+            }
             return effect;
         }
         self.debounce_seq += 1;
@@ -650,6 +666,7 @@ impl Model {
                 }
                 self.handle_key(k)
             }
+            Msg::Mouse(ev) => self.handle_mouse(ev),
             Msg::Resize(w, h) => {
                 self.width = w;
                 self.height = h;
@@ -686,10 +703,19 @@ impl Model {
                     }
                     Ok((detail, diff)) => {
                         self.detail_err = String::new();
+                        // A refetch of the PR already on screen (cached view
+                        // revalidated) keeps the reading position; render
+                        // clamps it to the new length.
+                        let same = self
+                            .current_detail
+                            .as_ref()
+                            .is_some_and(|d| d.base.url == detail.base.url);
+                        if !same {
+                            self.detail_scroll = 0;
+                            self.detail_total = 0;
+                        }
                         self.current_detail = Some(detail);
                         self.current_diff = diff;
-                        self.detail_scroll = 0;
-                        self.detail_total = 0;
                         Vec::new()
                     }
                 }
@@ -880,26 +906,8 @@ impl Model {
                 effects.extend(self.load_active_history_tab());
                 effects
             }
-            crossterm::event::KeyCode::Char('n') if ctrl => {
-                if self.loading {
-                    return Vec::new();
-                }
-                if self.advance_cursor(1) {
-                    self.ensure_cursor_visible();
-                    return self.detail_and_prefetch_effects();
-                }
-                Vec::new()
-            }
-            crossterm::event::KeyCode::Char('p') if ctrl => {
-                if self.loading {
-                    return Vec::new();
-                }
-                if self.advance_cursor(-1) {
-                    self.ensure_cursor_visible();
-                    return self.detail_and_prefetch_effects();
-                }
-                Vec::new()
-            }
+            crossterm::event::KeyCode::Char('n') if ctrl => self.move_cursor(1),
+            crossterm::event::KeyCode::Char('p') if ctrl => self.move_cursor(-1),
             crossterm::event::KeyCode::Char('h') if !ctrl => self.switch_tab(-1),
             crossterm::event::KeyCode::Char('l') if !ctrl => self.switch_tab(1),
             crossterm::event::KeyCode::Char('/') if !ctrl => {
@@ -973,6 +981,61 @@ impl Model {
                     self.status = "ctrl+enter (or ctrl+s) to send, esc to cancel".to_string();
                 }
                 Vec::new()
+            }
+            _ => Vec::new(),
+        }
+    }
+
+    fn move_cursor(&mut self, delta: i32) -> Vec<Effect> {
+        if self.loading {
+            return Vec::new();
+        }
+        if self.advance_cursor(delta) {
+            self.ensure_cursor_visible();
+            return self.detail_and_prefetch_effects();
+        }
+        Vec::new()
+    }
+
+    /// Wheel over the list moves the cursor, wheel elsewhere scrolls the
+    /// detail, and a left click on a list row selects it. Row geometry
+    /// mirrors render(): optional search line, tab bar, top border, header.
+    fn handle_mouse(&mut self, ev: crossterm::event::MouseEvent) -> Vec<Effect> {
+        use crossterm::event::{MouseButton, MouseEventKind};
+        if self.search_active || self.pending_approve.is_some() || self.comment_editor.is_some() {
+            return Vec::new();
+        }
+        let search_h = u16::from(self.search_visible());
+        let list_h = (self.compute_list_section_height() as u16)
+            .min(self.height.saturating_sub(search_h + 1));
+        let in_list = ev.row < search_h + list_h;
+        match ev.kind {
+            MouseEventKind::ScrollDown if in_list => self.move_cursor(1),
+            MouseEventKind::ScrollUp if in_list => self.move_cursor(-1),
+            MouseEventKind::ScrollDown => {
+                self.scroll_detail(MOUSE_SCROLL_LINES);
+                Vec::new()
+            }
+            MouseEventKind::ScrollUp => {
+                self.scroll_detail(-MOUSE_SCROLL_LINES);
+                Vec::new()
+            }
+            MouseEventKind::Down(MouseButton::Left) if in_list && !self.loading => {
+                let first_row = search_h + 3;
+                let visible = self.visible_pr_indices();
+                let hit = ev
+                    .row
+                    .checked_sub(first_row)
+                    .and_then(|i| visible.get(i as usize).copied());
+                match hit {
+                    Some(idx) if idx != self.cursor => {
+                        self.clear_mark_on_selected();
+                        self.cursor = idx;
+                        self.ensure_cursor_visible();
+                        self.detail_and_prefetch_effects()
+                    }
+                    _ => Vec::new(),
+                }
             }
             _ => Vec::new(),
         }
@@ -1458,7 +1521,16 @@ pub fn render_diff_content(
         format!("-{}", detail.deletions),
         fg(colors::RED),
     ));
+    if let Some((add, del)) = diffstat_blocks(detail.additions, detail.deletions) {
+        meta2.push(Span::raw(" "));
+        meta2.push(Span::styled("■".repeat(add), fg(colors::GREEN)));
+        meta2.push(Span::styled("■".repeat(del), fg(colors::RED)));
+    }
     lines.push(Line::from(meta2));
+
+    if let Some(ci) = render_ci_line(&detail.ci) {
+        lines.push(ci);
+    }
 
     if !detail.reviewers.is_empty() {
         let mut spans = vec![
@@ -1541,6 +1613,55 @@ pub fn render_diff_content(
         }
     }
     wrapped
+}
+
+/// "CI: failing  ✓3 ✗1 ●2", or None when the head commit has no checks.
+fn render_ci_line(ci: &gh::CiSummary) -> Option<Line<'static>> {
+    let (word, word_color) = if ci.failed > 0 {
+        ("failing", colors::RED)
+    } else if ci.pending > 0 {
+        ("pending", colors::YELLOW)
+    } else if ci.passed > 0 {
+        ("passing", colors::GREEN)
+    } else {
+        return None;
+    };
+    let mut spans = vec![
+        Span::styled("CI:".to_string(), fg(colors::YELLOW)),
+        Span::raw(" "),
+        Span::styled(
+            word.to_string(),
+            fg(word_color).add_modifier(Modifier::BOLD),
+        ),
+    ];
+    for (n, mark, color) in [
+        (ci.passed, "✓", colors::GREEN),
+        (ci.failed, "✗", colors::RED),
+        (ci.pending, "●", colors::YELLOW),
+    ] {
+        if n > 0 {
+            spans.push(Span::raw(" "));
+            spans.push(Span::styled(format!("{mark}{n}"), fg(color)));
+        }
+    }
+    Some(Line::from(spans))
+}
+
+const DIFFSTAT_BLOCKS: usize = 5;
+
+/// Splits GitHub's five-block diffstat bar into (green, red) counts by the
+/// share of added lines. Any nonzero side keeps at least one block, so a
+/// one-line deletion in a large addition is still visible. None when there
+/// are no changed lines.
+fn diffstat_blocks(additions: i64, deletions: i64) -> Option<(usize, usize)> {
+    let (add, del) = (additions.max(0) as u64, deletions.max(0) as u64);
+    let total = add + del;
+    if total == 0 {
+        return None;
+    }
+    let n = DIFFSTAT_BLOCKS as u64;
+    let green = ((add * n + total / 2) / total).clamp(u64::from(add > 0), n - u64::from(del > 0));
+    Some((green as usize, DIFFSTAT_BLOCKS - green as usize))
 }
 
 fn meta_pair(label: &str, value: &str) -> Vec<Span<'static>> {
@@ -1704,10 +1825,17 @@ fn highlight_diff(diff: &str) -> Vec<Line<'static>> {
     if diff.is_empty() {
         return Vec::new();
     }
+    let added_bg = Style::new().bg(mix(colors::BAR_BG, colors::GREEN, DIFF_TINT));
+    let removed_bg = Style::new().bg(mix(colors::BAR_BG, colors::RED, DIFF_TINT));
+    let mut hl = crate::syntax::Highlighter::default();
+    let mut budget = HIGHLIGHT_MAX_LINES;
     diff.lines()
         .map(|line| sanitize_text(&strip_ansi(line)))
         .map(|line| {
             let style = if line.starts_with("diff --git") {
+                if let Some((_, path)) = line.rsplit_once(" b/") {
+                    hl.set_file(path);
+                }
                 Style::new()
                     .fg(c(colors::CYAN))
                     .add_modifier(Modifier::BOLD)
@@ -1725,17 +1853,52 @@ fn highlight_diff(diff: &str) -> Vec<Line<'static>> {
             {
                 fg(colors::MUTED)
             } else if line.starts_with("@@") {
+                hl.reset();
                 fg(colors::MAGENTA)
-            } else if line.starts_with('+') {
-                fg(colors::GREEN)
-            } else if line.starts_with('-') {
-                fg(colors::RED)
             } else {
-                Style::new()
+                let (marker, tint, plain) = match line.chars().next() {
+                    Some('+') => ("+", added_bg, fg(colors::GREEN)),
+                    Some('-') => ("-", removed_bg, fg(colors::RED)),
+                    Some(' ') => (" ", Style::new(), Style::new()),
+                    _ => return Line::from(Span::raw(line)),
+                };
+                let code = &line[1..];
+                let runs = (budget > 0).then(|| hl.highlight(code)).flatten();
+                budget = budget.saturating_sub(1);
+                let Some(runs) = runs else {
+                    return Line::from(Span::styled(line, plain));
+                };
+                let mut spans = vec![Span::styled(marker.to_string(), plain.patch(tint))];
+                spans.extend(runs.into_iter().map(|(text, slot)| {
+                    Span::styled(text, fg(slot.unwrap_or(colors::FG)).patch(tint))
+                }));
+                return Line::from(spans);
             };
             Line::from(Span::styled(line, style))
         })
         .collect()
+}
+
+/// Code lines per diff that get syntax colors; the rest stay plain.
+// ponytail: syntect with the pure-Rust regex engine parses ~30k lines/s, and
+// the detail renders on the UI thread, so the cap bounds a cold render to
+// ~70 ms. Highlighting off-thread (or the C onig engine, ~3x faster) would
+// lift it.
+const HIGHLIGHT_MAX_LINES: usize = 2000;
+
+/// Share of the accent color in the added / removed line background.
+const DIFF_TINT: f32 = 0.2;
+
+/// Blends palette slot `a` toward `b` by `t` (0 = a, 1 = b).
+fn mix(a: theme::Slot, b: theme::Slot, t: f32) -> Color {
+    match (c(a), c(b)) {
+        (Color::Rgb(r1, g1, b1), Color::Rgb(r2, g2, b2)) => {
+            let ch =
+                |x: u8, y: u8| (f32::from(x) + (f32::from(y) - f32::from(x)) * t).round() as u8;
+            Color::Rgb(ch(r1, r2), ch(g1, g2), ch(b1, b2))
+        }
+        (_, other) => other,
+    }
 }
 
 fn wrap_line_to_width(text: &str, width: usize) -> Vec<String> {
@@ -2096,237 +2259,112 @@ fn render_tab_bar(m: &Model) -> Paragraph<'static> {
     Paragraph::new(Line::from(spans))
 }
 
+const COL_SPACING: usize = 2;
+
+/// Title column width: what the fixed columns, the one-column highlight
+/// symbol, the six column gaps, and the two border columns leave of `box_w`.
 fn list_title_width(box_w: usize) -> usize {
     let fixed = 2
+        + 1
         + COL_MARK_W
-        + 1
         + COL_TYPE_W
-        + 2
         + COL_REPO_W
-        + 2
         + COL_NUM_W
-        + 2
-        + 2
-        + 1
         + COL_AUTHOR_W
-        + 2
-        + COL_APPROVE_W;
+        + COL_APPROVE_W
+        + COL_SPACING * 6;
     std::cmp::max(10, box_w.saturating_sub(fixed))
 }
 
 fn render_list_frame(m: &Model, f: &mut Frame<'_>, rect: Rect) {
-    let box_w = m.frame_width();
-    let title_w = list_title_width(box_w);
-    let mut lines: Vec<Line<'static>> = Vec::new();
-
-    let header = vec![
-        Span::styled(format!(" {}", pad_right("", COL_MARK_W)), fg(colors::MUTED)),
-        Span::raw(" "),
-        Span::styled(pad_right("Type", COL_TYPE_W), fg(colors::MUTED)),
-        Span::raw("  "),
-        Span::styled(pad_right("Repository", COL_REPO_W), fg(colors::MUTED)),
-        Span::raw("  "),
-        Span::styled(pad_right("#", COL_NUM_W), fg(colors::MUTED)),
-        Span::raw("  "),
-        Span::styled(pad_right("Title", title_w), fg(colors::MUTED)),
-        Span::raw("   "),
-        Span::styled(pad_right("Author", COL_AUTHOR_W), fg(colors::MUTED)),
-        Span::raw("  "),
-        Span::styled(pad_right("Approve", COL_APPROVE_W), fg(colors::MUTED)),
-    ];
-    lines.push(Line::from(header));
-
+    let title_w = list_title_width(m.frame_width());
     let items = m.visible_pr_indices();
-    if items.is_empty() {
-        lines.push(Line::from(Span::styled(
-            format!(" {}", m.empty_list_message()),
-            fg(colors::MUTED),
-        )));
-    } else {
-        for idx in items {
-            let pr = &m.prs[idx];
-            lines.push(render_pr_line(m, idx, pr, box_w));
-        }
-    }
-
+    let rows: Vec<Row<'static>> = items
+        .iter()
+        .map(|&idx| render_pr_row(m, idx, &m.prs[idx], title_w))
+        .collect();
+    let widths = [
+        COL_MARK_W,
+        COL_TYPE_W,
+        COL_REPO_W,
+        COL_NUM_W,
+        title_w,
+        COL_AUTHOR_W,
+        COL_APPROVE_W,
+    ]
+    .map(|w| Constraint::Length(w as u16));
+    let header = Row::new(["", "Type", "Repository", "#", "Title", "Author", "Approve"])
+        .style(fg(colors::MUTED));
     let block = Block::bordered()
         .border_set(border::ROUNDED)
         .border_style(fg(colors::FRAME));
     let inner = block.inner(rect);
-    f.render_widget(block, rect);
-    let para = Paragraph::new(lines);
-    f.render_widget(para, inner);
+    let table = Table::new(rows, widths)
+        .header(header)
+        .column_spacing(COL_SPACING as u16)
+        .highlight_symbol(Span::styled("▌", fg(colors::CYAN)))
+        .highlight_spacing(HighlightSpacing::Always)
+        .row_highlight_style(Style::new().bg(c(colors::SELECTED)))
+        .block(block);
+    let mut state = TableState::new().with_selected(items.iter().position(|&i| i == m.cursor));
+    f.render_stateful_widget(table, rect, &mut state);
+
+    if items.is_empty() && inner.height > 1 {
+        let msg = Span::styled(format!(" {}", m.empty_list_message()), fg(colors::MUTED));
+        let area = Rect::new(inner.x, inner.y + 1, inner.width, inner.height - 1);
+        f.render_widget(Paragraph::new(Line::from(msg)), area);
+    }
 }
 
-fn render_pr_line(m: &Model, idx: usize, pr: &PullRequest, box_w: usize) -> Line<'static> {
-    let title_w = list_title_width(box_w);
-    let approve = m.approve_label(pr);
+fn render_pr_row(m: &Model, idx: usize, pr: &PullRequest, title_w: usize) -> Row<'static> {
     let selected = idx == m.cursor;
+    // The table paints the selected row's background; plain or muted columns
+    // switch to a foreground that stays readable on it.
+    let pick = |normal: theme::Slot, sel: theme::Slot| fg(if selected { sel } else { normal });
 
-    let mut spans: Vec<Span<'static>> = Vec::new();
-    if selected {
-        spans.push(Span::styled(
-            "▌".to_string(),
-            Style::new().fg(c(colors::CYAN)).bg(c(colors::SELECTED)),
-        ));
+    let mark = if m.marked_prs.contains(&pr.url) {
+        Span::styled("[!]", fg(colors::YELLOW).add_modifier(Modifier::BOLD))
     } else {
-        spans.push(Span::raw(" "));
-    }
-
-    // mark cell
-    if m.marked_prs.contains(&pr.url) {
-        let style = if selected {
-            Style::new()
-                .fg(c(colors::YELLOW))
-                .bg(c(colors::SELECTED))
-                .add_modifier(Modifier::BOLD)
-        } else {
-            Style::new()
-                .fg(c(colors::YELLOW))
-                .add_modifier(Modifier::BOLD)
-        };
-        spans.push(Span::styled(pad_right("[!]", COL_MARK_W), style));
-    } else if selected {
-        spans.push(Span::styled(
-            repeat_space(COL_MARK_W),
-            Style::new().bg(c(colors::SELECTED)),
-        ));
-    } else {
-        spans.push(Span::raw(repeat_space(COL_MARK_W)));
-    }
-    spans.push(Span::styled(
-        " ".to_string(),
-        if selected {
-            Style::new().bg(c(colors::SELECTED))
-        } else {
-            Style::new()
-        },
-    ));
-
-    // type cell
-    let is_me = pr.request.contains("@me");
-    let type_label = if is_me { "[me]" } else { "[team]" };
-    let type_color = if is_me { colors::CYAN } else { colors::ORANGE };
-    let type_style = if selected {
-        Style::new().fg(c(type_color)).bg(c(colors::SELECTED))
-    } else {
-        fg(type_color)
+        Span::raw("")
     };
-    spans.push(Span::styled(pad_right(type_label, COL_TYPE_W), type_style));
-    spans.push(Span::styled(
-        "  ".to_string(),
-        if selected {
-            Style::new().bg(c(colors::SELECTED))
-        } else {
-            Style::new()
-        },
-    ));
-
-    let repo_style = if selected {
-        Style::new()
-            .fg(c(colors::SELECTED_FG))
-            .bg(c(colors::SELECTED))
+    let (type_label, type_color) = if pr.request.contains("@me") {
+        ("[me]", colors::CYAN)
     } else {
-        fg(colors::CYAN)
+        ("[team]", colors::ORANGE)
     };
-    spans.push(Span::styled(
-        pad_right(&pr.repository, COL_REPO_W),
-        repo_style,
-    ));
-    spans.push(Span::styled(
-        "  ".to_string(),
-        if selected {
-            Style::new().bg(c(colors::SELECTED))
-        } else {
-            Style::new()
-        },
-    ));
-
-    let num_style = if selected {
-        Style::new().fg(c(colors::YELLOW)).bg(c(colors::SELECTED))
-    } else {
-        fg(colors::BLUE)
-    };
-    spans.push(Span::styled(
-        pad_right(&format!("#{}", pr.number), COL_NUM_W),
-        num_style,
-    ));
-    spans.push(Span::styled(
-        "  ".to_string(),
-        if selected {
-            Style::new().bg(c(colors::SELECTED))
-        } else {
-            Style::new()
-        },
-    ));
-
     let title_style = if selected {
-        Style::new()
-            .fg(c(colors::SELECTED_FG))
-            .bg(c(colors::SELECTED))
-            .add_modifier(Modifier::BOLD)
+        fg(colors::SELECTED_FG).add_modifier(Modifier::BOLD)
     } else {
         fg(colors::FG)
     };
-    spans.push(Span::styled(
-        pad_right(&sanitize_text(&pr.title), title_w),
-        title_style,
-    ));
-    spans.push(Span::styled(
-        "  ".to_string(),
-        if selected {
-            Style::new().bg(c(colors::SELECTED))
-        } else {
-            Style::new()
-        },
-    ));
-
-    let author_style = if selected {
-        Style::new()
-            .fg(c(colors::SELECTED_FG))
-            .bg(c(colors::SELECTED))
-    } else {
-        fg(colors::MAGENTA)
+    let approve = m.approve_label(pr);
+    let approve_style = match approve {
+        "approved" => fg(colors::GREEN),
+        "changes" => fg(colors::RED),
+        _ => pick(colors::MUTED, colors::YELLOW),
     };
-    spans.push(Span::styled(
-        pad_right(&format!("@{}", pr.author), COL_AUTHOR_W),
-        author_style,
-    ));
-    spans.push(Span::styled(
-        "  ".to_string(),
-        if selected {
-            Style::new().bg(c(colors::SELECTED))
-        } else {
-            Style::new()
-        },
-    ));
 
-    let approve_style = if selected {
-        match approve {
-            "approved" => Style::new().fg(c(colors::GREEN)).bg(c(colors::SELECTED)),
-            "changes" => Style::new().fg(c(colors::RED)).bg(c(colors::SELECTED)),
-            _ => Style::new().fg(c(colors::YELLOW)).bg(c(colors::SELECTED)),
-        }
-    } else {
-        match approve {
-            "approved" => fg(colors::GREEN),
-            "changes" => fg(colors::RED),
-            _ => fg(colors::MUTED),
-        }
-    };
-    spans.push(Span::styled(
-        pad_right(approve, COL_APPROVE_W),
-        approve_style,
-    ));
-
-    if selected {
-        spans.push(Span::styled(
-            " ".to_string(),
-            Style::new().bg(c(colors::SELECTED)),
-        ));
-    }
-
-    Line::from(spans)
+    Row::new(vec![
+        Cell::from(mark),
+        Cell::from(Span::styled(type_label, fg(type_color))),
+        Cell::from(Span::styled(
+            pad_right(&pr.repository, COL_REPO_W),
+            pick(colors::CYAN, colors::SELECTED_FG),
+        )),
+        Cell::from(Span::styled(
+            format!("#{}", pr.number),
+            pick(colors::BLUE, colors::YELLOW),
+        )),
+        Cell::from(Span::styled(
+            pad_right(&sanitize_text(&pr.title), title_w),
+            title_style,
+        )),
+        Cell::from(Span::styled(
+            pad_right(&format!("@{}", pr.author), COL_AUTHOR_W),
+            pick(colors::MAGENTA, colors::SELECTED_FG),
+        )),
+        Cell::from(Span::styled(approve, approve_style)),
+    ])
 }
 
 fn render_detail_section(m: &mut Model, f: &mut Frame<'_>, rect: Rect, vp_h: u16) {
@@ -2727,6 +2765,118 @@ mod tests {
         let cache = Arc::new(DetailCache::with_dir(None));
         let prefetcher = Arc::new(Prefetcher::new(cache.clone()));
         Model::new(cache, prefetcher)
+    }
+
+    #[test]
+    fn test_list_table_aligns_header_and_rows() {
+        for w in [120u16, 80] {
+            let mut m = model_with_loaded_detail();
+            let long = "a very long title that has to be cut with an ellipsis ".repeat(4);
+            m.prs.push(PullRequest {
+                repository: "owner/another-repository-with-long-name".into(),
+                number: 4567,
+                title: long,
+                url: "https://example.test/pr/4567".into(),
+                author: "someone".into(),
+                request: "team/x".into(),
+                ..Default::default()
+            });
+            m.marked_prs.insert(m.prs[1].url.clone());
+            m.update(Msg::Resize(w, 12));
+            let mut term =
+                ratatui::Terminal::new(ratatui::backend::TestBackend::new(w, 12)).unwrap();
+            term.draw(|f| render(&mut m, f)).unwrap();
+            let buf = term.backend().buffer().clone();
+            let row =
+                |y: u16| -> String { (0..w).map(|x| buf[(x, y)].symbol().to_string()).collect() };
+            let (header, first, second) = (row(2), row(3), row(4));
+            // Columns line up: "Author" in the header sits over "@octocat".
+            let col = |s: &str, pat: &str| s.find(pat).map(|b| s[..b].chars().count());
+            assert_eq!(col(&header, "Author"), col(&first, "@octocat"), "w={w}");
+            assert_eq!(col(&header, "Repository"), col(&second, "owner/"), "w={w}");
+            assert!(first.contains('▌'), "cursor bar on selected row, w={w}");
+            assert!(second.contains("[!]") && second.contains("..."), "w={w}");
+            // The highlight background spans the selected row.
+            assert_eq!(buf[(w / 2, 3)].bg, c(colors::SELECTED), "w={w}");
+            assert_ne!(buf[(w / 2, 4)].bg, c(colors::SELECTED), "w={w}");
+        }
+    }
+
+    #[test]
+    fn test_diffstat_blocks() {
+        assert_eq!(diffstat_blocks(0, 0), None);
+        assert_eq!(diffstat_blocks(10, 0), Some((5, 0)));
+        assert_eq!(diffstat_blocks(0, 10), Some((0, 5)));
+        assert_eq!(diffstat_blocks(50, 50), Some((3, 2)));
+        assert_eq!(diffstat_blocks(1000, 1), Some((4, 1)));
+        assert_eq!(diffstat_blocks(1, 1000), Some((1, 4)));
+        assert_eq!(diffstat_blocks(-3, 4), Some((0, 5)));
+    }
+
+    #[test]
+    fn test_mouse_click_selects_row_and_wheel_scrolls() {
+        use crossterm::event::{KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
+        let ev = |kind, row| {
+            Msg::Mouse(MouseEvent {
+                kind,
+                column: 10,
+                row,
+                modifiers: KeyModifiers::NONE,
+            })
+        };
+        let mut m = model_with_loaded_detail();
+        m.prs.push(PullRequest {
+            url: "https://example.test/pr/2".into(),
+            request: "@me".into(),
+            ..Default::default()
+        });
+        m.update(Msg::Resize(100, 30));
+        // Rows: 0 tab bar, 1 border, 2 header, 3 first PR, 4 second PR.
+        let effects = m.update(ev(MouseEventKind::Down(MouseButton::Left), 4));
+        assert_eq!(m.cursor, 1);
+        assert!(!effects.is_empty(), "selecting loads the detail");
+        m.update(ev(MouseEventKind::Down(MouseButton::Left), 2));
+        assert_eq!(m.cursor, 1, "header click is ignored");
+        m.update(ev(MouseEventKind::ScrollUp, 3));
+        assert_eq!(m.cursor, 0, "wheel over the list moves the cursor");
+
+        m.detail_total = 100;
+        m.update(ev(MouseEventKind::ScrollDown, 20));
+        assert_eq!(m.detail_scroll, MOUSE_SCROLL_LINES as u16);
+        m.update(ev(MouseEventKind::ScrollUp, 20));
+        assert_eq!(m.detail_scroll, 0);
+
+        m.pending_approve = Some(m.prs[0].clone());
+        m.update(ev(MouseEventKind::Down(MouseButton::Left), 4));
+        assert_eq!(m.cursor, 0, "mouse is inert while a popup is open");
+    }
+
+    #[test]
+    fn test_highlight_diff_colors_code_and_tints_changes() {
+        let diff =
+            "diff --git a/src/x.rs b/src/x.rs\n@@ -1 +1 @@\n-let a = 1;\n+let a = 2;\n \"s\"\n\
+diff --git a/notes.zzz b/notes.zzz\n@@ -1 +1 @@\n+plain text";
+        let lines = highlight_diff(diff);
+        let added = &lines[3];
+        assert!(added.spans.len() > 2, "rust code is split into runs");
+        let tint = mix(colors::BAR_BG, colors::GREEN, DIFF_TINT);
+        assert!(added.spans.iter().all(|s| s.style.bg == Some(tint)));
+        assert!(added
+            .spans
+            .iter()
+            .any(|s| s.content == "let" && s.style.fg == Some(c(colors::MAGENTA))));
+        assert_ne!(
+            lines[2].spans[0].style.bg,
+            Some(tint),
+            "removed lines use red"
+        );
+        assert!(
+            lines[4].spans.iter().all(|s| s.style.bg.is_none()),
+            "context: no tint"
+        );
+        let plain = lines.last().unwrap();
+        assert_eq!(plain.spans.len(), 1, "unknown file type stays one span");
+        assert_eq!(plain.spans[0].style.fg, Some(c(colors::GREEN)));
     }
 
     fn model_with_loaded_detail() -> Model {
@@ -3144,6 +3294,77 @@ mod tests {
         assert!(!m.detail_loading);
         assert_eq!(m.current_diff, "diff body");
         assert!(m.current_detail.is_some());
+    }
+
+    #[test]
+    fn test_trigger_detail_load_refetches_cached_pending_ci() {
+        let mut m = new_model();
+        let pr = pr("https://example.test/pr/1");
+        m.prs = vec![pr.clone()];
+        m.cache.put(
+            &gh::cache_key_of(&pr),
+            CacheEntry {
+                detail: PullRequestDetail {
+                    base: pr.clone(),
+                    ci: gh::CiSummary {
+                        passed: 1,
+                        failed: 0,
+                        pending: 1,
+                    },
+                    ..Default::default()
+                },
+                diff: "diff body".into(),
+            },
+        );
+        let effect = m.trigger_detail_load();
+        assert!(
+            matches!(effect, Some(Effect::Debounce { .. })),
+            "refetch is debounced like a cache miss"
+        );
+        assert!(
+            m.current_detail.is_some(),
+            "cached view still shows at once"
+        );
+
+        m.detail_scroll = 7;
+        let detail = m.current_detail.clone().unwrap();
+        m.update(Msg::DiffDone(Box::new(DiffDoneMsg {
+            pr: pr.clone(),
+            result: Ok((detail, "new diff".into())),
+        })));
+        assert_eq!(m.detail_scroll, 7, "revalidating the shown PR keeps scroll");
+        assert_eq!(m.current_diff, "new diff");
+    }
+
+    #[test]
+    fn test_render_ci_line() {
+        let text = |ci: gh::CiSummary| {
+            render_ci_line(&ci).map(|l| {
+                l.spans
+                    .iter()
+                    .map(|s| s.content.to_string())
+                    .collect::<String>()
+            })
+        };
+        assert_eq!(text(gh::CiSummary::default()), None);
+        assert_eq!(
+            text(gh::CiSummary {
+                passed: 3,
+                failed: 1,
+                pending: 2
+            })
+            .as_deref(),
+            Some("CI: failing ✓3 ✗1 ●2")
+        );
+        assert_eq!(
+            text(gh::CiSummary {
+                passed: 4,
+                failed: 0,
+                pending: 0
+            })
+            .as_deref(),
+            Some("CI: passing ✓4")
+        );
     }
 
     #[test]
