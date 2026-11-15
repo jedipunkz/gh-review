@@ -138,6 +138,9 @@ author (case-insensitive substring). While editing:
 - `enter` confirms and leaves the filter value in place
 - `esc` clears the value and closes the filter
 - `ctrl+n` / `ctrl+p` move the selection while the cursor stays in the input
+- `ctrl+b` / `ctrl+f` move the input cursor left / right, `ctrl+a` / `ctrl+e`
+  jump to the start / end, and `ctrl+h` deletes the character before the
+  cursor (the arrow keys, `home`, `end`, and `backspace` work too)
 
 ### Review comment
 

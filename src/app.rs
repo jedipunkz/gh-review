@@ -1077,10 +1077,20 @@ impl Model {
     }
 
     fn handle_search_key(&mut self, key: crossterm::event::KeyEvent) -> Vec<Effect> {
+        use crossterm::event::KeyCode;
         let ctrl = key
             .modifiers
             .contains(crossterm::event::KeyModifiers::CONTROL);
-        match key.code {
+        // Emacs-style editing keys map onto the keys that already edit.
+        let code = match key.code {
+            KeyCode::Char('h') if ctrl => KeyCode::Backspace,
+            KeyCode::Char('b') if ctrl => KeyCode::Left,
+            KeyCode::Char('f') if ctrl => KeyCode::Right,
+            KeyCode::Char('a') if ctrl => KeyCode::Home,
+            KeyCode::Char('e') if ctrl => KeyCode::End,
+            other => other,
+        };
+        match code {
             crossterm::event::KeyCode::Char('c') if ctrl => {
                 self.quit = true;
                 Vec::new()
@@ -3033,6 +3043,32 @@ diff --git a/notes.zzz b/notes.zzz\n@@ -1 +1 @@\n+plain text";
             code,
             crossterm::event::KeyModifiers::CONTROL,
         ))
+    }
+
+    #[test]
+    fn test_search_emacs_editing_keys() {
+        use crossterm::event::KeyCode;
+        let mut m = model_with_loaded_detail();
+        m.update(key(KeyCode::Char('/')));
+        for ch in "abcd".chars() {
+            m.update(key(KeyCode::Char(ch)));
+        }
+        m.update(ctrl_key(KeyCode::Char('a')));
+        assert_eq!(m.search_cursor, 0);
+        m.update(ctrl_key(KeyCode::Char('f')));
+        m.update(ctrl_key(KeyCode::Char('f')));
+        assert_eq!(m.search_cursor, 2);
+        m.update(ctrl_key(KeyCode::Char('h')));
+        assert_eq!((m.search_value.as_str(), m.search_cursor), ("acd", 1));
+        m.update(ctrl_key(KeyCode::Char('b')));
+        assert_eq!(m.search_cursor, 0);
+        m.update(ctrl_key(KeyCode::Char('h')));
+        assert_eq!(m.search_value, "acd", "ctrl+h at the start deletes nothing");
+        m.update(ctrl_key(KeyCode::Char('e')));
+        assert_eq!(m.search_cursor, 3);
+        m.update(ctrl_key(KeyCode::Char('f')));
+        assert_eq!(m.search_cursor, 3, "ctrl+f stops at the end");
+        assert!(m.search_active, "none of these close the filter");
     }
 
     #[test]
