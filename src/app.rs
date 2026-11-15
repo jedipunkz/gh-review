@@ -1542,21 +1542,29 @@ pub fn render_diff_content(
     }
     lines.push(Line::from(status));
 
-    let mut meta = meta_pair("Author", &format!("@{}", detail.base.author));
-    meta.push(Span::raw(META_GAP));
-    meta.extend(meta_pair("Review request", &detail.base.request));
-    let branch = branch_label(detail);
-    if !branch.is_empty() {
-        meta.push(Span::raw(META_GAP));
-        meta.extend(meta_pair("Branch", &branch));
+    // Fields come in related pairs (Author/Requested, Created/Updated) that
+    // the grid keeps on one row; long ones (the branch, many reviewers or
+    // labels) get full rows below.
+    let mut fields: Vec<(&str, Vec<Span<'static>>)> = vec![
+        (
+            "Author",
+            vec![Span::styled(
+                format!("@{}", detail.base.author),
+                fg(colors::MAGENTA),
+            )],
+        ),
+        ("Requested", vec![Span::raw(detail.base.request.clone())]),
+    ];
+    for (label, at) in [
+        ("Created", detail.created_at),
+        ("Updated", detail.base.updated_at),
+    ] {
+        if at != std::time::SystemTime::UNIX_EPOCH {
+            fields.push((label, vec![Span::raw(crate::gh::format_human(at))]));
+        }
     }
-    lines.push(Line::from(meta));
-
     if !detail.reviewers.is_empty() {
-        let mut spans = vec![
-            Span::styled("Reviewed by:".to_string(), fg(colors::YELLOW)),
-            Span::raw(" "),
-        ];
+        let mut spans = Vec::new();
         for (i, reviewer) in detail.reviewers.iter().enumerate() {
             if i > 0 {
                 spans.push(Span::raw(META_GAP));
@@ -1567,31 +1575,8 @@ pub fn render_diff_content(
                 review_decision_style(&reviewer.state),
             ));
         }
-        lines.push(Line::from(spans));
+        fields.push(("Reviewers", spans));
     }
-
-    if detail.created_at != std::time::SystemTime::UNIX_EPOCH
-        || detail.base.updated_at != std::time::SystemTime::UNIX_EPOCH
-    {
-        let mut spans = Vec::new();
-        if detail.created_at != std::time::SystemTime::UNIX_EPOCH {
-            spans.extend(meta_pair(
-                "Created",
-                &crate::gh::format_human(detail.created_at),
-            ));
-        }
-        if detail.base.updated_at != std::time::SystemTime::UNIX_EPOCH {
-            if !spans.is_empty() {
-                spans.push(Span::raw(META_GAP));
-            }
-            spans.extend(meta_pair(
-                "Updated",
-                &crate::gh::format_human(detail.base.updated_at),
-            ));
-        }
-        lines.push(Line::from(spans));
-    }
-
     if !detail.labels.is_empty() {
         let mut spans = Vec::new();
         for (i, label) in detail.labels.iter().enumerate() {
@@ -1600,10 +1585,15 @@ pub fn render_diff_content(
             }
             spans.push(pill(&sanitize_text(label), None));
         }
-        lines.push(Line::from(spans));
+        fields.push(("Labels", spans));
     }
+    let branch = branch_label(detail);
+    if !branch.is_empty() {
+        fields.push(("Branch", vec![Span::styled(branch, fg(colors::CYAN))]));
+    }
+    lines.extend(field_grid(fields, width));
 
-    lines.push(Line::from(""));
+    lines.push(rule(width));
 
     let body = sanitize_text(detail.body.trim());
     let body = body.trim();
@@ -1616,9 +1606,7 @@ pub fn render_diff_content(
         lines.extend(render_markdown(body, width));
     }
 
-    lines.push(Line::from(""));
-    lines.push(Line::from(Span::styled("─".repeat(80), fg(colors::MUTED))));
-    lines.push(Line::from(""));
+    lines.push(rule(width));
 
     lines.extend(highlighted_diff(diff).iter().cloned());
 
@@ -1728,11 +1716,97 @@ fn diffstat_blocks(additions: i64, deletions: i64) -> Option<(usize, usize)> {
     Some((green as usize, DIFFSTAT_BLOCKS - green as usize))
 }
 
-fn meta_pair(label: &str, value: &str) -> Vec<Span<'static>> {
-    vec![
-        Span::styled(format!("{label}:"), fg(colors::YELLOW)),
-        Span::raw(format!(" {value}")),
-    ]
+/// Label column width of the detail header fields ("Reviewers" + gap).
+const FIELD_W: usize = 11;
+
+/// A "Label      value" row, wrapped to `width` with continuation rows
+/// indented to the value column.
+fn field_rows(label: &str, value: Vec<Span<'static>>, width: usize) -> Vec<Line<'static>> {
+    let avail = width.saturating_sub(FIELD_W).max(1);
+    wrap_line_spans(Line::from(value), avail)
+        .into_iter()
+        .enumerate()
+        .map(|(i, row)| {
+            let head = if i == 0 {
+                Span::styled(pad_right(label, FIELD_W), fg(colors::YELLOW))
+            } else {
+                Span::raw(repeat_space(FIELD_W))
+            };
+            let mut spans = vec![head];
+            spans.extend(row.spans);
+            Line::from(spans)
+        })
+        .collect()
+}
+
+/// Gap between grid columns of the detail header fields.
+const GRID_GAP: usize = 3;
+
+/// Lays `fields` out row by row as label/value cells, each column as wide
+/// as its longest value, in the most columns that fit `width`. The column
+/// count is even (or 1), so fields given in pairs share a row. A field
+/// wider than half the content gets its own full-width row after the grid,
+/// so one long value never stretches a column.
+fn field_grid(fields: Vec<(&str, Vec<Span<'static>>)>, width: usize) -> Vec<Line<'static>> {
+    let value_w = |v: &[Span<'static>]| v.iter().map(|s| s.width()).sum::<usize>();
+    let half = width.saturating_sub(GRID_GAP) / 2;
+    let (narrow, wide): (Vec<_>, Vec<_>) = fields
+        .into_iter()
+        .partition(|(_, v)| FIELD_W + value_w(v) <= half);
+
+    let mut out = Vec::new();
+    if !narrow.is_empty() {
+        let n = narrow.len();
+        let column_widths = |cols: usize| -> Vec<usize> {
+            (0..cols.min(n))
+                .map(|c| {
+                    narrow
+                        .iter()
+                        .skip(c)
+                        .step_by(cols)
+                        .map(|(_, v)| value_w(v))
+                        .max()
+                        .unwrap_or(0)
+                })
+                .collect()
+        };
+        let fits = |widths: &[usize]| {
+            widths.iter().map(|w| FIELD_W + w).sum::<usize>()
+                + GRID_GAP * widths.len().saturating_sub(1)
+                <= width
+        };
+        // Widest even layout that fits; a single column always does.
+        let cols = (2..=n.next_multiple_of(2))
+            .rev()
+            .step_by(2)
+            .find(|&cols| fits(&column_widths(cols)))
+            .unwrap_or(1);
+        let widths = column_widths(cols);
+        for row in narrow.chunks(cols) {
+            let mut spans: Vec<Span<'static>> = Vec::new();
+            for (c, (label, value)) in row.iter().enumerate() {
+                if c > 0 {
+                    // Pad the previous cell out to its column width.
+                    let prev = &row[c - 1].1;
+                    spans.push(Span::raw(repeat_space(
+                        widths[c - 1] - value_w(prev) + GRID_GAP,
+                    )));
+                }
+                spans.push(Span::styled(pad_right(label, FIELD_W), fg(colors::YELLOW)));
+                spans.extend(value.iter().cloned());
+            }
+            out.push(Line::from(spans));
+        }
+    }
+    for (label, value) in wide {
+        out.extend(field_rows(label, value, width));
+    }
+    out
+}
+
+/// A horizontal rule across the content width.
+fn rule(width: usize) -> Line<'static> {
+    Line::from(Span::styled("─".repeat(width), fg(colors::FRAME)))
 }
 
 /// Wraps a styled line to `width`, preserving span styles, so that every
@@ -1791,7 +1865,13 @@ fn wrap_line_spans(line: Line<'static>, width: usize) -> Vec<Line<'static>> {
             spans.push(Span::styled(run, run_style.unwrap()));
         }
         out.push(Line::from(spans));
-        idx = cut;
+        // A break at a space consumes it, so the next row does not start
+        // with a stray blank.
+        idx = if cut < flat.len() && flat[cut].1 == ' ' {
+            cut + 1
+        } else {
+            cut
+        };
     }
     out
 }
@@ -3539,24 +3619,56 @@ diff --git a/notes.zzz b/notes.zzz\n@@ -1 +1 @@\n+plain text";
                 author: "bob".into(),
                 state: "CHANGES_REQUESTED".into(),
             }],
+            created_at: std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(86_400),
             ..Default::default()
+        };
+        let detail = PullRequestDetail {
+            base: PullRequest {
+                updated_at: std::time::SystemTime::UNIX_EPOCH
+                    + std::time::Duration::from_secs(2 * 86_400),
+                ..detail.base.clone()
+            },
+            ..detail
         };
         let lines = render_diff_content(&detail, "", 120);
         let text = |l: &Line| -> String { l.spans.iter().map(|s| s.content.to_string()).collect() };
         let all: Vec<String> = lines.iter().map(text).collect();
         assert!(all[1].starts_with(" blocked   approved "), "{}", all[1]);
         assert_eq!(lines[1].spans[0].style.bg, Some(c(colors::RED)));
-        assert!(
-            all.contains(
-                &"Author: @alice   Review request: @me   Branch: feat/x -> main".to_string()
-            ),
-            "{all:?}"
-        );
-        assert!(
-            all.contains(&"Reviewed by: @bob changes requested".to_string()),
-            "{all:?}"
-        );
-        assert!(all.contains(&" bug   ui ".to_string()), "{all:?}");
+        // Pairs share a row at every width that has room for two columns.
+        for w in [120usize, 60] {
+            let rows: Vec<String> = render_diff_content(&detail, "", w)
+                .iter()
+                .map(text)
+                .collect();
+            let row_of = |label: &str| rows.iter().position(|r| r.contains(label)).unwrap();
+            assert_eq!(row_of("Author "), row_of("Requested "), "w={w} {rows:?}");
+            assert_eq!(row_of("Created "), row_of("Updated "), "w={w} {rows:?}");
+            let col = |label: &str| rows[row_of(label)].find(label);
+            assert!(col("Created ") < col("Updated "), "w={w}");
+            if w == 60 {
+                // Two columns: the second labels line up.
+                assert_eq!(col("Requested "), col("Updated "), "{rows:?}");
+            }
+            assert!(
+                rows.iter().any(|r| r.contains("Labels      bug   ui ")),
+                "{rows:?}"
+            );
+        }
+        // A value too long for the row wraps under the value column.
+        let long = PullRequestDetail {
+            head_ref_name: "dependabot/go_modules/charm.land/bubbletea/v2-2.0.10".into(),
+            base_ref_name: "main".into(),
+            ..detail
+        };
+        let rows: Vec<String> = render_diff_content(&long, "", 40)
+            .iter()
+            .map(text)
+            .collect();
+        let at = rows.iter().position(|r| r.starts_with("Branch ")).unwrap();
+        assert!(rows[at + 1].starts_with(&" ".repeat(FIELD_W)), "{rows:?}");
+        assert!(!rows[at + 1][FIELD_W..].starts_with(' '), "{rows:?}");
+        assert!(rows.iter().all(|r| r.width() <= 40), "{rows:?}");
     }
 
     #[test]
@@ -4127,7 +4239,7 @@ diff --git a/notes.zzz b/notes.zzz\n@@ -1 +1 @@\n+plain text";
             })
             .collect();
         let joined = text.join("\n");
-        for want in ["Reviewed by:", "@alice approved", "@bob changes requested"] {
+        for want in ["Reviewers  ", "@alice approved", "@bob changes requested"] {
             assert!(joined.contains(want), "rendered detail missing {want}");
         }
     }
@@ -4335,6 +4447,13 @@ diff --git a/notes.zzz b/notes.zzz\n@@ -1 +1 @@\n+plain text";
             })
             .collect();
         assert!(joined.contains("Author:"));
+        for l in &out[1..] {
+            let first = l.spans.first().map(|s| s.content.as_ref()).unwrap_or("");
+            assert!(
+                !first.starts_with(' '),
+                "continuation starts with a blank: {out:?}"
+            );
+        }
     }
 
     #[test]
