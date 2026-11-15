@@ -522,13 +522,7 @@ impl Model {
 
         let key = gh::cache_key_of(&pr);
         let cached = match self.cache.get_mem(&key) {
-            // ponytail: CI results land without bumping updatedAt (the cache
-            // key), so a cached pending run is refetched. A re-run of an
-            // already finished check stays stale until the PR itself updates.
-            Some(entry) => {
-                let refresh = entry.detail.ci.pending > 0;
-                Some((entry, refresh.then(|| Effect::LoadDiff { pr: pr.clone() })))
-            }
+            Some(entry) => Some((entry, None)),
             None => self
                 .cache
                 .get_disk(&key)
@@ -536,9 +530,20 @@ impl Model {
         };
         if let Some((entry, effect)) = cached {
             self.debounce_seq += 1;
+            // ponytail: CI results land without bumping updatedAt (the cache
+            // key), so a cached pending run is refetched, debounced like a
+            // miss so wheel-scrolling the list does not fan out fetches. A
+            // re-run of a finished check stays stale until the PR updates.
+            let refresh = effect.is_none() && entry.detail.ci.pending > 0;
             self.current_detail = Some(entry.detail);
             self.current_diff = entry.diff;
             self.detail_loading = false;
+            if refresh {
+                return Some(Effect::Debounce {
+                    seq: self.debounce_seq,
+                    url: pr.url,
+                });
+            }
             return effect;
         }
         self.debounce_seq += 1;
@@ -698,10 +703,19 @@ impl Model {
                     }
                     Ok((detail, diff)) => {
                         self.detail_err = String::new();
+                        // A refetch of the PR already on screen (cached view
+                        // revalidated) keeps the reading position; render
+                        // clamps it to the new length.
+                        let same = self
+                            .current_detail
+                            .as_ref()
+                            .is_some_and(|d| d.base.url == detail.base.url);
+                        if !same {
+                            self.detail_scroll = 0;
+                            self.detail_total = 0;
+                        }
                         self.current_detail = Some(detail);
                         self.current_diff = diff;
-                        self.detail_scroll = 0;
-                        self.detail_total = 0;
                         Vec::new()
                     }
                 }
@@ -3303,11 +3317,23 @@ diff --git a/notes.zzz b/notes.zzz\n@@ -1 +1 @@\n+plain text";
             },
         );
         let effect = m.trigger_detail_load();
-        assert!(matches!(effect, Some(Effect::LoadDiff { .. })));
+        assert!(
+            matches!(effect, Some(Effect::Debounce { .. })),
+            "refetch is debounced like a cache miss"
+        );
         assert!(
             m.current_detail.is_some(),
             "cached view still shows at once"
         );
+
+        m.detail_scroll = 7;
+        let detail = m.current_detail.clone().unwrap();
+        m.update(Msg::DiffDone(Box::new(DiffDoneMsg {
+            pr: pr.clone(),
+            result: Ok((detail, "new diff".into())),
+        })));
+        assert_eq!(m.detail_scroll, 7, "revalidating the shown PR keeps scroll");
+        assert_eq!(m.current_diff, "new diff");
     }
 
     #[test]
