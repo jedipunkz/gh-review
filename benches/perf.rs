@@ -143,6 +143,13 @@ fn rust_diff() -> &'static str {
     })
 }
 
+// The highlighting itself, bypassing the memo that render_diff_content
+// reads: what a background fetch pays once per diff.
+#[divan::bench]
+fn highlight_diff_rust() {
+    app::highlight_diff(rust_diff());
+}
+
 #[divan::bench]
 fn render_diff_rust_120col() {
     let d = detail();
@@ -211,6 +218,69 @@ fn render_frame_steady_120x40() {
     let mut g = S
         .get_or_init(|| {
             let mut m = frame_model();
+            let mut term = ratatui::Terminal::new(ratatui::backend::TestBackend::new(120, 40))
+                .expect("test backend");
+            term.draw(|f| app::render(&mut m, f)).expect("warm draw");
+            std::sync::Mutex::new((term, m))
+        })
+        .lock()
+        .unwrap();
+    let (term, m) = &mut *g;
+    term.draw(|f| app::render(m, f)).expect("draw");
+}
+
+// Selection change onto a PR whose diff gets syntax colors: the first frame
+// rebuilds the detail, highlighting included.
+#[divan::bench]
+fn render_frame_rust_120x40() {
+    let mut m = frame_model();
+    m.current_diff = rust_diff().to_string();
+    let mut term =
+        ratatui::Terminal::new(ratatui::backend::TestBackend::new(120, 40)).expect("test backend");
+    term.draw(|f| app::render(&mut m, f)).expect("draw");
+}
+
+// A terminal resize with the highlighted detail on screen: every resize
+// event changes the content width, so the wrapped view is rebuilt.
+#[divan::bench]
+fn render_frame_resize_rust() {
+    static S: OnceLock<
+        std::sync::Mutex<(
+            ratatui::Terminal<ratatui::backend::TestBackend>,
+            app::Model,
+            bool,
+        )>,
+    > = OnceLock::new();
+    let mut g = S
+        .get_or_init(|| {
+            let mut m = frame_model();
+            m.current_diff = rust_diff().to_string();
+            let mut term = ratatui::Terminal::new(ratatui::backend::TestBackend::new(120, 40))
+                .expect("test backend");
+            term.draw(|f| app::render(&mut m, f)).expect("warm draw");
+            std::sync::Mutex::new((term, m, false))
+        })
+        .lock()
+        .unwrap();
+    let (term, m, flip) = &mut *g;
+    *flip = !*flip;
+    let w = if *flip { 119 } else { 120 };
+    m.width = w;
+    term.backend_mut().resize(w, 40);
+    term.draw(|f| app::render(m, f)).expect("draw");
+}
+
+// Steady frame over a large diff (~1.6 MB): what the spinner tick pays when
+// the detail view cache is warm but its inputs are big.
+#[divan::bench]
+fn render_frame_steady_large_diff() {
+    static S: OnceLock<
+        std::sync::Mutex<(ratatui::Terminal<ratatui::backend::TestBackend>, app::Model)>,
+    > = OnceLock::new();
+    let mut g = S
+        .get_or_init(|| {
+            let mut m = frame_model();
+            m.current_diff = diff().repeat(50);
             let mut term = ratatui::Terminal::new(ratatui::backend::TestBackend::new(120, 40))
                 .expect("test backend");
             term.draw(|f| app::render(&mut m, f)).expect("warm draw");

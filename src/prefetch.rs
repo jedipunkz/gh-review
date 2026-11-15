@@ -75,7 +75,15 @@ impl Prefetcher {
 
         if let Ok(Ok((detail, diff))) = result {
             let key = gh::cache_key_of_updated(&url, detail.base.updated_at);
-            self.cache.put(&key, CacheEntry { detail, diff });
+            self.cache.put(
+                &key,
+                CacheEntry {
+                    detail,
+                    diff: diff.clone(),
+                },
+            );
+            // Highlight off the UI thread so selecting this PR is instant.
+            let _ = tokio::task::spawn_blocking(move || crate::app::highlighted_diff(&diff)).await;
         }
         self.finish(&url).await;
     }

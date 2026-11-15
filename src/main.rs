@@ -62,6 +62,15 @@ impl Runtime {
                 let cache = self.cache.clone();
                 self.inflight_load = Some(tokio::spawn(async move {
                     let result = gh_review::gh::load_detail_and_diff(&g2, &pr.clone()).await;
+                    if let Ok((_, ref diff)) = result {
+                        // Highlight here, off the UI thread; the render then
+                        // hits the memo instead of stalling the event loop.
+                        let diff = diff.clone();
+                        let _ = tokio::task::spawn_blocking(move || {
+                            gh_review::app::highlighted_diff(&diff);
+                        })
+                        .await;
+                    }
                     if let Ok((ref detail, ref diff)) = result {
                         let key =
                             gh_review::gh::cache_key_of_updated(&pr.url, detail.base.updated_at);
@@ -274,15 +283,21 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         runtime.execute(Gh::new(), Effect::LoadPRs);
 
         let run_result: Result<(), String> = async {
+            let mut redraw = true;
             loop {
-                terminal
-                    .draw(|f| gh_review::app::render(&mut model, f))
-                    .map_err(|e| e.to_string())?;
+                if redraw {
+                    terminal
+                        .draw(|f| gh_review::app::render(&mut model, f))
+                        .map_err(|e| e.to_string())?;
+                }
 
                 let msg = match rx.recv().await {
                     Some(m) => m,
                     None => break,
                 };
+                // The spinner ticks ten times a second even when nothing
+                // spins; such a tick changes nothing on screen.
+                redraw = !matches!(msg, Msg::SpinnerTick) || model.spinning();
 
                 // ctrl+l repaints the whole screen. Recovers from stale
                 // glyphs left behind when the terminal and ratatui disagree
