@@ -1594,7 +1594,7 @@ pub fn render_diff_content(
     lines.push(Line::from(Span::styled("─".repeat(80), fg(colors::MUTED))));
     lines.push(Line::from(""));
 
-    lines.extend(highlight_diff(diff));
+    lines.extend(highlighted_diff(diff).iter().cloned());
 
     // Wrap every logical line to the content width up front. Paragraph would
     // otherwise word-wrap long lines (diff hunks, code fences, long headers)
@@ -1821,7 +1821,44 @@ fn strip_ansi(s: &str) -> String {
     out
 }
 
-fn highlight_diff(diff: &str) -> Vec<Line<'static>> {
+/// Highlighted diffs kept for reuse; one entry per recently shown or
+/// prefetched PR.
+const HIGHLIGHT_CACHE_ENTRIES: usize = 8;
+
+/// `highlight_diff` memoized by diff content. Syntax highlighting is the
+/// slow part of a detail rebuild and does not depend on the content width,
+/// so a resize reuses it, and background fetches call this first so that
+/// selecting a fetched PR finds it ready. Colors resolve against the active
+/// theme, which is fixed for the process lifetime.
+pub fn highlighted_diff(diff: &str) -> Arc<Vec<Line<'static>>> {
+    use std::hash::{Hash, Hasher};
+    type Memo =
+        std::sync::Mutex<std::collections::VecDeque<((u64, usize), Arc<Vec<Line<'static>>>)>>;
+    static MEMO: std::sync::OnceLock<Memo> = std::sync::OnceLock::new();
+    let memo = MEMO.get_or_init(Default::default);
+
+    // ponytail: a 64-bit hash plus length stands in for the diff itself;
+    // keeping the full text as the key would double the memory per entry.
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    diff.hash(&mut h);
+    let key = (h.finish(), diff.len());
+    if let Some((_, lines)) = memo.lock().unwrap().iter().find(|(k, _)| *k == key) {
+        return lines.clone();
+    }
+    // Computed outside the lock: a slow diff must not block other lookups.
+    let lines = Arc::new(highlight_diff(diff));
+    let mut memo = memo.lock().unwrap();
+    if !memo.iter().any(|(k, _)| *k == key) {
+        if memo.len() >= HIGHLIGHT_CACHE_ENTRIES {
+            memo.pop_front();
+        }
+        memo.push_back((key, lines.clone()));
+    }
+    lines
+}
+
+/// Uncached diff styling; callers go through `highlighted_diff`.
+pub fn highlight_diff(diff: &str) -> Vec<Line<'static>> {
     if diff.is_empty() {
         return Vec::new();
     }
@@ -2877,6 +2914,22 @@ diff --git a/notes.zzz b/notes.zzz\n@@ -1 +1 @@\n+plain text";
         let plain = lines.last().unwrap();
         assert_eq!(plain.spans.len(), 1, "unknown file type stays one span");
         assert_eq!(plain.spans[0].style.fg, Some(c(colors::GREEN)));
+    }
+
+    #[test]
+    fn test_highlighted_diff_is_memoized_by_content() {
+        let a = highlighted_diff("diff --git a/memo.rs b/memo.rs\n@@ -1 +1 @@\n+fn a() {}");
+        let again = highlighted_diff("diff --git a/memo.rs b/memo.rs\n@@ -1 +1 @@\n+fn a() {}");
+        assert!(
+            Arc::ptr_eq(&a, &again),
+            "same diff reuses the highlighted lines"
+        );
+        let b = highlighted_diff("diff --git a/memo.rs b/memo.rs\n@@ -1 +1 @@\n+fn b() {}");
+        assert!(!Arc::ptr_eq(&a, &b));
+        assert_eq!(
+            *b,
+            highlight_diff("diff --git a/memo.rs b/memo.rs\n@@ -1 +1 @@\n+fn b() {}")
+        );
     }
 
     fn model_with_loaded_detail() -> Model {

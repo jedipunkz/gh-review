@@ -62,6 +62,15 @@ impl Runtime {
                 let cache = self.cache.clone();
                 self.inflight_load = Some(tokio::spawn(async move {
                     let result = gh_review::gh::load_detail_and_diff(&g2, &pr.clone()).await;
+                    if let Ok((_, ref diff)) = result {
+                        // Highlight here, off the UI thread; the render then
+                        // hits the memo instead of stalling the event loop.
+                        let diff = diff.clone();
+                        let _ = tokio::task::spawn_blocking(move || {
+                            gh_review::app::highlighted_diff(&diff);
+                        })
+                        .await;
+                    }
                     if let Ok((ref detail, ref diff)) = result {
                         let key =
                             gh_review::gh::cache_key_of_updated(&pr.url, detail.base.updated_at);
