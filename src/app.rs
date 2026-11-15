@@ -255,6 +255,11 @@ impl Model {
         self.history_loading.iter().any(|&b| b)
     }
 
+    /// True while anything shows the spinner.
+    pub fn spinning(&self) -> bool {
+        self.loading || self.detail_loading || self.any_history_loading()
+    }
+
     /// Starts fetching the active tab when it is a Merged / Closed tab that
     /// has not been fetched yet (or was marked stale by `r`).
     fn load_active_history_tab(&mut self) -> Option<Effect> {
@@ -798,7 +803,7 @@ impl Model {
                 vec![Effect::LoadDiff { pr }]
             }
             Msg::SpinnerTick => {
-                if self.loading || self.detail_loading || self.any_history_loading() {
+                if self.spinning() {
                     self.spinner_frame = self.spinner_frame.wrapping_add(1);
                 }
                 Vec::new()
