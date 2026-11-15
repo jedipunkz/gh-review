@@ -519,7 +519,13 @@ impl Model {
 
         let key = gh::cache_key_of(&pr);
         let cached = match self.cache.get_mem(&key) {
-            Some(entry) => Some((entry, None)),
+            // ponytail: CI results land without bumping updatedAt (the cache
+            // key), so a cached pending run is refetched. A re-run of an
+            // already finished check stays stale until the PR itself updates.
+            Some(entry) => {
+                let refresh = entry.detail.ci.pending > 0;
+                Some((entry, refresh.then(|| Effect::LoadDiff { pr: pr.clone() })))
+            }
             None => self
                 .cache
                 .get_disk(&key)
@@ -1467,6 +1473,10 @@ pub fn render_diff_content(
     }
     lines.push(Line::from(meta2));
 
+    if let Some(ci) = render_ci_line(&detail.ci) {
+        lines.push(ci);
+    }
+
     if !detail.reviewers.is_empty() {
         let mut spans = vec![
             Span::styled("Reviewed by:".to_string(), fg(colors::YELLOW)),
@@ -1548,6 +1558,38 @@ pub fn render_diff_content(
         }
     }
     wrapped
+}
+
+/// "CI: failing  ✓3 ✗1 ●2", or None when the head commit has no checks.
+fn render_ci_line(ci: &gh::CiSummary) -> Option<Line<'static>> {
+    let (word, word_color) = if ci.failed > 0 {
+        ("failing", colors::RED)
+    } else if ci.pending > 0 {
+        ("pending", colors::YELLOW)
+    } else if ci.passed > 0 {
+        ("passing", colors::GREEN)
+    } else {
+        return None;
+    };
+    let mut spans = vec![
+        Span::styled("CI:".to_string(), fg(colors::YELLOW)),
+        Span::raw(" "),
+        Span::styled(
+            word.to_string(),
+            fg(word_color).add_modifier(Modifier::BOLD),
+        ),
+    ];
+    for (n, mark, color) in [
+        (ci.passed, "✓", colors::GREEN),
+        (ci.failed, "✗", colors::RED),
+        (ci.pending, "●", colors::YELLOW),
+    ] {
+        if n > 0 {
+            spans.push(Span::raw(" "));
+            spans.push(Span::styled(format!("{mark}{n}"), fg(color)));
+        }
+    }
+    Some(Line::from(spans))
 }
 
 const DIFFSTAT_BLOCKS: usize = 5;
@@ -3089,6 +3131,65 @@ mod tests {
         assert!(!m.detail_loading);
         assert_eq!(m.current_diff, "diff body");
         assert!(m.current_detail.is_some());
+    }
+
+    #[test]
+    fn test_trigger_detail_load_refetches_cached_pending_ci() {
+        let mut m = new_model();
+        let pr = pr("https://example.test/pr/1");
+        m.prs = vec![pr.clone()];
+        m.cache.put(
+            &gh::cache_key_of(&pr),
+            CacheEntry {
+                detail: PullRequestDetail {
+                    base: pr.clone(),
+                    ci: gh::CiSummary {
+                        passed: 1,
+                        failed: 0,
+                        pending: 1,
+                    },
+                    ..Default::default()
+                },
+                diff: "diff body".into(),
+            },
+        );
+        let effect = m.trigger_detail_load();
+        assert!(matches!(effect, Some(Effect::LoadDiff { .. })));
+        assert!(
+            m.current_detail.is_some(),
+            "cached view still shows at once"
+        );
+    }
+
+    #[test]
+    fn test_render_ci_line() {
+        let text = |ci: gh::CiSummary| {
+            render_ci_line(&ci).map(|l| {
+                l.spans
+                    .iter()
+                    .map(|s| s.content.to_string())
+                    .collect::<String>()
+            })
+        };
+        assert_eq!(text(gh::CiSummary::default()), None);
+        assert_eq!(
+            text(gh::CiSummary {
+                passed: 3,
+                failed: 1,
+                pending: 2
+            })
+            .as_deref(),
+            Some("CI: failing ✓3 ✗1 ●2")
+        );
+        assert_eq!(
+            text(gh::CiSummary {
+                passed: 4,
+                failed: 0,
+                pending: 0
+            })
+            .as_deref(),
+            Some("CI: passing ✓4")
+        );
     }
 
     #[test]

@@ -124,6 +124,17 @@ pub struct PullRequestDetail {
     pub changed_files: i64,
     pub labels: Vec<String>,
     pub reviewers: Vec<ReviewSummary>,
+    /// Absent in cache entries written before CI status was fetched.
+    #[serde(default)]
+    pub ci: CiSummary,
+}
+
+/// Check runs and commit statuses of the head commit, counted by outcome.
+#[derive(Debug, Clone, Default, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct CiSummary {
+    pub passed: u32,
+    pub failed: u32,
+    pub pending: u32,
 }
 
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
@@ -162,6 +173,7 @@ impl Default for PullRequestDetail {
             changed_files: 0,
             labels: Vec::new(),
             reviewers: Vec::new(),
+            ci: CiSummary::default(),
         }
     }
 }
@@ -440,6 +452,8 @@ struct PRViewResponse {
     labels: Vec<LabelNode>,
     #[serde(rename = "latestReviews")]
     latest_reviews: Vec<ReviewNode>,
+    #[serde(rename = "statusCheckRollup")]
+    status_check_rollup: Vec<CheckNode>,
 }
 
 impl Default for PRViewResponse {
@@ -461,6 +475,7 @@ impl Default for PRViewResponse {
             author: None,
             labels: Vec::new(),
             latest_reviews: Vec::new(),
+            status_check_rollup: Vec::new(),
         }
     }
 }
@@ -476,6 +491,38 @@ where
 #[derive(Deserialize)]
 struct LabelNode {
     name: String,
+}
+
+/// One `statusCheckRollup` entry: a CheckRun (status + conclusion) or a
+/// StatusContext (state).
+#[derive(Deserialize, Default)]
+#[serde(default)]
+struct CheckNode {
+    status: Option<String>,
+    conclusion: Option<String>,
+    state: Option<String>,
+}
+
+fn ci_summary(nodes: &[CheckNode]) -> CiSummary {
+    let mut s = CiSummary::default();
+    for n in nodes {
+        let outcome = match (
+            n.state.as_deref(),
+            n.status.as_deref(),
+            n.conclusion.as_deref(),
+        ) {
+            (Some(state), _, _) => state,
+            (None, Some(status), _) if status != "COMPLETED" => "PENDING",
+            (None, _, Some(conclusion)) => conclusion,
+            _ => "PENDING",
+        };
+        match outcome {
+            "SUCCESS" | "NEUTRAL" | "SKIPPED" => s.passed += 1,
+            "PENDING" | "EXPECTED" => s.pending += 1,
+            _ => s.failed += 1,
+        }
+    }
+    s
 }
 
 #[derive(Deserialize)]
@@ -700,7 +747,7 @@ pub async fn search_prs(
 }
 
 fn detail_json_fields() -> String {
-    "number,title,url,body,createdAt,updatedAt,baseRefName,headRefName,reviewDecision,mergeStateStatus,additions,deletions,changedFiles,author,labels,latestReviews"
+    "number,title,url,body,createdAt,updatedAt,baseRefName,headRefName,reviewDecision,mergeStateStatus,additions,deletions,changedFiles,author,labels,latestReviews,statusCheckRollup"
         .to_string()
 }
 
@@ -726,6 +773,7 @@ pub async fn load_pr_detail(g: &Gh, pr: &PullRequest) -> Result<PullRequestDetai
         additions: res.additions,
         deletions: res.deletions,
         changed_files: res.changed_files,
+        ci: ci_summary(&res.status_check_rollup),
         ..Default::default()
     };
     if res.number != 0 {
@@ -899,6 +947,33 @@ mod tests {
             "request":"@me","review_decision":""}"#;
         let pr: PullRequest = serde_json::from_str(old).unwrap();
         assert_eq!(pr.state, "");
+    }
+
+    #[test]
+    fn test_ci_summary_counts_check_runs_and_statuses() {
+        let nodes: Vec<CheckNode> = serde_json::from_str(
+            r#"[
+                {"__typename":"CheckRun","status":"COMPLETED","conclusion":"SUCCESS"},
+                {"__typename":"CheckRun","status":"COMPLETED","conclusion":"SKIPPED"},
+                {"__typename":"CheckRun","status":"COMPLETED","conclusion":"FAILURE"},
+                {"__typename":"CheckRun","status":"COMPLETED","conclusion":"TIMED_OUT"},
+                {"__typename":"CheckRun","status":"IN_PROGRESS","conclusion":null},
+                {"__typename":"CheckRun","status":"QUEUED","conclusion":""},
+                {"__typename":"StatusContext","state":"SUCCESS"},
+                {"__typename":"StatusContext","state":"PENDING"},
+                {"__typename":"StatusContext","state":"ERROR"}
+            ]"#,
+        )
+        .unwrap();
+        assert_eq!(
+            ci_summary(&nodes),
+            CiSummary {
+                passed: 3,
+                failed: 3,
+                pending: 3
+            }
+        );
+        assert_eq!(ci_summary(&[]), CiSummary::default());
     }
 
     #[test]
