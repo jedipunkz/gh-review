@@ -26,8 +26,11 @@ waiting for your review, shows the diff in a TUI, and approves from the keyboard
 
 - **Review queue at a glance**: open PRs that request review from you or your
   teams, split into `Awaiting Review`, `Reviewed`, `Merged`, and `Closed` tabs.
-- **Diff in the terminal**: metadata, description, headline diff, and the
-  latest reviews of the selected PR.
+- **Diff in the terminal**: metadata, CI check status, a diffstat bar,
+  description, syntax-highlighted diff, and the latest reviews of the
+  selected PR.
+- **Mouse support**: wheel to move through the list or scroll the detail,
+  click to select a PR.
 - **Approve and comment from the keyboard**: `a` to approve, `c` to write a
   review comment (IME input supported, drafts kept per PR).
 - **Auto refresh**: re-checks every minute and notifies you (with a sound on
