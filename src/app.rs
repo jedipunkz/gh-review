@@ -934,12 +934,37 @@ pub fn combine_pr_lists(open: Vec<PullRequest>, history: Vec<PullRequest>) -> Ve
 }
 
 pub fn pr_matches_query(pr: &PullRequest, q: &str) -> bool {
+    let q = q.trim().to_lowercase();
     if q.is_empty() {
         return true;
     }
-    pr.repository.to_lowercase().contains(q)
-        || pr.title.to_lowercase().contains(q)
-        || pr.author.to_lowercase().contains(q)
+
+    let mut repositories = Vec::new();
+    let mut authors = Vec::new();
+    let mut text = Vec::new();
+    for term in q.split_whitespace() {
+        if let Some(value) = term.strip_prefix("repo:") {
+            if !value.is_empty() {
+                repositories.push(value);
+            }
+        } else if let Some(value) = term.strip_prefix("author:") {
+            if !value.is_empty() {
+                authors.push(value);
+            }
+        } else {
+            text.push(term);
+        }
+    }
+
+    let repository = pr.repository.to_lowercase();
+    let author = pr.author.to_lowercase();
+    let title = pr.title.to_lowercase();
+    repositories.iter().all(|value| repository.contains(value))
+        && authors.iter().all(|value| author.contains(value))
+        && (text.is_empty() || {
+            let phrase = text.join(" ");
+            repository.contains(&phrase) || title.contains(&phrase) || author.contains(&phrase)
+        })
 }
 
 fn cursor_position(indices: &[usize], cursor: usize) -> Option<usize> {
@@ -1809,6 +1834,12 @@ diff --git a/notes.zzz b/notes.zzz\n@@ -1 +1 @@\n+plain text";
             ("api", vec![0]),
             ("billing", vec![1]),
             ("CAROL", vec![2]),
+            ("repo:owner/api", vec![0]),
+            ("author:CAROL", vec![2]),
+            ("repo:owner author:alice", vec![0]),
+            ("repo:owner/web billing", vec![1]),
+            ("repo:owner/cli api", vec![]),
+            ("repo:", vec![0, 1, 2]),
             (" ", vec![0, 1, 2]),
             ("missing", vec![]),
         ];

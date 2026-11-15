@@ -132,8 +132,13 @@ then). `r` refetches the active one and makes the other refetch on its next
 visit; the per-minute auto refresh does not re-check them. Merged and closed
 PRs cannot be approved.
 
-Press `/` to edit a filter. The filter matches repository name, PR title, and
-author (case-insensitive substring). While editing:
+Press `/` to edit a filter. Unqualified text matches repository name, PR title,
+and author as a case-insensitive substring. Add `repo:<text>` or
+`author:<text>` to filter those fields specifically; qualifiers and unqualified
+text combine with AND. For example, `repo:owner/api author:alice auth` matches
+PRs in repositories containing `owner/api`, by authors containing `alice`, and
+with `auth` in the repository, title, or author. Qualifier values are also
+case-insensitive substrings. While editing:
 
 - `enter` confirms and leaves the filter value in place
 - `esc` clears the value and closes the filter
