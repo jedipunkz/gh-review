@@ -1542,21 +1542,29 @@ pub fn render_diff_content(
     }
     lines.push(Line::from(status));
 
-    let mut meta = meta_pair("Author", &format!("@{}", detail.base.author));
-    meta.push(Span::raw(META_GAP));
-    meta.extend(meta_pair("Review request", &detail.base.request));
+    // One field per row with the values in one column; a long value wraps
+    // under its own column instead of under the label.
+    let field = |label: &str, value: Vec<Span<'static>>| field_rows(label, value, width);
+    lines.extend(field(
+        "Author",
+        vec![Span::styled(
+            format!("@{}", detail.base.author),
+            fg(colors::MAGENTA),
+        )],
+    ));
+    lines.extend(field(
+        "Requested",
+        vec![Span::raw(detail.base.request.clone())],
+    ));
     let branch = branch_label(detail);
     if !branch.is_empty() {
-        meta.push(Span::raw(META_GAP));
-        meta.extend(meta_pair("Branch", &branch));
+        lines.extend(field(
+            "Branch",
+            vec![Span::styled(branch, fg(colors::CYAN))],
+        ));
     }
-    lines.push(Line::from(meta));
-
     if !detail.reviewers.is_empty() {
-        let mut spans = vec![
-            Span::styled("Reviewed by:".to_string(), fg(colors::YELLOW)),
-            Span::raw(" "),
-        ];
+        let mut spans = Vec::new();
         for (i, reviewer) in detail.reviewers.iter().enumerate() {
             if i > 0 {
                 spans.push(Span::raw(META_GAP));
@@ -1567,31 +1575,16 @@ pub fn render_diff_content(
                 review_decision_style(&reviewer.state),
             ));
         }
-        lines.push(Line::from(spans));
+        lines.extend(field("Reviewers", spans));
     }
-
-    if detail.created_at != std::time::SystemTime::UNIX_EPOCH
-        || detail.base.updated_at != std::time::SystemTime::UNIX_EPOCH
-    {
-        let mut spans = Vec::new();
-        if detail.created_at != std::time::SystemTime::UNIX_EPOCH {
-            spans.extend(meta_pair(
-                "Created",
-                &crate::gh::format_human(detail.created_at),
-            ));
+    for (label, at) in [
+        ("Created", detail.created_at),
+        ("Updated", detail.base.updated_at),
+    ] {
+        if at != std::time::SystemTime::UNIX_EPOCH {
+            lines.extend(field(label, vec![Span::raw(crate::gh::format_human(at))]));
         }
-        if detail.base.updated_at != std::time::SystemTime::UNIX_EPOCH {
-            if !spans.is_empty() {
-                spans.push(Span::raw(META_GAP));
-            }
-            spans.extend(meta_pair(
-                "Updated",
-                &crate::gh::format_human(detail.base.updated_at),
-            ));
-        }
-        lines.push(Line::from(spans));
     }
-
     if !detail.labels.is_empty() {
         let mut spans = Vec::new();
         for (i, label) in detail.labels.iter().enumerate() {
@@ -1600,10 +1593,10 @@ pub fn render_diff_content(
             }
             spans.push(pill(&sanitize_text(label), None));
         }
-        lines.push(Line::from(spans));
+        lines.extend(field("Labels", spans));
     }
 
-    lines.push(Line::from(""));
+    lines.push(rule(width));
 
     let body = sanitize_text(detail.body.trim());
     let body = body.trim();
@@ -1616,9 +1609,7 @@ pub fn render_diff_content(
         lines.extend(render_markdown(body, width));
     }
 
-    lines.push(Line::from(""));
-    lines.push(Line::from(Span::styled("─".repeat(80), fg(colors::MUTED))));
-    lines.push(Line::from(""));
+    lines.push(rule(width));
 
     lines.extend(highlighted_diff(diff).iter().cloned());
 
@@ -1728,11 +1719,32 @@ fn diffstat_blocks(additions: i64, deletions: i64) -> Option<(usize, usize)> {
     Some((green as usize, DIFFSTAT_BLOCKS - green as usize))
 }
 
-fn meta_pair(label: &str, value: &str) -> Vec<Span<'static>> {
-    vec![
-        Span::styled(format!("{label}:"), fg(colors::YELLOW)),
-        Span::raw(format!(" {value}")),
-    ]
+/// Label column width of the detail header fields ("Reviewers" + gap).
+const FIELD_W: usize = 11;
+
+/// A "Label      value" row, wrapped to `width` with continuation rows
+/// indented to the value column.
+fn field_rows(label: &str, value: Vec<Span<'static>>, width: usize) -> Vec<Line<'static>> {
+    let avail = width.saturating_sub(FIELD_W).max(1);
+    wrap_line_spans(Line::from(value), avail)
+        .into_iter()
+        .enumerate()
+        .map(|(i, row)| {
+            let head = if i == 0 {
+                Span::styled(pad_right(label, FIELD_W), fg(colors::YELLOW))
+            } else {
+                Span::raw(repeat_space(FIELD_W))
+            };
+            let mut spans = vec![head];
+            spans.extend(row.spans);
+            Line::from(spans)
+        })
+        .collect()
+}
+
+/// A horizontal rule across the content width.
+fn rule(width: usize) -> Line<'static> {
+    Line::from(Span::styled("─".repeat(width), fg(colors::FRAME)))
 }
 
 /// Wraps a styled line to `width`, preserving span styles, so that every
@@ -3552,17 +3564,30 @@ diff --git a/notes.zzz b/notes.zzz\n@@ -1 +1 @@\n+plain text";
         let all: Vec<String> = lines.iter().map(text).collect();
         assert!(all[1].starts_with(" blocked   approved "), "{}", all[1]);
         assert_eq!(lines[1].spans[0].style.bg, Some(c(colors::RED)));
-        assert!(
-            all.contains(
-                &"Author: @alice   Review request: @me   Branch: feat/x -> main".to_string()
-            ),
-            "{all:?}"
-        );
-        assert!(
-            all.contains(&"Reviewed by: @bob changes requested".to_string()),
-            "{all:?}"
-        );
-        assert!(all.contains(&" bug   ui ".to_string()), "{all:?}");
+        for want in [
+            "Author     @alice",
+            "Requested  @me",
+            "Branch     feat/x -> main",
+            "Reviewers  @bob changes requested",
+            "Labels      bug   ui ",
+        ] {
+            assert!(all.contains(&want.to_string()), "{want:?} in {all:?}");
+        }
+
+        // A value too long for the row wraps under the value column.
+        let long = PullRequestDetail {
+            head_ref_name: "dependabot/go_modules/charm.land/bubbletea/v2-2.0.10".into(),
+            base_ref_name: "main".into(),
+            ..detail
+        };
+        let rows: Vec<String> = render_diff_content(&long, "", 40)
+            .iter()
+            .map(text)
+            .collect();
+        let at = rows.iter().position(|r| r.starts_with("Branch ")).unwrap();
+        assert!(rows[at + 1].starts_with(&" ".repeat(FIELD_W)), "{rows:?}");
+        assert!(!rows[at + 1][FIELD_W..].starts_with(' '), "{rows:?}");
+        assert!(rows.iter().all(|r| r.width() <= 40), "{rows:?}");
     }
 
     #[test]
@@ -4133,7 +4158,7 @@ diff --git a/notes.zzz b/notes.zzz\n@@ -1 +1 @@\n+plain text";
             })
             .collect();
         let joined = text.join("\n");
-        for want in ["Reviewed by:", "@alice approved", "@bob changes requested"] {
+        for want in ["Reviewers  ", "@alice approved", "@bob changes requested"] {
             assert!(joined.contains(want), "rendered detail missing {want}");
         }
     }
