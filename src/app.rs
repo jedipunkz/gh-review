@@ -1811,10 +1811,17 @@ fn highlight_diff(diff: &str) -> Vec<Line<'static>> {
     if diff.is_empty() {
         return Vec::new();
     }
+    let added_bg = Style::new().bg(mix(colors::BAR_BG, colors::GREEN, DIFF_TINT));
+    let removed_bg = Style::new().bg(mix(colors::BAR_BG, colors::RED, DIFF_TINT));
+    let mut hl = crate::syntax::Highlighter::default();
+    let mut budget = HIGHLIGHT_MAX_LINES;
     diff.lines()
         .map(|line| sanitize_text(&strip_ansi(line)))
         .map(|line| {
             let style = if line.starts_with("diff --git") {
+                if let Some((_, path)) = line.rsplit_once(" b/") {
+                    hl.set_file(path);
+                }
                 Style::new()
                     .fg(c(colors::CYAN))
                     .add_modifier(Modifier::BOLD)
@@ -1832,17 +1839,52 @@ fn highlight_diff(diff: &str) -> Vec<Line<'static>> {
             {
                 fg(colors::MUTED)
             } else if line.starts_with("@@") {
+                hl.reset();
                 fg(colors::MAGENTA)
-            } else if line.starts_with('+') {
-                fg(colors::GREEN)
-            } else if line.starts_with('-') {
-                fg(colors::RED)
             } else {
-                Style::new()
+                let (marker, tint, plain) = match line.chars().next() {
+                    Some('+') => ("+", added_bg, fg(colors::GREEN)),
+                    Some('-') => ("-", removed_bg, fg(colors::RED)),
+                    Some(' ') => (" ", Style::new(), Style::new()),
+                    _ => return Line::from(Span::raw(line)),
+                };
+                let code = &line[1..];
+                let runs = (budget > 0).then(|| hl.highlight(code)).flatten();
+                budget = budget.saturating_sub(1);
+                let Some(runs) = runs else {
+                    return Line::from(Span::styled(line, plain));
+                };
+                let mut spans = vec![Span::styled(marker.to_string(), plain.patch(tint))];
+                spans.extend(runs.into_iter().map(|(text, slot)| {
+                    Span::styled(text, fg(slot.unwrap_or(colors::FG)).patch(tint))
+                }));
+                return Line::from(spans);
             };
             Line::from(Span::styled(line, style))
         })
         .collect()
+}
+
+/// Code lines per diff that get syntax colors; the rest stay plain.
+// ponytail: syntect with the pure-Rust regex engine parses ~30k lines/s, and
+// the detail renders on the UI thread, so the cap bounds a cold render to
+// ~70 ms. Highlighting off-thread (or the C onig engine, ~3x faster) would
+// lift it.
+const HIGHLIGHT_MAX_LINES: usize = 2000;
+
+/// Share of the accent color in the added / removed line background.
+const DIFF_TINT: f32 = 0.2;
+
+/// Blends palette slot `a` toward `b` by `t` (0 = a, 1 = b).
+fn mix(a: theme::Slot, b: theme::Slot, t: f32) -> Color {
+    match (c(a), c(b)) {
+        (Color::Rgb(r1, g1, b1), Color::Rgb(r2, g2, b2)) => {
+            let ch =
+                |x: u8, y: u8| (f32::from(x) + (f32::from(y) - f32::from(x)) * t).round() as u8;
+            Color::Rgb(ch(r1, r2), ch(g1, g2), ch(b1, b2))
+        }
+        (_, other) => other,
+    }
 }
 
 fn wrap_line_to_width(text: &str, width: usize) -> Vec<String> {
@@ -2793,6 +2835,34 @@ mod tests {
         m.pending_approve = Some(m.prs[0].clone());
         m.update(ev(MouseEventKind::Down(MouseButton::Left), 4));
         assert_eq!(m.cursor, 0, "mouse is inert while a popup is open");
+    }
+
+    #[test]
+    fn test_highlight_diff_colors_code_and_tints_changes() {
+        let diff =
+            "diff --git a/src/x.rs b/src/x.rs\n@@ -1 +1 @@\n-let a = 1;\n+let a = 2;\n \"s\"\n\
+diff --git a/notes.zzz b/notes.zzz\n@@ -1 +1 @@\n+plain text";
+        let lines = highlight_diff(diff);
+        let added = &lines[3];
+        assert!(added.spans.len() > 2, "rust code is split into runs");
+        let tint = mix(colors::BAR_BG, colors::GREEN, DIFF_TINT);
+        assert!(added.spans.iter().all(|s| s.style.bg == Some(tint)));
+        assert!(added
+            .spans
+            .iter()
+            .any(|s| s.content == "let" && s.style.fg == Some(c(colors::MAGENTA))));
+        assert_ne!(
+            lines[2].spans[0].style.bg,
+            Some(tint),
+            "removed lines use red"
+        );
+        assert!(
+            lines[4].spans.iter().all(|s| s.style.bg.is_none()),
+            "context: no tint"
+        );
+        let plain = lines.last().unwrap();
+        assert_eq!(plain.spans.len(), 1, "unknown file type stays one span");
+        assert_eq!(plain.spans[0].style.fg, Some(c(colors::GREEN)));
     }
 
     fn model_with_loaded_detail() -> Model {
