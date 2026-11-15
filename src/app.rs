@@ -8,7 +8,7 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::symbols::border;
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{
-    Block, Cell, Clear, HighlightSpacing, Padding, Paragraph, Row, Table, TableState, Wrap,
+    Block, Cell, Clear, HighlightSpacing, Padding, Paragraph, Row, Table, TableState, Tabs, Wrap,
 };
 use ratatui::Frame;
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
@@ -2306,40 +2306,45 @@ fn render_search_line(m: &Model) -> Paragraph<'static> {
     Paragraph::new(line)
 }
 
-fn render_tab_bar(m: &Model) -> Paragraph<'static> {
+fn render_tab_bar(m: &Model) -> Tabs<'static> {
     let counts = m.tab_counts();
     // Merged / Closed: no count until first visit, "…" while fetching.
-    let history_label = |name: &str, tab: usize| {
-        if m.history_loading[tab] {
-            format!("{name} …")
-        } else if m.history_loaded[tab] {
-            format!("{name} {}", counts[tab])
-        } else {
-            name.to_string()
+    let count = |tab: usize| -> Option<String> {
+        if tab == TAB_MERGED || tab == TAB_CLOSED {
+            if m.history_loading[tab] {
+                return Some("…".to_string());
+            }
+            if !m.history_loaded[tab] {
+                return None;
+            }
         }
+        Some(counts[tab].to_string())
     };
-    let labels = [
-        format!("Awaiting Review {}", counts[TAB_AWAITING]),
-        format!("Reviewed {}", counts[TAB_REVIEWED]),
-        history_label("Merged", TAB_MERGED),
-        history_label("Closed", TAB_CLOSED),
-    ];
-    let mut spans = vec![Span::raw(" ")];
-    for (i, label) in labels.iter().enumerate() {
-        if i > 0 {
-            spans.push(Span::raw(" "));
-        }
-        let style = if i == m.active_tab {
+    let titles = ["Awaiting Review", "Reviewed", "Merged", "Closed"]
+        .into_iter()
+        .enumerate()
+        .map(|(tab, name)| {
+            let mut spans = vec![Span::raw(format!(" {name} "))];
+            if let Some(n) = count(tab) {
+                spans.push(Span::styled(
+                    format!("{n} "),
+                    fg(colors::CYAN).add_modifier(Modifier::BOLD),
+                ));
+            }
+            Line::from(spans)
+        });
+    // Titles carry their own padding so the active one reads as a pill.
+    Tabs::new(titles)
+        .select(m.active_tab)
+        .style(fg(colors::MUTED))
+        .highlight_style(
             Style::new()
                 .fg(c(colors::INK))
                 .bg(c(colors::BLUE))
-                .add_modifier(Modifier::BOLD)
-        } else {
-            Style::new().fg(c(colors::MUTED)).bg(c(colors::BAR_BG))
-        };
-        spans.push(Span::styled(format!(" {label} "), style));
-    }
-    Paragraph::new(Line::from(spans))
+                .add_modifier(Modifier::BOLD),
+        )
+        .divider(Span::styled("│", fg(colors::FRAME)))
+        .padding("", "")
 }
 
 const COL_SPACING: usize = 2;
@@ -2362,9 +2367,21 @@ fn list_title_width(box_w: usize) -> usize {
 fn render_list_frame(m: &Model, f: &mut Frame<'_>, rect: Rect) {
     let title_w = list_title_width(m.frame_width());
     let items = m.visible_pr_indices();
+    // Every other row gets a faint band, halfway between the background and
+    // the header bar, so it stays distinct from the selection color in every
+    // theme (solarized's selection equals its bar color).
+    let zebra = Style::new().bg(mix(colors::INK, colors::BAR_BG, 0.5));
     let rows: Vec<Row<'static>> = items
         .iter()
-        .map(|&idx| render_pr_row(m, idx, &m.prs[idx], title_w))
+        .enumerate()
+        .map(|(i, &idx)| {
+            let row = render_pr_row(m, idx, &m.prs[idx], title_w);
+            if i % 2 == 1 {
+                row.style(zebra)
+            } else {
+                row
+            }
+        })
         .collect();
     let widths = [
         COL_MARK_W,
@@ -2376,8 +2393,12 @@ fn render_list_frame(m: &Model, f: &mut Frame<'_>, rect: Rect) {
         COL_APPROVE_W,
     ]
     .map(|w| Constraint::Length(w as u16));
-    let header = Row::new(["", "Type", "Repository", "#", "Title", "Author", "Approve"])
-        .style(fg(colors::MUTED));
+    let header = Row::new(["", "Type", "Repository", "#", "Title", "Author", "Approve"]).style(
+        Style::new()
+            .fg(c(colors::MUTED))
+            .bg(c(colors::BAR_BG))
+            .add_modifier(Modifier::BOLD),
+    );
     let block = Block::bordered()
         .border_set(border::ROUNDED)
         .border_style(fg(colors::FRAME));
@@ -2882,6 +2903,12 @@ mod tests {
             // The highlight background spans the selected row.
             assert_eq!(buf[(w / 2, 3)].bg, c(colors::SELECTED), "w={w}");
             assert_ne!(buf[(w / 2, 4)].bg, c(colors::SELECTED), "w={w}");
+            assert_eq!(buf[(w / 2, 2)].bg, c(colors::BAR_BG), "header band, w={w}");
+            assert_eq!(
+                buf[(w / 2, 4)].bg,
+                mix(colors::INK, colors::BAR_BG, 0.5),
+                "zebra row, w={w}"
+            );
         }
     }
 
@@ -3920,7 +3947,20 @@ diff --git a/notes.zzz b/notes.zzz\n@@ -1 +1 @@\n+plain text";
             buf.content().iter().map(|c| c.symbol()).collect()
         };
         let got = text(&m);
-        assert!(got.contains(" Merged   Closed "), "{got}");
+        assert!(got.contains(" Merged │ Closed "), "{got}");
+        let buf_cell = |m: &Model, x: u16| {
+            let mut term =
+                ratatui::Terminal::new(ratatui::backend::TestBackend::new(80, 1)).unwrap();
+            term.draw(|f| f.render_widget(render_tab_bar(m), f.area()))
+                .unwrap();
+            term.backend().buffer()[(x, 0)].clone()
+        };
+        assert_eq!(buf_cell(&m, 1).bg, c(colors::BLUE), "active tab is a pill");
+        assert_ne!(
+            buf_cell(&m, 22).bg,
+            c(colors::BLUE),
+            "inactive tabs are plain"
+        );
         m.history_loading[TAB_MERGED] = true;
         assert!(text(&m).contains(" Merged … "));
         m.update(history_msg(
