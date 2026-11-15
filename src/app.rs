@@ -88,8 +88,6 @@ pub struct DetailViewCache {
     pub content_width: usize,
     pub total: u16,
     pub lines: Vec<Line<'static>>,
-    pub detail: PullRequestDetail,
-    pub diff: String,
 }
 
 pub struct MatchesCache {
@@ -168,8 +166,8 @@ pub struct Model {
     pub pr_list_loaded: bool,
     pub cursor: usize,
     pub list_offset: usize,
-    pub current_detail: Option<PullRequestDetail>,
-    pub current_diff: String,
+    current_detail: Option<PullRequestDetail>,
+    current_diff: String,
     pub detail_loading: bool,
     pub detail_err: String,
     pub loading_for_url: Option<String>,
@@ -249,6 +247,19 @@ impl Model {
             detail_view_cache: None,
             matches_cache: RefCell::new(None),
         }
+    }
+
+    /// Replaces the detail inputs and invalidates the rendered detail cache.
+    pub fn set_detail_view(&mut self, detail: PullRequestDetail, diff: String) {
+        self.current_detail = Some(detail);
+        self.current_diff = diff;
+        self.detail_view_cache = None;
+    }
+
+    /// Replaces the diff and invalidates the rendered detail cache.
+    pub fn set_current_diff(&mut self, diff: String) {
+        self.current_diff = diff;
+        self.detail_view_cache = None;
     }
 
     pub fn any_history_loading(&self) -> bool {
@@ -484,6 +495,7 @@ impl Model {
             self.current_detail = None;
             self.detail_loading = false;
             self.loading_for_url = None;
+            self.detail_view_cache = None;
             return None;
         }
         if self.cursor >= self.prs.len() {
@@ -540,8 +552,7 @@ impl Model {
             // miss so wheel-scrolling the list does not fan out fetches. A
             // re-run of a finished check stays stale until the PR updates.
             let refresh = effect.is_none() && entry.detail.ci.pending > 0;
-            self.current_detail = Some(entry.detail);
-            self.current_diff = entry.diff;
+            self.set_detail_view(entry.detail, entry.diff);
             self.detail_loading = false;
             if refresh {
                 return Some(Effect::Debounce {
@@ -724,8 +735,7 @@ impl Model {
                             self.detail_scroll = 0;
                             self.detail_total = 0;
                         }
-                        self.current_detail = Some(detail);
-                        self.current_diff = diff;
+                        self.set_detail_view(detail, diff);
                         Vec::new()
                     }
                 }
@@ -2580,9 +2590,10 @@ fn render_detail_section(m: &mut Model, f: &mut Frame<'_>, rect: Rect, vp_h: u16
             // Rebuild the rendered detail only when its inputs changed; the
             // per-frame cost is then just cloning the cached lines (the slow
             // markdown parse / ANSI strip / style build runs once per change).
-            let fresh = m.detail_view_cache.as_ref().is_some_and(|c| {
-                c.content_width == content_width && c.detail == *detail && c.diff == m.current_diff
-            });
+            let fresh = m
+                .detail_view_cache
+                .as_ref()
+                .is_some_and(|c| c.content_width == content_width);
             if !fresh {
                 let lines = render_diff_content(detail, &m.current_diff, content_width);
                 let total: usize = lines
@@ -2600,8 +2611,6 @@ fn render_detail_section(m: &mut Model, f: &mut Frame<'_>, rect: Rect, vp_h: u16
                     content_width,
                     total: total.min(u16::MAX as usize) as u16,
                     lines,
-                    detail: detail.clone(),
-                    diff: m.current_diff.clone(),
                 });
             }
         }
@@ -4513,6 +4522,44 @@ diff --git a/notes.zzz b/notes.zzz\n@@ -1 +1 @@\n+plain text";
                 "continuation starts with a blank: {out:?}"
             );
         }
+    }
+
+    #[test]
+    fn test_detail_render_cache_rebuilds_after_diff_update() {
+        use ratatui::backend::TestBackend;
+        use ratatui::layout::Rect;
+        use ratatui::Terminal;
+
+        let rect = Rect::new(0, 0, 60, 20);
+        let mut m = model_with_loaded_detail();
+        m.set_current_diff("+old diff line".into());
+        let mut term = Terminal::new(TestBackend::new(rect.width, rect.height)).unwrap();
+
+        term.draw(|f| render_detail_section(&mut m, f, rect, rect.height - 2))
+            .unwrap();
+        let before: String = term
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect();
+        assert!(before.contains("old diff line"));
+
+        m.set_current_diff("+new diff line".into());
+        assert!(m.detail_view_cache.is_none());
+        term.draw(|f| render_detail_section(&mut m, f, rect, rect.height - 2))
+            .unwrap();
+
+        let text: String = term
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect();
+        assert!(text.contains("new diff line"));
+        assert!(!text.contains("old diff line"));
     }
 
     #[test]

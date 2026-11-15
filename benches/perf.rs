@@ -182,8 +182,7 @@ fn frame_model() -> app::Model {
     m.prs = prs().clone();
     m.pr_list_loaded = true;
     m.cursor = 0;
-    m.current_detail = Some(detail());
-    m.current_diff = diff().to_string();
+    m.set_detail_view(detail(), diff().to_string());
     m
 }
 
@@ -234,7 +233,7 @@ fn render_frame_steady_120x40() {
 #[divan::bench]
 fn render_frame_rust_120x40() {
     let mut m = frame_model();
-    m.current_diff = rust_diff().to_string();
+    m.set_current_diff(rust_diff().to_string());
     let mut term =
         ratatui::Terminal::new(ratatui::backend::TestBackend::new(120, 40)).expect("test backend");
     term.draw(|f| app::render(&mut m, f)).expect("draw");
@@ -254,7 +253,7 @@ fn render_frame_resize_rust() {
     let mut g = S
         .get_or_init(|| {
             let mut m = frame_model();
-            m.current_diff = rust_diff().to_string();
+            m.set_current_diff(rust_diff().to_string());
             let mut term = ratatui::Terminal::new(ratatui::backend::TestBackend::new(120, 40))
                 .expect("test backend");
             term.draw(|f| app::render(&mut m, f)).expect("warm draw");
@@ -280,7 +279,7 @@ fn render_frame_steady_large_diff() {
     let mut g = S
         .get_or_init(|| {
             let mut m = frame_model();
-            m.current_diff = diff().repeat(50);
+            m.set_current_diff(diff().repeat(50));
             let mut term = ratatui::Terminal::new(ratatui::backend::TestBackend::new(120, 40))
                 .expect("test backend");
             term.draw(|f| app::render(&mut m, f)).expect("warm draw");
