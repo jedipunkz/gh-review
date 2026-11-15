@@ -3,11 +3,13 @@ use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
-use ratatui::layout::Rect;
+use ratatui::layout::{Constraint, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::symbols::border;
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Clear, Padding, Paragraph, Wrap};
+use ratatui::widgets::{
+    Block, Cell, Clear, HighlightSpacing, Padding, Paragraph, Row, Table, TableState, Wrap,
+};
 use ratatui::Frame;
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
@@ -2096,237 +2098,112 @@ fn render_tab_bar(m: &Model) -> Paragraph<'static> {
     Paragraph::new(Line::from(spans))
 }
 
+const COL_SPACING: usize = 2;
+
+/// Title column width: what the fixed columns, the one-column highlight
+/// symbol, the six column gaps, and the two border columns leave of `box_w`.
 fn list_title_width(box_w: usize) -> usize {
     let fixed = 2
+        + 1
         + COL_MARK_W
-        + 1
         + COL_TYPE_W
-        + 2
         + COL_REPO_W
-        + 2
         + COL_NUM_W
-        + 2
-        + 2
-        + 1
         + COL_AUTHOR_W
-        + 2
-        + COL_APPROVE_W;
+        + COL_APPROVE_W
+        + COL_SPACING * 6;
     std::cmp::max(10, box_w.saturating_sub(fixed))
 }
 
 fn render_list_frame(m: &Model, f: &mut Frame<'_>, rect: Rect) {
-    let box_w = m.frame_width();
-    let title_w = list_title_width(box_w);
-    let mut lines: Vec<Line<'static>> = Vec::new();
-
-    let header = vec![
-        Span::styled(format!(" {}", pad_right("", COL_MARK_W)), fg(colors::MUTED)),
-        Span::raw(" "),
-        Span::styled(pad_right("Type", COL_TYPE_W), fg(colors::MUTED)),
-        Span::raw("  "),
-        Span::styled(pad_right("Repository", COL_REPO_W), fg(colors::MUTED)),
-        Span::raw("  "),
-        Span::styled(pad_right("#", COL_NUM_W), fg(colors::MUTED)),
-        Span::raw("  "),
-        Span::styled(pad_right("Title", title_w), fg(colors::MUTED)),
-        Span::raw("   "),
-        Span::styled(pad_right("Author", COL_AUTHOR_W), fg(colors::MUTED)),
-        Span::raw("  "),
-        Span::styled(pad_right("Approve", COL_APPROVE_W), fg(colors::MUTED)),
-    ];
-    lines.push(Line::from(header));
-
+    let title_w = list_title_width(m.frame_width());
     let items = m.visible_pr_indices();
-    if items.is_empty() {
-        lines.push(Line::from(Span::styled(
-            format!(" {}", m.empty_list_message()),
-            fg(colors::MUTED),
-        )));
-    } else {
-        for idx in items {
-            let pr = &m.prs[idx];
-            lines.push(render_pr_line(m, idx, pr, box_w));
-        }
-    }
-
+    let rows: Vec<Row<'static>> = items
+        .iter()
+        .map(|&idx| render_pr_row(m, idx, &m.prs[idx], title_w))
+        .collect();
+    let widths = [
+        COL_MARK_W,
+        COL_TYPE_W,
+        COL_REPO_W,
+        COL_NUM_W,
+        title_w,
+        COL_AUTHOR_W,
+        COL_APPROVE_W,
+    ]
+    .map(|w| Constraint::Length(w as u16));
+    let header = Row::new(["", "Type", "Repository", "#", "Title", "Author", "Approve"])
+        .style(fg(colors::MUTED));
     let block = Block::bordered()
         .border_set(border::ROUNDED)
         .border_style(fg(colors::FRAME));
     let inner = block.inner(rect);
-    f.render_widget(block, rect);
-    let para = Paragraph::new(lines);
-    f.render_widget(para, inner);
+    let table = Table::new(rows, widths)
+        .header(header)
+        .column_spacing(COL_SPACING as u16)
+        .highlight_symbol(Span::styled("▌", fg(colors::CYAN)))
+        .highlight_spacing(HighlightSpacing::Always)
+        .row_highlight_style(Style::new().bg(c(colors::SELECTED)))
+        .block(block);
+    let mut state = TableState::new().with_selected(items.iter().position(|&i| i == m.cursor));
+    f.render_stateful_widget(table, rect, &mut state);
+
+    if items.is_empty() && inner.height > 1 {
+        let msg = Span::styled(format!(" {}", m.empty_list_message()), fg(colors::MUTED));
+        let area = Rect::new(inner.x, inner.y + 1, inner.width, inner.height - 1);
+        f.render_widget(Paragraph::new(Line::from(msg)), area);
+    }
 }
 
-fn render_pr_line(m: &Model, idx: usize, pr: &PullRequest, box_w: usize) -> Line<'static> {
-    let title_w = list_title_width(box_w);
-    let approve = m.approve_label(pr);
+fn render_pr_row(m: &Model, idx: usize, pr: &PullRequest, title_w: usize) -> Row<'static> {
     let selected = idx == m.cursor;
+    // The table paints the selected row's background; plain or muted columns
+    // switch to a foreground that stays readable on it.
+    let pick = |normal: theme::Slot, sel: theme::Slot| fg(if selected { sel } else { normal });
 
-    let mut spans: Vec<Span<'static>> = Vec::new();
-    if selected {
-        spans.push(Span::styled(
-            "▌".to_string(),
-            Style::new().fg(c(colors::CYAN)).bg(c(colors::SELECTED)),
-        ));
+    let mark = if m.marked_prs.contains(&pr.url) {
+        Span::styled("[!]", fg(colors::YELLOW).add_modifier(Modifier::BOLD))
     } else {
-        spans.push(Span::raw(" "));
-    }
-
-    // mark cell
-    if m.marked_prs.contains(&pr.url) {
-        let style = if selected {
-            Style::new()
-                .fg(c(colors::YELLOW))
-                .bg(c(colors::SELECTED))
-                .add_modifier(Modifier::BOLD)
-        } else {
-            Style::new()
-                .fg(c(colors::YELLOW))
-                .add_modifier(Modifier::BOLD)
-        };
-        spans.push(Span::styled(pad_right("[!]", COL_MARK_W), style));
-    } else if selected {
-        spans.push(Span::styled(
-            repeat_space(COL_MARK_W),
-            Style::new().bg(c(colors::SELECTED)),
-        ));
-    } else {
-        spans.push(Span::raw(repeat_space(COL_MARK_W)));
-    }
-    spans.push(Span::styled(
-        " ".to_string(),
-        if selected {
-            Style::new().bg(c(colors::SELECTED))
-        } else {
-            Style::new()
-        },
-    ));
-
-    // type cell
-    let is_me = pr.request.contains("@me");
-    let type_label = if is_me { "[me]" } else { "[team]" };
-    let type_color = if is_me { colors::CYAN } else { colors::ORANGE };
-    let type_style = if selected {
-        Style::new().fg(c(type_color)).bg(c(colors::SELECTED))
-    } else {
-        fg(type_color)
+        Span::raw("")
     };
-    spans.push(Span::styled(pad_right(type_label, COL_TYPE_W), type_style));
-    spans.push(Span::styled(
-        "  ".to_string(),
-        if selected {
-            Style::new().bg(c(colors::SELECTED))
-        } else {
-            Style::new()
-        },
-    ));
-
-    let repo_style = if selected {
-        Style::new()
-            .fg(c(colors::SELECTED_FG))
-            .bg(c(colors::SELECTED))
+    let (type_label, type_color) = if pr.request.contains("@me") {
+        ("[me]", colors::CYAN)
     } else {
-        fg(colors::CYAN)
+        ("[team]", colors::ORANGE)
     };
-    spans.push(Span::styled(
-        pad_right(&pr.repository, COL_REPO_W),
-        repo_style,
-    ));
-    spans.push(Span::styled(
-        "  ".to_string(),
-        if selected {
-            Style::new().bg(c(colors::SELECTED))
-        } else {
-            Style::new()
-        },
-    ));
-
-    let num_style = if selected {
-        Style::new().fg(c(colors::YELLOW)).bg(c(colors::SELECTED))
-    } else {
-        fg(colors::BLUE)
-    };
-    spans.push(Span::styled(
-        pad_right(&format!("#{}", pr.number), COL_NUM_W),
-        num_style,
-    ));
-    spans.push(Span::styled(
-        "  ".to_string(),
-        if selected {
-            Style::new().bg(c(colors::SELECTED))
-        } else {
-            Style::new()
-        },
-    ));
-
     let title_style = if selected {
-        Style::new()
-            .fg(c(colors::SELECTED_FG))
-            .bg(c(colors::SELECTED))
-            .add_modifier(Modifier::BOLD)
+        fg(colors::SELECTED_FG).add_modifier(Modifier::BOLD)
     } else {
         fg(colors::FG)
     };
-    spans.push(Span::styled(
-        pad_right(&sanitize_text(&pr.title), title_w),
-        title_style,
-    ));
-    spans.push(Span::styled(
-        "  ".to_string(),
-        if selected {
-            Style::new().bg(c(colors::SELECTED))
-        } else {
-            Style::new()
-        },
-    ));
-
-    let author_style = if selected {
-        Style::new()
-            .fg(c(colors::SELECTED_FG))
-            .bg(c(colors::SELECTED))
-    } else {
-        fg(colors::MAGENTA)
+    let approve = m.approve_label(pr);
+    let approve_style = match approve {
+        "approved" => fg(colors::GREEN),
+        "changes" => fg(colors::RED),
+        _ => pick(colors::MUTED, colors::YELLOW),
     };
-    spans.push(Span::styled(
-        pad_right(&format!("@{}", pr.author), COL_AUTHOR_W),
-        author_style,
-    ));
-    spans.push(Span::styled(
-        "  ".to_string(),
-        if selected {
-            Style::new().bg(c(colors::SELECTED))
-        } else {
-            Style::new()
-        },
-    ));
 
-    let approve_style = if selected {
-        match approve {
-            "approved" => Style::new().fg(c(colors::GREEN)).bg(c(colors::SELECTED)),
-            "changes" => Style::new().fg(c(colors::RED)).bg(c(colors::SELECTED)),
-            _ => Style::new().fg(c(colors::YELLOW)).bg(c(colors::SELECTED)),
-        }
-    } else {
-        match approve {
-            "approved" => fg(colors::GREEN),
-            "changes" => fg(colors::RED),
-            _ => fg(colors::MUTED),
-        }
-    };
-    spans.push(Span::styled(
-        pad_right(approve, COL_APPROVE_W),
-        approve_style,
-    ));
-
-    if selected {
-        spans.push(Span::styled(
-            " ".to_string(),
-            Style::new().bg(c(colors::SELECTED)),
-        ));
-    }
-
-    Line::from(spans)
+    Row::new(vec![
+        Cell::from(mark),
+        Cell::from(Span::styled(type_label, fg(type_color))),
+        Cell::from(Span::styled(
+            pad_right(&pr.repository, COL_REPO_W),
+            pick(colors::CYAN, colors::SELECTED_FG),
+        )),
+        Cell::from(Span::styled(
+            format!("#{}", pr.number),
+            pick(colors::BLUE, colors::YELLOW),
+        )),
+        Cell::from(Span::styled(
+            pad_right(&sanitize_text(&pr.title), title_w),
+            title_style,
+        )),
+        Cell::from(Span::styled(
+            pad_right(&format!("@{}", pr.author), COL_AUTHOR_W),
+            pick(colors::MAGENTA, colors::SELECTED_FG),
+        )),
+        Cell::from(Span::styled(approve, approve_style)),
+    ])
 }
 
 fn render_detail_section(m: &mut Model, f: &mut Frame<'_>, rect: Rect, vp_h: u16) {
@@ -2727,6 +2604,41 @@ mod tests {
         let cache = Arc::new(DetailCache::with_dir(None));
         let prefetcher = Arc::new(Prefetcher::new(cache.clone()));
         Model::new(cache, prefetcher)
+    }
+
+    #[test]
+    fn test_list_table_aligns_header_and_rows() {
+        for w in [120u16, 80] {
+            let mut m = model_with_loaded_detail();
+            let long = "a very long title that has to be cut with an ellipsis ".repeat(4);
+            m.prs.push(PullRequest {
+                repository: "owner/another-repository-with-long-name".into(),
+                number: 4567,
+                title: long,
+                url: "https://example.test/pr/4567".into(),
+                author: "someone".into(),
+                request: "team/x".into(),
+                ..Default::default()
+            });
+            m.marked_prs.insert(m.prs[1].url.clone());
+            m.update(Msg::Resize(w, 12));
+            let mut term =
+                ratatui::Terminal::new(ratatui::backend::TestBackend::new(w, 12)).unwrap();
+            term.draw(|f| render(&mut m, f)).unwrap();
+            let buf = term.backend().buffer().clone();
+            let row =
+                |y: u16| -> String { (0..w).map(|x| buf[(x, y)].symbol().to_string()).collect() };
+            let (header, first, second) = (row(2), row(3), row(4));
+            // Columns line up: "Author" in the header sits over "@octocat".
+            let col = |s: &str, pat: &str| s.find(pat).map(|b| s[..b].chars().count());
+            assert_eq!(col(&header, "Author"), col(&first, "@octocat"), "w={w}");
+            assert_eq!(col(&header, "Repository"), col(&second, "owner/"), "w={w}");
+            assert!(first.contains('▌'), "cursor bar on selected row, w={w}");
+            assert!(second.contains("[!]") && second.contains("..."), "w={w}");
+            // The highlight background spans the selected row.
+            assert_eq!(buf[(w / 2, 3)].bg, c(colors::SELECTED), "w={w}");
+            assert_ne!(buf[(w / 2, 4)].bg, c(colors::SELECTED), "w={w}");
+        }
     }
 
     fn model_with_loaded_detail() -> Model {
