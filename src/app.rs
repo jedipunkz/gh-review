@@ -1460,6 +1460,11 @@ pub fn render_diff_content(
         format!("-{}", detail.deletions),
         fg(colors::RED),
     ));
+    if let Some((add, del)) = diffstat_blocks(detail.additions, detail.deletions) {
+        meta2.push(Span::raw(" "));
+        meta2.push(Span::styled("■".repeat(add), fg(colors::GREEN)));
+        meta2.push(Span::styled("■".repeat(del), fg(colors::RED)));
+    }
     lines.push(Line::from(meta2));
 
     if !detail.reviewers.is_empty() {
@@ -1543,6 +1548,23 @@ pub fn render_diff_content(
         }
     }
     wrapped
+}
+
+const DIFFSTAT_BLOCKS: usize = 5;
+
+/// Splits GitHub's five-block diffstat bar into (green, red) counts by the
+/// share of added lines. Any nonzero side keeps at least one block, so a
+/// one-line deletion in a large addition is still visible. None when there
+/// are no changed lines.
+fn diffstat_blocks(additions: i64, deletions: i64) -> Option<(usize, usize)> {
+    let (add, del) = (additions.max(0) as u64, deletions.max(0) as u64);
+    let total = add + del;
+    if total == 0 {
+        return None;
+    }
+    let n = DIFFSTAT_BLOCKS as u64;
+    let green = ((add * n + total / 2) / total).clamp(u64::from(add > 0), n - u64::from(del > 0));
+    Some((green as usize, DIFFSTAT_BLOCKS - green as usize))
 }
 
 fn meta_pair(label: &str, value: &str) -> Vec<Span<'static>> {
@@ -2639,6 +2661,17 @@ mod tests {
             assert_eq!(buf[(w / 2, 3)].bg, c(colors::SELECTED), "w={w}");
             assert_ne!(buf[(w / 2, 4)].bg, c(colors::SELECTED), "w={w}");
         }
+    }
+
+    #[test]
+    fn test_diffstat_blocks() {
+        assert_eq!(diffstat_blocks(0, 0), None);
+        assert_eq!(diffstat_blocks(10, 0), Some((5, 0)));
+        assert_eq!(diffstat_blocks(0, 10), Some((0, 5)));
+        assert_eq!(diffstat_blocks(50, 50), Some((3, 2)));
+        assert_eq!(diffstat_blocks(1000, 1), Some((4, 1)));
+        assert_eq!(diffstat_blocks(1, 1000), Some((1, 4)));
+        assert_eq!(diffstat_blocks(-3, 4), Some((0, 5)));
     }
 
     fn model_with_loaded_detail() -> Model {
