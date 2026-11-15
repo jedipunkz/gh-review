@@ -44,7 +44,7 @@ waiting for your review, shows the diff in a TUI, and approves from the keyboard
 ### Prerequisites
 
 - A GitHub CLI (`gh`) installation that is authenticated
-- [Rust](https://rustup.rs) 1.75 or later (only for building from source)
+- [Rust](https://rustup.rs) 1.88 or later (only for building from source)
 
 ### Step 1. Install the extension
 
