@@ -8,7 +8,7 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::symbols::border;
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{
-    Block, Cell, Clear, HighlightSpacing, Padding, Paragraph, Row, Table, TableState, Wrap,
+    Block, Cell, Clear, HighlightSpacing, Padding, Paragraph, Row, Table, TableState, Tabs, Wrap,
 };
 use ratatui::Frame;
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
@@ -1500,42 +1500,47 @@ pub fn render_diff_content(
             .add_modifier(Modifier::BOLD),
     )));
 
-    let mut meta = meta_pair("Author", &format!("@{}", detail.base.author));
-    meta.extend(meta_pair("Review request", &detail.base.request));
-    let branch = branch_label(detail);
-    if !branch.is_empty() {
-        meta.extend(meta_pair("Branch", &branch));
+    // Status pills: merge state, review decision, CI, then the diffstat.
+    let mut status = vec![
+        state_pill(&detail.merge_state_status),
+        Span::raw(" "),
+        review_pill(&detail.base.review_decision),
+    ];
+    let ci = ci_spans(&detail.ci);
+    if !ci.is_empty() {
+        status.push(Span::raw(" "));
+        status.extend(ci);
     }
-    lines.push(Line::from(meta));
-
-    let mut meta2 = meta_pair("State", &non_empty(&detail.merge_state_status, "unknown"));
-    let decision = non_empty(&detail.base.review_decision, "none");
-    meta2.push(Span::styled("Review:".to_string(), fg(colors::YELLOW)));
-    meta2.push(Span::raw(" "));
-    meta2.push(Span::styled(
-        decision,
-        review_decision_style(&detail.base.review_decision),
+    status.push(Span::raw("   "));
+    status.push(Span::styled(
+        format!("{} files ", detail.changed_files),
+        fg(colors::MUTED),
     ));
-    meta2.extend(meta_pair("Files", &detail.changed_files.to_string()));
-    meta2.push(Span::styled(
+    status.push(Span::styled(
         format!("+{}", detail.additions),
         fg(colors::GREEN),
     ));
-    meta2.push(Span::raw(" "));
-    meta2.push(Span::styled(
+    status.push(Span::raw(" "));
+    status.push(Span::styled(
         format!("-{}", detail.deletions),
         fg(colors::RED),
     ));
     if let Some((add, del)) = diffstat_blocks(detail.additions, detail.deletions) {
-        meta2.push(Span::raw(" "));
-        meta2.push(Span::styled("■".repeat(add), fg(colors::GREEN)));
-        meta2.push(Span::styled("■".repeat(del), fg(colors::RED)));
+        status.push(Span::raw(" "));
+        status.push(Span::styled("■".repeat(add), fg(colors::GREEN)));
+        status.push(Span::styled("■".repeat(del), fg(colors::RED)));
     }
-    lines.push(Line::from(meta2));
+    lines.push(Line::from(status));
 
-    if let Some(ci) = render_ci_line(&detail.ci) {
-        lines.push(ci);
+    let mut meta = meta_pair("Author", &format!("@{}", detail.base.author));
+    meta.push(Span::raw(META_GAP));
+    meta.extend(meta_pair("Review request", &detail.base.request));
+    let branch = branch_label(detail);
+    if !branch.is_empty() {
+        meta.push(Span::raw(META_GAP));
+        meta.extend(meta_pair("Branch", &branch));
     }
+    lines.push(Line::from(meta));
 
     if !detail.reviewers.is_empty() {
         let mut spans = vec![
@@ -1544,11 +1549,11 @@ pub fn render_diff_content(
         ];
         for (i, reviewer) in detail.reviewers.iter().enumerate() {
             if i > 0 {
-                spans.push(Span::raw(", "));
+                spans.push(Span::raw(META_GAP));
             }
-            spans.push(Span::raw(format!("@{}", reviewer.author)));
+            spans.push(Span::raw(format!("@{} ", reviewer.author)));
             spans.push(Span::styled(
-                reviewer.state.clone(),
+                reviewer.state.to_lowercase().replace('_', " "),
                 review_decision_style(&reviewer.state),
             ));
         }
@@ -1567,7 +1572,7 @@ pub fn render_diff_content(
         }
         if detail.base.updated_at != std::time::SystemTime::UNIX_EPOCH {
             if !spans.is_empty() {
-                spans.push(Span::raw("  "));
+                spans.push(Span::raw(META_GAP));
             }
             spans.extend(meta_pair(
                 "Updated",
@@ -1578,7 +1583,13 @@ pub fn render_diff_content(
     }
 
     if !detail.labels.is_empty() {
-        let spans = meta_pair("Labels", &sanitize_text(&detail.labels.join(", ")));
+        let mut spans = Vec::new();
+        for (i, label) in detail.labels.iter().enumerate() {
+            if i > 0 {
+                spans.push(Span::raw(" "));
+            }
+            spans.push(pill(&sanitize_text(label), None));
+        }
         lines.push(Line::from(spans));
     }
 
@@ -1621,24 +1632,62 @@ pub fn render_diff_content(
 }
 
 /// "CI: failing  ✓3 ✗1 ●2", or None when the head commit has no checks.
-fn render_ci_line(ci: &gh::CiSummary) -> Option<Line<'static>> {
-    let (word, word_color) = if ci.failed > 0 {
-        ("failing", colors::RED)
-    } else if ci.pending > 0 {
-        ("pending", colors::YELLOW)
-    } else if ci.passed > 0 {
-        ("passing", colors::GREEN)
-    } else {
-        return None;
+/// Gap between the label/value pairs of one metadata line.
+const META_GAP: &str = "   ";
+
+/// " text " on a colored background. `None` is the neutral style used for
+/// labels and unknown states.
+fn pill(text: &str, slot: Option<theme::Slot>) -> Span<'static> {
+    let style = match slot {
+        Some(slot) => Style::new()
+            .fg(c(colors::INK))
+            .bg(c(slot))
+            .add_modifier(Modifier::BOLD),
+        None => Style::new().fg(c(colors::FG)).bg(c(colors::FRAME)),
     };
-    let mut spans = vec![
-        Span::styled("CI:".to_string(), fg(colors::YELLOW)),
-        Span::raw(" "),
-        Span::styled(
-            word.to_string(),
-            fg(word_color).add_modifier(Modifier::BOLD),
-        ),
-    ];
+    Span::styled(format!(" {text} "), style)
+}
+
+/// GitHub's mergeStateStatus, lowercased, colored by whether it blocks a
+/// merge.
+fn state_pill(state: &str) -> Span<'static> {
+    let slot = match state {
+        "CLEAN" | "HAS_HOOKS" => Some(colors::GREEN),
+        "UNSTABLE" | "BEHIND" => Some(colors::YELLOW),
+        "BLOCKED" | "DIRTY" => Some(colors::RED),
+        _ => None,
+    };
+    let text = if state.is_empty() {
+        "unknown".to_string()
+    } else {
+        state.to_lowercase().replace('_', " ")
+    };
+    pill(&text, slot)
+}
+
+fn review_pill(decision: &str) -> Span<'static> {
+    match decision {
+        "APPROVED" => pill("approved", Some(colors::GREEN)),
+        "CHANGES_REQUESTED" => pill("changes requested", Some(colors::RED)),
+        "REVIEW_REQUIRED" => pill("review required", Some(colors::YELLOW)),
+        "" => pill("no review", None),
+        other => pill(&other.to_lowercase().replace('_', " "), None),
+    }
+}
+
+/// A "ci failing" pill plus per-outcome counts ("✓3 ✗1 ●2"); empty when the
+/// head commit has no checks.
+fn ci_spans(ci: &gh::CiSummary) -> Vec<Span<'static>> {
+    let (word, slot) = if ci.failed > 0 {
+        ("ci failing", colors::RED)
+    } else if ci.pending > 0 {
+        ("ci pending", colors::YELLOW)
+    } else if ci.passed > 0 {
+        ("ci passing", colors::GREEN)
+    } else {
+        return Vec::new();
+    };
+    let mut spans = vec![pill(word, Some(slot))];
     for (n, mark, color) in [
         (ci.passed, "✓", colors::GREEN),
         (ci.failed, "✗", colors::RED),
@@ -1649,7 +1698,7 @@ fn render_ci_line(ci: &gh::CiSummary) -> Option<Line<'static>> {
             spans.push(Span::styled(format!("{mark}{n}"), fg(color)));
         }
     }
-    Some(Line::from(spans))
+    spans
 }
 
 const DIFFSTAT_BLOCKS: usize = 5;
@@ -1735,14 +1784,6 @@ fn wrap_line_spans(line: Line<'static>, width: usize) -> Vec<Line<'static>> {
         idx = cut;
     }
     out
-}
-
-fn non_empty(s: &str, fallback: &str) -> String {
-    if s.is_empty() {
-        fallback.to_string()
-    } else {
-        s.to_string()
-    }
 }
 
 fn branch_label(detail: &PullRequestDetail) -> String {
@@ -2265,40 +2306,45 @@ fn render_search_line(m: &Model) -> Paragraph<'static> {
     Paragraph::new(line)
 }
 
-fn render_tab_bar(m: &Model) -> Paragraph<'static> {
+fn render_tab_bar(m: &Model) -> Tabs<'static> {
     let counts = m.tab_counts();
     // Merged / Closed: no count until first visit, "…" while fetching.
-    let history_label = |name: &str, tab: usize| {
-        if m.history_loading[tab] {
-            format!("{name} …")
-        } else if m.history_loaded[tab] {
-            format!("{name} {}", counts[tab])
-        } else {
-            name.to_string()
+    let count = |tab: usize| -> Option<String> {
+        if tab == TAB_MERGED || tab == TAB_CLOSED {
+            if m.history_loading[tab] {
+                return Some("…".to_string());
+            }
+            if !m.history_loaded[tab] {
+                return None;
+            }
         }
+        Some(counts[tab].to_string())
     };
-    let labels = [
-        format!("Awaiting Review {}", counts[TAB_AWAITING]),
-        format!("Reviewed {}", counts[TAB_REVIEWED]),
-        history_label("Merged", TAB_MERGED),
-        history_label("Closed", TAB_CLOSED),
-    ];
-    let mut spans = vec![Span::raw(" ")];
-    for (i, label) in labels.iter().enumerate() {
-        if i > 0 {
-            spans.push(Span::raw(" "));
-        }
-        let style = if i == m.active_tab {
+    let titles = ["Awaiting Review", "Reviewed", "Merged", "Closed"]
+        .into_iter()
+        .enumerate()
+        .map(|(tab, name)| {
+            let mut spans = vec![Span::raw(format!(" {name} "))];
+            if let Some(n) = count(tab) {
+                spans.push(Span::styled(
+                    format!("{n} "),
+                    fg(colors::CYAN).add_modifier(Modifier::BOLD),
+                ));
+            }
+            Line::from(spans)
+        });
+    // Titles carry their own padding so the active one reads as a pill.
+    Tabs::new(titles)
+        .select(m.active_tab)
+        .style(fg(colors::MUTED))
+        .highlight_style(
             Style::new()
                 .fg(c(colors::INK))
                 .bg(c(colors::BLUE))
-                .add_modifier(Modifier::BOLD)
-        } else {
-            Style::new().fg(c(colors::MUTED)).bg(c(colors::BAR_BG))
-        };
-        spans.push(Span::styled(format!(" {label} "), style));
-    }
-    Paragraph::new(Line::from(spans))
+                .add_modifier(Modifier::BOLD),
+        )
+        .divider(Span::styled("│", fg(colors::FRAME)))
+        .padding("", "")
 }
 
 const COL_SPACING: usize = 2;
@@ -2321,9 +2367,21 @@ fn list_title_width(box_w: usize) -> usize {
 fn render_list_frame(m: &Model, f: &mut Frame<'_>, rect: Rect) {
     let title_w = list_title_width(m.frame_width());
     let items = m.visible_pr_indices();
+    // Every other row gets a faint band, halfway between the background and
+    // the header bar, so it stays distinct from the selection color in every
+    // theme (solarized's selection equals its bar color).
+    let zebra = Style::new().bg(mix(colors::INK, colors::BAR_BG, 0.5));
     let rows: Vec<Row<'static>> = items
         .iter()
-        .map(|&idx| render_pr_row(m, idx, &m.prs[idx], title_w))
+        .enumerate()
+        .map(|(i, &idx)| {
+            let row = render_pr_row(m, idx, &m.prs[idx], title_w);
+            if i % 2 == 1 {
+                row.style(zebra)
+            } else {
+                row
+            }
+        })
         .collect();
     let widths = [
         COL_MARK_W,
@@ -2335,8 +2393,12 @@ fn render_list_frame(m: &Model, f: &mut Frame<'_>, rect: Rect) {
         COL_APPROVE_W,
     ]
     .map(|w| Constraint::Length(w as u16));
-    let header = Row::new(["", "Type", "Repository", "#", "Title", "Author", "Approve"])
-        .style(fg(colors::MUTED));
+    let header = Row::new(["", "Type", "Repository", "#", "Title", "Author", "Approve"]).style(
+        Style::new()
+            .fg(c(colors::MUTED))
+            .bg(c(colors::BAR_BG))
+            .add_modifier(Modifier::BOLD),
+    );
     let block = Block::bordered()
         .border_set(border::ROUNDED)
         .border_style(fg(colors::FRAME));
@@ -2841,6 +2903,12 @@ mod tests {
             // The highlight background spans the selected row.
             assert_eq!(buf[(w / 2, 3)].bg, c(colors::SELECTED), "w={w}");
             assert_ne!(buf[(w / 2, 4)].bg, c(colors::SELECTED), "w={w}");
+            assert_eq!(buf[(w / 2, 2)].bg, c(colors::BAR_BG), "header band, w={w}");
+            assert_eq!(
+                buf[(w / 2, 4)].bg,
+                mix(colors::INK, colors::BAR_BG, 0.5),
+                "zebra row, w={w}"
+            );
         }
     }
 
@@ -3395,34 +3463,64 @@ diff --git a/notes.zzz b/notes.zzz\n@@ -1 +1 @@\n+plain text";
     }
 
     #[test]
-    fn test_render_ci_line() {
-        let text = |ci: gh::CiSummary| {
-            render_ci_line(&ci).map(|l| {
-                l.spans
-                    .iter()
-                    .map(|s| s.content.to_string())
-                    .collect::<String>()
-            })
+    fn test_ci_spans() {
+        let text = |ci: gh::CiSummary| -> String {
+            ci_spans(&ci)
+                .iter()
+                .map(|s| s.content.to_string())
+                .collect()
         };
-        assert_eq!(text(gh::CiSummary::default()), None);
-        assert_eq!(
-            text(gh::CiSummary {
-                passed: 3,
-                failed: 1,
-                pending: 2
-            })
-            .as_deref(),
-            Some("CI: failing ✓3 ✗1 ●2")
+        assert_eq!(text(gh::CiSummary::default()), "");
+        let ci = gh::CiSummary {
+            passed: 3,
+            failed: 1,
+            pending: 2,
+        };
+        assert_eq!(text(ci.clone()), " ci failing  ✓3 ✗1 ●2");
+        assert_eq!(ci_spans(&ci)[0].style.bg, Some(c(colors::RED)));
+        let passing = gh::CiSummary {
+            passed: 4,
+            failed: 0,
+            pending: 0,
+        };
+        assert_eq!(text(passing), " ci passing  ✓4");
+    }
+
+    #[test]
+    fn test_detail_header_pills_and_spacing() {
+        let detail = PullRequestDetail {
+            base: PullRequest {
+                author: "alice".into(),
+                request: "@me".into(),
+                review_decision: "APPROVED".into(),
+                ..Default::default()
+            },
+            merge_state_status: "BLOCKED".into(),
+            head_ref_name: "feat/x".into(),
+            base_ref_name: "main".into(),
+            labels: vec!["bug".into(), "ui".into()],
+            reviewers: vec![gh::ReviewSummary {
+                author: "bob".into(),
+                state: "CHANGES_REQUESTED".into(),
+            }],
+            ..Default::default()
+        };
+        let lines = render_diff_content(&detail, "", 120);
+        let text = |l: &Line| -> String { l.spans.iter().map(|s| s.content.to_string()).collect() };
+        let all: Vec<String> = lines.iter().map(text).collect();
+        assert!(all[1].starts_with(" blocked   approved "), "{}", all[1]);
+        assert_eq!(lines[1].spans[0].style.bg, Some(c(colors::RED)));
+        assert!(
+            all.contains(
+                &"Author: @alice   Review request: @me   Branch: feat/x -> main".to_string()
+            ),
+            "{all:?}"
         );
-        assert_eq!(
-            text(gh::CiSummary {
-                passed: 4,
-                failed: 0,
-                pending: 0
-            })
-            .as_deref(),
-            Some("CI: passing ✓4")
+        assert!(
+            all.contains(&"Reviewed by: @bob changes requested".to_string()),
+            "{all:?}"
         );
+        assert!(all.contains(&" bug   ui ".to_string()), "{all:?}");
     }
 
     #[test]
@@ -3849,7 +3947,20 @@ diff --git a/notes.zzz b/notes.zzz\n@@ -1 +1 @@\n+plain text";
             buf.content().iter().map(|c| c.symbol()).collect()
         };
         let got = text(&m);
-        assert!(got.contains(" Merged   Closed "), "{got}");
+        assert!(got.contains(" Merged │ Closed "), "{got}");
+        let buf_cell = |m: &Model, x: u16| {
+            let mut term =
+                ratatui::Terminal::new(ratatui::backend::TestBackend::new(80, 1)).unwrap();
+            term.draw(|f| f.render_widget(render_tab_bar(m), f.area()))
+                .unwrap();
+            term.backend().buffer()[(x, 0)].clone()
+        };
+        assert_eq!(buf_cell(&m, 1).bg, c(colors::BLUE), "active tab is a pill");
+        assert_ne!(
+            buf_cell(&m, 22).bg,
+            c(colors::BLUE),
+            "inactive tabs are plain"
+        );
         m.history_loading[TAB_MERGED] = true;
         assert!(text(&m).contains(" Merged … "));
         m.update(history_msg(
@@ -3980,13 +4091,7 @@ diff --git a/notes.zzz b/notes.zzz\n@@ -1 +1 @@\n+plain text";
             })
             .collect();
         let joined = text.join("\n");
-        for want in [
-            "Reviewed by:",
-            "@alice",
-            "APPROVED",
-            "@bob",
-            "CHANGES_REQUESTED",
-        ] {
+        for want in ["Reviewed by:", "@alice approved", "@bob changes requested"] {
             assert!(joined.contains(want), "rendered detail missing {want}");
         }
     }
