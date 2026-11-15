@@ -1791,7 +1791,13 @@ fn wrap_line_spans(line: Line<'static>, width: usize) -> Vec<Line<'static>> {
             spans.push(Span::styled(run, run_style.unwrap()));
         }
         out.push(Line::from(spans));
-        idx = cut;
+        // A break at a space consumes it, so the next row does not start
+        // with a stray blank.
+        idx = if cut < flat.len() && flat[cut].1 == ' ' {
+            cut + 1
+        } else {
+            cut
+        };
     }
     out
 }
@@ -4335,6 +4341,13 @@ diff --git a/notes.zzz b/notes.zzz\n@@ -1 +1 @@\n+plain text";
             })
             .collect();
         assert!(joined.contains("Author:"));
+        for l in &out[1..] {
+            let first = l.spans.first().map(|s| s.content.as_ref()).unwrap_or("");
+            assert!(
+                !first.starts_with(' '),
+                "continuation starts with a blank: {out:?}"
+            );
+        }
     }
 
     #[test]
