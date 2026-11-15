@@ -1542,26 +1542,25 @@ pub fn render_diff_content(
     }
     lines.push(Line::from(status));
 
-    // One field per row with the values in one column; a long value wraps
-    // under its own column instead of under the label.
-    let field = |label: &str, value: Vec<Span<'static>>| field_rows(label, value, width);
-    lines.extend(field(
-        "Author",
-        vec![Span::styled(
-            format!("@{}", detail.base.author),
-            fg(colors::MAGENTA),
-        )],
-    ));
-    lines.extend(field(
-        "Requested",
-        vec![Span::raw(detail.base.request.clone())],
-    ));
-    let branch = branch_label(detail);
-    if !branch.is_empty() {
-        lines.extend(field(
-            "Branch",
-            vec![Span::styled(branch, fg(colors::CYAN))],
-        ));
+    // Short fields fill a column-major grid as wide as the content allows;
+    // long ones (the branch, many reviewers or labels) get full rows below.
+    let mut fields: Vec<(&str, Vec<Span<'static>>)> = vec![
+        (
+            "Author",
+            vec![Span::styled(
+                format!("@{}", detail.base.author),
+                fg(colors::MAGENTA),
+            )],
+        ),
+        ("Requested", vec![Span::raw(detail.base.request.clone())]),
+    ];
+    for (label, at) in [
+        ("Created", detail.created_at),
+        ("Updated", detail.base.updated_at),
+    ] {
+        if at != std::time::SystemTime::UNIX_EPOCH {
+            fields.push((label, vec![Span::raw(crate::gh::format_human(at))]));
+        }
     }
     if !detail.reviewers.is_empty() {
         let mut spans = Vec::new();
@@ -1575,15 +1574,7 @@ pub fn render_diff_content(
                 review_decision_style(&reviewer.state),
             ));
         }
-        lines.extend(field("Reviewers", spans));
-    }
-    for (label, at) in [
-        ("Created", detail.created_at),
-        ("Updated", detail.base.updated_at),
-    ] {
-        if at != std::time::SystemTime::UNIX_EPOCH {
-            lines.extend(field(label, vec![Span::raw(crate::gh::format_human(at))]));
-        }
+        fields.push(("Reviewers", spans));
     }
     if !detail.labels.is_empty() {
         let mut spans = Vec::new();
@@ -1593,8 +1584,13 @@ pub fn render_diff_content(
             }
             spans.push(pill(&sanitize_text(label), None));
         }
-        lines.extend(field("Labels", spans));
+        fields.push(("Labels", spans));
     }
+    let branch = branch_label(detail);
+    if !branch.is_empty() {
+        fields.push(("Branch", vec![Span::styled(branch, fg(colors::CYAN))]));
+    }
+    lines.extend(field_grid(fields, width));
 
     lines.push(rule(width));
 
@@ -1740,6 +1736,64 @@ fn field_rows(label: &str, value: Vec<Span<'static>>, width: usize) -> Vec<Line<
             Line::from(spans)
         })
         .collect()
+}
+
+/// Gap between grid columns of the detail header fields.
+const GRID_GAP: usize = 3;
+
+/// Lays `fields` out as label/value cells in the most columns that fit
+/// `width`, filled top to bottom, each column as wide as its longest value.
+/// A field wider than half the content gets its own full-width row after
+/// the grid, so one long value never stretches a column.
+fn field_grid(fields: Vec<(&str, Vec<Span<'static>>)>, width: usize) -> Vec<Line<'static>> {
+    let value_w = |v: &[Span<'static>]| v.iter().map(|s| s.width()).sum::<usize>();
+    let half = width.saturating_sub(GRID_GAP) / 2;
+    let (narrow, wide): (Vec<_>, Vec<_>) = fields
+        .into_iter()
+        .partition(|(_, v)| FIELD_W + value_w(v) <= half);
+
+    let mut out = Vec::new();
+    if !narrow.is_empty() {
+        // The most columns whose summed widths fit; one column always does.
+        let n = narrow.len();
+        let layout = (1..=n)
+            .rev()
+            .map(|cols| {
+                let rows = n.div_ceil(cols);
+                let widths: Vec<usize> = narrow
+                    .chunks(rows)
+                    .map(|col| col.iter().map(|(_, v)| value_w(v)).max().unwrap_or(0))
+                    .collect();
+                (rows, widths)
+            })
+            .find(|(_, widths)| {
+                let total: usize = widths.iter().map(|w| FIELD_W + w).sum::<usize>()
+                    + GRID_GAP * widths.len().saturating_sub(1);
+                total <= width || widths.len() == 1
+            });
+        if let Some((rows, widths)) = layout {
+            for r in 0..rows {
+                let mut spans: Vec<Span<'static>> = Vec::new();
+                let cells = narrow.iter().skip(r).step_by(rows);
+                for (c, (label, value)) in cells.enumerate() {
+                    if c > 0 {
+                        // Pad the previous cell out to its column width.
+                        let prev = &narrow[(c - 1) * rows + r].1;
+                        spans.push(Span::raw(repeat_space(
+                            widths[c - 1] - value_w(prev) + GRID_GAP,
+                        )));
+                    }
+                    spans.push(Span::styled(pad_right(label, FIELD_W), fg(colors::YELLOW)));
+                    spans.extend(value.iter().cloned());
+                }
+                out.push(Line::from(spans));
+            }
+        }
+    }
+    for (label, value) in wide {
+        out.extend(field_rows(label, value, width));
+    }
+    out
 }
 
 /// A horizontal rule across the content width.
@@ -3564,15 +3618,17 @@ diff --git a/notes.zzz b/notes.zzz\n@@ -1 +1 @@\n+plain text";
         let all: Vec<String> = lines.iter().map(text).collect();
         assert!(all[1].starts_with(" blocked   approved "), "{}", all[1]);
         assert_eq!(lines[1].spans[0].style.bg, Some(c(colors::RED)));
-        for want in [
-            "Author     @alice",
-            "Requested  @me",
-            "Branch     feat/x -> main",
-            "Reviewers  @bob changes requested",
-            "Labels      bug   ui ",
-        ] {
-            assert!(all.contains(&want.to_string()), "{want:?} in {all:?}");
-        }
+        // 120 columns fit three grid columns, filled top to bottom.
+        assert_eq!(
+            all[2],
+            "Author     @alice   Reviewers  @bob changes requested   Branch     feat/x -> main"
+        );
+        assert_eq!(all[3], "Requested  @me      Labels      bug   ui ");
+        assert_eq!(
+            all[2].find("Reviewers"),
+            all[3].find("Labels"),
+            "columns align"
+        );
 
         // A value too long for the row wraps under the value column.
         let long = PullRequestDetail {
