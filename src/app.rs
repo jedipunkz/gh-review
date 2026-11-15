@@ -606,13 +606,15 @@ impl Model {
         self.ensure_cursor_visible();
         self.status = format!("{} review request(s)", self.open_count());
         let mut effects = Vec::new();
-        if !self.prs.is_empty() {
+        if !self.matching_indices().is_empty() {
             if let Some(e) = self.trigger_detail_load() {
                 effects.push(e);
             }
             let mut candidates = top_n(&self.prs, 3);
             candidates.retain(|p| p.url != self.prs[self.cursor].url);
             effects.push(Effect::PrefetchHint { prs: candidates });
+        } else {
+            self.clear_detail();
         }
         effects
     }
@@ -661,6 +663,9 @@ impl Model {
         self.detail_loading = false;
         self.loading_for_url = None;
         self.detail_err = String::new();
+        self.detail_view_cache = None;
+        self.detail_scroll = 0;
+        self.detail_total = 0;
     }
 
     pub fn update(&mut self, msg: Msg) -> Vec<Effect> {
@@ -1096,11 +1101,11 @@ impl Model {
                 Vec::new()
             }
             crossterm::event::KeyCode::Esc => {
+                let prev_cursor = self.cursor;
                 self.search_active = false;
                 self.search_value.clear();
                 self.search_cursor = 0;
-                self.ensure_cursor_visible();
-                Vec::new()
+                self.refresh_after_filter_change(prev_cursor)
             }
             crossterm::event::KeyCode::Enter => {
                 self.search_active = false;
@@ -1128,11 +1133,7 @@ impl Model {
                         .replace_range(byte_idx..self.char_to_byte(self.search_cursor), "");
                     self.search_cursor -= 1;
                 }
-                self.ensure_cursor_visible();
-                if self.cursor != prev_cursor && !self.loading && !self.prs.is_empty() {
-                    return self.detail_and_prefetch_effects();
-                }
-                Vec::new()
+                self.refresh_after_filter_change(prev_cursor)
             }
             crossterm::event::KeyCode::Delete => {
                 let prev_cursor = self.cursor;
@@ -1141,11 +1142,7 @@ impl Model {
                     let end = self.char_to_byte(self.search_cursor + 1);
                     self.search_value.replace_range(byte_idx..end, "");
                 }
-                self.ensure_cursor_visible();
-                if self.cursor != prev_cursor && !self.loading && !self.prs.is_empty() {
-                    return self.detail_and_prefetch_effects();
-                }
-                Vec::new()
+                self.refresh_after_filter_change(prev_cursor)
             }
             crossterm::event::KeyCode::Left => {
                 if self.search_cursor > 0 {
@@ -1174,11 +1171,7 @@ impl Model {
                 let byte_idx = self.char_to_byte(self.search_cursor);
                 self.search_value.insert(byte_idx, ch);
                 self.search_cursor += 1;
-                self.ensure_cursor_visible();
-                if self.cursor != prev_cursor && !self.loading && !self.prs.is_empty() {
-                    return self.detail_and_prefetch_effects();
-                }
-                Vec::new()
+                self.refresh_after_filter_change(prev_cursor)
             }
             _ => Vec::new(),
         }
@@ -1190,6 +1183,18 @@ impl Model {
             .nth(char_idx)
             .map(|(b, _)| b)
             .unwrap_or(self.search_value.len())
+    }
+
+    fn refresh_after_filter_change(&mut self, prev_cursor: usize) -> Vec<Effect> {
+        self.ensure_cursor_visible();
+        if self.matching_indices().is_empty() {
+            self.clear_detail();
+            return Vec::new();
+        }
+        if self.cursor != prev_cursor && !self.loading && !self.prs.is_empty() {
+            return self.detail_and_prefetch_effects();
+        }
+        Vec::new()
     }
 
     fn handle_comment_key(&mut self, key: crossterm::event::KeyEvent) -> Vec<Effect> {
@@ -3000,6 +3005,60 @@ mod tests {
                 "zebra row, w={w}"
             );
         }
+    }
+
+    #[test]
+    fn test_empty_tab_does_not_keep_previous_detail_visible() {
+        let mut m = model_with_loaded_detail();
+        m.update(Msg::Resize(80, 30));
+        let mut term = ratatui::Terminal::new(ratatui::backend::TestBackend::new(80, 30)).unwrap();
+
+        term.draw(|f| render(&mut m, f)).unwrap();
+        let before: String = term
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect();
+        assert!(before.contains("Test PR"));
+
+        m.switch_tab(1);
+        term.draw(|f| render(&mut m, f)).unwrap();
+        let after: String = term
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect();
+        assert!(
+            !after.contains("Test PR"),
+            "an empty tab must not render the previous PR detail"
+        );
+    }
+
+    #[test]
+    fn test_filter_with_no_matches_clears_detail() {
+        let mut m = model_with_loaded_detail();
+        m.search_active = true;
+
+        m.update(key(crossterm::event::KeyCode::Char('z')));
+
+        assert!(m.matching_indices().is_empty());
+        assert!(m.current_detail.is_none());
+        assert!(m.detail_view_cache.is_none());
+    }
+
+    #[test]
+    fn test_empty_pr_refresh_clears_detail() {
+        let mut m = model_with_loaded_detail();
+
+        m.apply_pr_list(Vec::new());
+
+        assert!(m.prs.is_empty());
+        assert!(m.current_detail.is_none());
+        assert!(m.detail_view_cache.is_none());
     }
 
     #[test]
