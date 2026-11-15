@@ -101,6 +101,18 @@ headline diff, and the latest reviews.
 | `j` / `k` | Scroll the detail |
 | `pgup` / `pgdn` | Page-scroll the detail |
 
+### Mouse
+
+| Action | Effect |
+|---|---|
+| Wheel over the list | Move the selection |
+| Wheel over the detail | Scroll the detail |
+| Left click on a list row | Select that PR |
+
+Mouse capture turns off the terminal's own text selection. Most terminals
+let you select text anyway while a modifier key is held during the drag
+(usually `shift`); the key depends on the terminal.
+
 ## 📖 Usage
 
 ### Tabs and filter

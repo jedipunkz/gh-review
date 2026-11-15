@@ -39,6 +39,8 @@ const COL_NUM_W: usize = 6;
 const COL_AUTHOR_W: usize = 15;
 const COL_APPROVE_W: usize = 11;
 
+const MOUSE_SCROLL_LINES: i32 = 3;
+
 const SPINNER_FRAMES: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
 
 fn color(hex: &str) -> Color {
@@ -115,6 +117,7 @@ pub enum Effect {
 
 pub enum Msg {
     Key(crossterm::event::KeyEvent),
+    Mouse(crossterm::event::MouseEvent),
     Resize(u16, u16),
     PRList(Result<Vec<PullRequest>, String>),
     HistoryList {
@@ -658,6 +661,7 @@ impl Model {
                 }
                 self.handle_key(k)
             }
+            Msg::Mouse(ev) => self.handle_mouse(ev),
             Msg::Resize(w, h) => {
                 self.width = w;
                 self.height = h;
@@ -888,26 +892,8 @@ impl Model {
                 effects.extend(self.load_active_history_tab());
                 effects
             }
-            crossterm::event::KeyCode::Char('n') if ctrl => {
-                if self.loading {
-                    return Vec::new();
-                }
-                if self.advance_cursor(1) {
-                    self.ensure_cursor_visible();
-                    return self.detail_and_prefetch_effects();
-                }
-                Vec::new()
-            }
-            crossterm::event::KeyCode::Char('p') if ctrl => {
-                if self.loading {
-                    return Vec::new();
-                }
-                if self.advance_cursor(-1) {
-                    self.ensure_cursor_visible();
-                    return self.detail_and_prefetch_effects();
-                }
-                Vec::new()
-            }
+            crossterm::event::KeyCode::Char('n') if ctrl => self.move_cursor(1),
+            crossterm::event::KeyCode::Char('p') if ctrl => self.move_cursor(-1),
             crossterm::event::KeyCode::Char('h') if !ctrl => self.switch_tab(-1),
             crossterm::event::KeyCode::Char('l') if !ctrl => self.switch_tab(1),
             crossterm::event::KeyCode::Char('/') if !ctrl => {
@@ -981,6 +967,61 @@ impl Model {
                     self.status = "ctrl+enter (or ctrl+s) to send, esc to cancel".to_string();
                 }
                 Vec::new()
+            }
+            _ => Vec::new(),
+        }
+    }
+
+    fn move_cursor(&mut self, delta: i32) -> Vec<Effect> {
+        if self.loading {
+            return Vec::new();
+        }
+        if self.advance_cursor(delta) {
+            self.ensure_cursor_visible();
+            return self.detail_and_prefetch_effects();
+        }
+        Vec::new()
+    }
+
+    /// Wheel over the list moves the cursor, wheel elsewhere scrolls the
+    /// detail, and a left click on a list row selects it. Row geometry
+    /// mirrors render(): optional search line, tab bar, top border, header.
+    fn handle_mouse(&mut self, ev: crossterm::event::MouseEvent) -> Vec<Effect> {
+        use crossterm::event::{MouseButton, MouseEventKind};
+        if self.search_active || self.pending_approve.is_some() || self.comment_editor.is_some() {
+            return Vec::new();
+        }
+        let search_h = u16::from(self.search_visible());
+        let list_h = (self.compute_list_section_height() as u16)
+            .min(self.height.saturating_sub(search_h + 1));
+        let in_list = ev.row < search_h + list_h;
+        match ev.kind {
+            MouseEventKind::ScrollDown if in_list => self.move_cursor(1),
+            MouseEventKind::ScrollUp if in_list => self.move_cursor(-1),
+            MouseEventKind::ScrollDown => {
+                self.scroll_detail(MOUSE_SCROLL_LINES);
+                Vec::new()
+            }
+            MouseEventKind::ScrollUp => {
+                self.scroll_detail(-MOUSE_SCROLL_LINES);
+                Vec::new()
+            }
+            MouseEventKind::Down(MouseButton::Left) if in_list && !self.loading => {
+                let first_row = search_h + 3;
+                let visible = self.visible_pr_indices();
+                let hit = ev
+                    .row
+                    .checked_sub(first_row)
+                    .and_then(|i| visible.get(i as usize).copied());
+                match hit {
+                    Some(idx) if idx != self.cursor => {
+                        self.clear_mark_on_selected();
+                        self.cursor = idx;
+                        self.ensure_cursor_visible();
+                        self.detail_and_prefetch_effects()
+                    }
+                    _ => Vec::new(),
+                }
             }
             _ => Vec::new(),
         }
@@ -2714,6 +2755,44 @@ mod tests {
         assert_eq!(diffstat_blocks(1000, 1), Some((4, 1)));
         assert_eq!(diffstat_blocks(1, 1000), Some((1, 4)));
         assert_eq!(diffstat_blocks(-3, 4), Some((0, 5)));
+    }
+
+    #[test]
+    fn test_mouse_click_selects_row_and_wheel_scrolls() {
+        use crossterm::event::{KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
+        let ev = |kind, row| {
+            Msg::Mouse(MouseEvent {
+                kind,
+                column: 10,
+                row,
+                modifiers: KeyModifiers::NONE,
+            })
+        };
+        let mut m = model_with_loaded_detail();
+        m.prs.push(PullRequest {
+            url: "https://example.test/pr/2".into(),
+            request: "@me".into(),
+            ..Default::default()
+        });
+        m.update(Msg::Resize(100, 30));
+        // Rows: 0 tab bar, 1 border, 2 header, 3 first PR, 4 second PR.
+        let effects = m.update(ev(MouseEventKind::Down(MouseButton::Left), 4));
+        assert_eq!(m.cursor, 1);
+        assert!(!effects.is_empty(), "selecting loads the detail");
+        m.update(ev(MouseEventKind::Down(MouseButton::Left), 2));
+        assert_eq!(m.cursor, 1, "header click is ignored");
+        m.update(ev(MouseEventKind::ScrollUp, 3));
+        assert_eq!(m.cursor, 0, "wheel over the list moves the cursor");
+
+        m.detail_total = 100;
+        m.update(ev(MouseEventKind::ScrollDown, 20));
+        assert_eq!(m.detail_scroll, MOUSE_SCROLL_LINES as u16);
+        m.update(ev(MouseEventKind::ScrollUp, 20));
+        assert_eq!(m.detail_scroll, 0);
+
+        m.pending_approve = Some(m.prs[0].clone());
+        m.update(ev(MouseEventKind::Down(MouseButton::Left), 4));
+        assert_eq!(m.cursor, 0, "mouse is inert while a popup is open");
     }
 
     fn model_with_loaded_detail() -> Model {

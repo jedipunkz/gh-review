@@ -1,6 +1,7 @@
 use std::sync::Arc;
 use std::time::Duration;
 
+use crossterm::event::{DisableMouseCapture, EnableMouseCapture, MouseButton, MouseEventKind};
 use tokio::sync::mpsc;
 
 use gh_review::app::{Effect, Model, Msg};
@@ -171,6 +172,20 @@ fn spawn_key_reader(tx: mpsc::UnboundedSender<Msg>) {
                     break;
                 }
             }
+            // Only wheel and left click: forwarding motion events (sent
+            // continuously while capture is on) would redraw on every move.
+            Ok(crossterm::event::Event::Mouse(ev))
+                if matches!(
+                    ev.kind,
+                    MouseEventKind::ScrollUp
+                        | MouseEventKind::ScrollDown
+                        | MouseEventKind::Down(MouseButton::Left)
+                ) =>
+            {
+                if tx.send(Msg::Mouse(ev)).is_err() {
+                    break;
+                }
+            }
             Ok(crossterm::event::Event::Resize(w, h)) => {
                 if tx.send(Msg::Resize(w, h)).is_err() {
                     break;
@@ -192,11 +207,19 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         .build()?;
 
     let mut terminal = ratatui::init();
+    // ratatui's panic hook restores raw mode and the screen but not mouse
+    // capture; without this a panic leaves the shell printing mouse escapes.
+    let restore_hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        let _ = crossterm::execute!(std::io::stdout(), DisableMouseCapture);
+        restore_hook(info);
+    }));
     let keyboard_enhancement =
         crossterm::terminal::supports_keyboard_enhancement().unwrap_or(false);
 
     let result = rt.block_on(async {
         crossterm::terminal::enable_raw_mode().map_err(|e| e.to_string())?;
+        crossterm::execute!(std::io::stdout(), EnableMouseCapture).map_err(|e| e.to_string())?;
         // Lets the comment popup tell ctrl+enter from enter on terminals
         // that support the kitty keyboard protocol.
         if keyboard_enhancement {
@@ -294,6 +317,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             crossterm::event::PopKeyboardEnhancementFlags
         );
     }
+    let _ = crossterm::execute!(std::io::stdout(), DisableMouseCapture);
     ratatui::restore();
     crossterm::terminal::disable_raw_mode()?;
     result.map_err(|e| e.into())
